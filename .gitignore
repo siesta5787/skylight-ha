@@ -1,5 +1,6 @@
 /target
 /.cache
+/dist
 /config.toml
 *.secret
 ha-token*
