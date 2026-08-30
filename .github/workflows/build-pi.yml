@@ -41,7 +41,7 @@ jobs:
             -v "${{ github.workspace }}/.cache/cargo-registry":/root/.cargo/registry \
             alpine:3.20 sh -c '
               set -eu
-              apk add --no-cache curl gcc libinput-dev eudev-dev pkgconf musl-dev linux-headers
+              apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
                 sh -s -- -y --profile minimal --default-toolchain stable
               . "$HOME/.cargo/env"
