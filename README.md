@@ -36,8 +36,17 @@ cargo build --release --target aarch64-unknown-linux-musl \
   -p skylight-ha --no-default-features -F ui/backend-linuxkms
 ```
 
-Cross-compiling `aarch64-unknown-linux-musl` from this machine needs a musl
-cross linker (`cross`/Docker, or `cargo-zigbuild`) — not yet set up here.
+Built via `.github/workflows/build-pi.yml` on GitHub Actions: a QEMU-emulated
+aarch64 Alpine container, since Alpine's `apk` packages are musl-native
+(no manual cross-sysroot assembly needed for libinput/libudev). Alpine
+doesn't ship *static* builds of libinput/libudev/libxkbcommon though, so
+`.cargo/config.toml` disables `crt-static` for this target: the binary is
+still self-contained for everything that matters (our code, fonts, all
+pure-Rust dependencies) but dynamically links musl's own libc plus those
+three small hardware-input libraries — all of which any musl-based distro
+already provides as its foundation. Expect a from-scratch CI run to take
+multiple hours (QEMU emulation of a large dependency tree); it should be
+much faster once the dependency cache is warm and the lockfile is stable.
 
 ## Status
 

@@ -1,5 +1,5 @@
 /target
 /.cache
-config.toml
+/config.toml
 *.secret
 ha-token*

@@ -1,0 +1,12 @@
+# aarch64-unknown-linux-musl defaults to fully static linking (crt-static),
+# including native C libs. That's fine for pure-Rust dependencies, but
+# libinput/libudev/libxkbcommon (needed for touch/keyboard input on bare
+# KMS) don't ship static (.a) builds on Alpine, and mixing static/dynamic
+# per-library on a crt-static target is fragile and poorly supported.
+# Disabling crt-static switches the whole target to musl's normal dynamic
+# mode instead: the binary dynamically links musl's own libc plus those
+# three small libs, all of which any musl-based distro already provides as
+# its foundation -- everything else (our own code, all pure-Rust deps) is
+# still linked into the binary itself either way.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=-crt-static"]
