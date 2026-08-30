@@ -1,0 +1,23 @@
+[package]
+name = "skylight-ha"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "skylight-ha"
+path = "src/main.rs"
+
+[dependencies]
+ha-client = { path = "../../crates/ha-client" }
+dashboard-config = { path = "../../crates/dashboard-config" }
+ui = { path = "../../crates/ui" }
+# Cargo unifies features for a shared dependency across the build, so the
+# actual backend (winit vs linuxkms) is still decided by `ui`'s features --
+# this just brings the `slint` API (ModelRc, Timer, ComponentHandle, ...)
+# into scope here without re-declaring the backend choice.
+slint = { version = "1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
+tokio = { workspace = true }
+time = { workspace = true, features = ["local-offset"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true

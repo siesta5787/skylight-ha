@@ -1,0 +1,121 @@
+import { Theme } from "theme.slint";
+
+export struct TodoItemData {
+    summary: string,
+    completed: bool,
+}
+
+export struct TodoColumnData {
+    member-name: string,
+    member-color: color,
+    items: [TodoItemData],
+}
+
+component TodoRow inherits Rectangle {
+    in property <TodoItemData> item;
+    in property <color> member-color;
+    callback toggled();
+
+    height: 34px;
+
+    TouchArea {
+        clicked => { toggled(); }
+
+        HorizontalLayout {
+            spacing: 8px;
+            padding-left: 2px;
+            padding-right: 2px;
+
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 5px;
+                border-width: 2px;
+                border-color: member-color;
+                background: item.completed ? member-color : transparent;
+            }
+
+            Text {
+                text: item.summary;
+                color: item.completed ? Theme.text-muted : Theme.text-primary;
+                font-size: 14px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+    }
+}
+
+component TodoColumn inherits Rectangle {
+    in property <TodoColumnData> column;
+    callback item-toggled(int);
+
+    background: Theme.surface-alt;
+    border-radius: 12px;
+    min-width: 140px;
+
+    VerticalLayout {
+        alignment: start;
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 6px;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: column.member-color;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: column.member-name;
+                color: Theme.text-primary;
+                font-weight: 700;
+                font-size: 14px;
+            }
+        }
+
+        for item[idx] in column.items: TodoRow {
+            item: item;
+            member-color: column.member-color;
+            toggled => { item-toggled(idx); }
+        }
+    }
+}
+
+export component TodoCard inherits Rectangle {
+    in property <[TodoColumnData]> columns;
+    callback item-toggled(int /* column */, int /* item */);
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        alignment: start;
+        padding: 18px;
+        spacing: 10px;
+
+        Text {
+            text: "Tasks";
+            color: Theme.text-primary;
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        // Without `alignment: start`, VerticalLayout's default alignment
+        // stretches/distributes children across all leftover height instead
+        // of packing them at the top -- this row was ending up pushed far
+        // down (or entirely below the visible window) instead of sitting
+        // right under the title.
+        HorizontalLayout {
+            spacing: Theme.gap;
+            for column[col-idx] in columns: TodoColumn {
+                column: column;
+                horizontal-stretch: 1;
+                item-toggled(item-idx) => { item-toggled(col-idx, item-idx); }
+            }
+        }
+    }
+}

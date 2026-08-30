@@ -1,0 +1,27 @@
+[package]
+name = "ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# "backend-winit" is for dev-loop iteration on a normal desktop (Windows/Linux/Mac).
+# "backend-linuxkms" is what actually ships to the Pi: bare DRM/KMS + libinput
+# evdev touch, no compositor. Both use the software renderer so the on-device
+# build never depends on the distro's Mesa/EGL userspace libs.
+slint = { version = "1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
+# Slint's text stack (parley/fontique) links against system fontconfig by
+# default, which (a) fails to cross-compile without a target sysroot and (b)
+# is a runtime dependency we don't want. "fontconfig-dlopen" makes it
+# dlopen libfontconfig at runtime instead of link-time-linking it, so the
+# cross build succeeds without a sysroot and the binary doesn't hard-fail if
+# the target system has no fontconfig -- we bundle our own font regardless.
+fontique = { version = "0.10", default-features = false, features = ["std", "fontconfig-dlopen"] }
+
+[build-dependencies]
+slint-build = "1"
+
+[features]
+default = ["backend-winit"]
+backend-winit = ["slint/backend-winit"]
+backend-linuxkms = ["slint/backend-linuxkms"]

@@ -1,0 +1,18 @@
+[package]
+name = "ha-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+url.workspace = true
+# rustls (pure Rust, no OpenSSL) keeps this friendly to static musl builds.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

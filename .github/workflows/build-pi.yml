@@ -1,0 +1,53 @@
+name: Build Pi binary (aarch64-musl)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      # QEMU-emulated aarch64 builds are slow (this is a large dependency
+      # tree), so cache cargo's registry and the target dir across runs.
+      # Mounted into the container at the same paths Alpine's cargo expects.
+      - name: Cache cargo registry and target dir
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/cargo-registry
+            target
+          key: pi-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            pi-build-
+
+      # Alpine's apk packages are built against musl, matching our target
+      # exactly -- so building natively inside an emulated aarch64 Alpine
+      # container gets us correctly-linked libinput/libudev for free,
+      # instead of assembling a cross sysroot by hand.
+      - name: Build inside emulated aarch64 Alpine container
+        run: |
+          mkdir -p .cache/cargo-registry target
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}":/workspace -w /workspace \
+            -v "${{ github.workspace }}/.cache/cargo-registry":/root/.cargo/registry \
+            alpine:3.20 sh -c '
+              set -eu
+              apk add --no-cache rust cargo libinput-dev eudev-dev pkgconf musl-dev linux-headers
+              cargo build --release -p skylight-ha \
+                --no-default-features -F ui/backend-linuxkms
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skylight-ha-aarch64-linux-musl
+          path: target/release/skylight-ha
+          if-no-files-found: error

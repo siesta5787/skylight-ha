@@ -1,0 +1,31 @@
+# Copy to config.toml and fill in. Never commit config.toml or the token file.
+
+[ha]
+base_url = "http://homeassistant.local:8123"
+# File containing a single Home Assistant long-lived access token
+# (Profile -> Security -> Long-Lived Access Tokens). Keep this file's
+# permissions restricted (chmod 600 on the target device).
+token_path = "./ha-token.secret"
+
+[[family]]
+id = "alice"
+name = "Alice"
+color = "#e0607a"
+todo_entity = "todo.chores_alice"
+calendar_entity = "calendar.alice"
+
+[[family]]
+id = "bob"
+name = "Bob"
+color = "#4f8ef7"
+todo_entity = "todo.chores_bob"
+calendar_entity = "calendar.bob"
+
+[[views]]
+name = "Home"
+
+[[views.cards]]
+type = "calendar"
+
+[[views.cards]]
+type = "todo_list"

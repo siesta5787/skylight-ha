@@ -1,0 +1,89 @@
+import { Theme } from "theme.slint";
+
+export struct CalendarEventDot {
+    member-color: color,
+}
+
+export struct CalendarDayData {
+    day-number: int,
+    in-current-month: bool,
+    is-today: bool,
+    events: [CalendarEventDot],
+}
+
+component WeekdayHeader inherits Text {
+    color: Theme.text-muted;
+    font-size: 13px;
+    horizontal-alignment: center;
+}
+
+component DayCell inherits Rectangle {
+    in property <CalendarDayData> day;
+
+    background: day.is-today ? Theme.accent.with-alpha(0.18) : transparent;
+    border-radius: 10px;
+
+    VerticalLayout {
+        alignment: start;
+        padding: 6px;
+        spacing: 4px;
+
+        Text {
+            text: day.day-number;
+            color: day.in-current-month ? Theme.text-primary : Theme.text-muted;
+            font-weight: day.is-today ? 700 : 400;
+            font-size: 15px;
+        }
+
+        HorizontalLayout {
+            spacing: 3px;
+            for dot in day.events: Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: dot.member-color;
+            }
+        }
+    }
+}
+
+export component CalendarCard inherits Rectangle {
+    in property <[[CalendarDayData]]> weeks;
+    in property <string> month-label;
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        alignment: start;
+        padding: 18px;
+        spacing: 10px;
+
+        Text {
+            text: month-label;
+            color: Theme.text-primary;
+            font-size: 20px;
+            font-weight: 700;
+        }
+
+        HorizontalLayout {
+            spacing: 4px;
+            WeekdayHeader { text: "Sun"; }
+            WeekdayHeader { text: "Mon"; }
+            WeekdayHeader { text: "Tue"; }
+            WeekdayHeader { text: "Wed"; }
+            WeekdayHeader { text: "Thu"; }
+            WeekdayHeader { text: "Fri"; }
+            WeekdayHeader { text: "Sat"; }
+        }
+
+        for week in weeks: HorizontalLayout {
+            spacing: 4px;
+            for day in week: DayCell {
+                day: day;
+                horizontal-stretch: 1;
+                height: 64px;
+            }
+        }
+    }
+}

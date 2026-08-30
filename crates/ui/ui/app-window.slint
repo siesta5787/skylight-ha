@@ -1,0 +1,64 @@
+import { Theme } from "theme.slint";
+import { CalendarCard, CalendarDayData } from "calendar-card.slint";
+import { TodoCard, TodoColumnData } from "todo-card.slint";
+
+export { CalendarDayData, TodoColumnData }
+
+export component AppWindow inherits Window {
+    title: "Family Dashboard";
+    background: Theme.background;
+    preferred-width: 1100px;
+    preferred-height: 600px;
+
+    in property <string> clock-text: "--:--";
+    in property <string> date-text: "";
+    in property <string> month-label: "";
+    in property <[[CalendarDayData]]> calendar-weeks;
+    in property <[TodoColumnData]> todo-columns;
+
+    callback todo-item-toggled(int, int);
+
+    VerticalLayout {
+        alignment: start;
+        padding: 20px;
+        spacing: Theme.gap;
+
+        // Plain packed layout, deliberately not using `alignment:
+        // space-between` or a `horizontal-stretch` spacer to push clock-text
+        // to the right -- both reliably made it fail to paint at all under
+        // this renderer/backend combo (i-slint-renderer-software +
+        // backend-winit, tested on Windows without a real GPU). Revisit in
+        // the polish pass; for now this trades "clock pinned to the right
+        // edge" for "clock reliably visible."
+        HorizontalLayout {
+            Text {
+                text: date-text;
+                color: Theme.text-muted;
+                font-size: 16px;
+                vertical-alignment: center;
+            }
+            Text {
+                text: clock-text;
+                color: Theme.text-primary;
+                font-size: 22px;
+                font-weight: 700;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            CalendarCard {
+                weeks: calendar-weeks;
+                month-label: month-label;
+                horizontal-stretch: 2;
+            }
+
+            TodoCard {
+                columns: todo-columns;
+                horizontal-stretch: 1;
+                item-toggled(col, item) => { todo-item-toggled(col, item); }
+            }
+        }
+    }
+}
