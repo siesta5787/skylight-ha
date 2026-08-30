@@ -45,8 +45,28 @@ still self-contained for everything that matters (our code, fonts, all
 pure-Rust dependencies) but dynamically links musl's own libc plus those
 three small hardware-input libraries — all of which any musl-based distro
 already provides as its foundation. Expect a from-scratch CI run to take
-multiple hours (QEMU emulation of a large dependency tree); it should be
-much faster once the dependency cache is warm and the lockfile is stable.
+multiple hours (QEMU emulation of a large dependency tree); the GH Actions
+cache didn't reliably speed up repeat runs in practice (each took 1-3.5h
+regardless), so budget for that every time the workflow changes.
+
+**Status: builds successfully.** Trigger via `gh workflow run build-pi.yml`,
+grab the `skylight-ha-aarch64-linux-musl` artifact once it finishes
+(`gh run download <run-id> -n skylight-ha-aarch64-linux-musl`). Verified as a
+real `aarch64` ELF binary (`file` reports `ELF 64-bit LSB pie executable, ARM
+aarch64 ... dynamically linked, interpreter /lib/ld-musl-aarch64.so.1`).
+
+Runtime dependencies the target distro must provide (not yet set up, no
+device tested against yet):
+- musl's own libc + dynamic loader (`ld-musl-aarch64.so.1`) — standard on
+  any musl-based distro.
+- `libinput.so`, `libudev.so`/`eudev.so`, `libxkbcommon.so`.
+- udev's hardware database (hwdb/rules) so libinput can identify the
+  touchscreen, and xkb keymap data (normally under `/usr/share/X11/xkb`) so
+  libxkbcommon can load a keyboard layout — these are runtime *data*
+  dependencies, separate from the linked code, needed regardless of how the
+  binary links against the libraries.
+- Permission to open `/dev/dri/*` directly (e.g. running as root), since the
+  build uses Slint's `backend-linuxkms-noseat` (no seatd-style broker).
 
 ## Status
 
@@ -55,9 +75,11 @@ month calendar renders with real dates but no HA events yet, a live clock and
 date update every second, and a todo column renders per configured family
 member (currently empty — HA data isn't wired in yet). The `ha-client` crate
 connects and authenticates against a real HA instance but its data isn't
-pushed into the UI yet. See `docs/plan.md`'s phased build order for what's
-next — the very next real milestone is running a Slint hello-world over bare
-KMS with touch on actual Pi Zero 2 W hardware, before more app-layer work.
+pushed into the UI yet. The `aarch64-musl` release binary builds
+successfully in CI (see above) but hasn't been run on a Pi yet. See
+`docs/plan.md`'s phased build order for what's next — the very next real
+milestone is actually running the binary over bare KMS with touch on real
+Pi Zero 2 W hardware, before more app-layer work.
 
 Known rough edges (functional, not blocking): the default window size is a
 little too small to show every calendar row and both todo columns without
