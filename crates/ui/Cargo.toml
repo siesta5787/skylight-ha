@@ -24,4 +24,10 @@ slint-build = "1"
 [features]
 default = ["backend-winit"]
 backend-winit = ["slint/backend-winit"]
-backend-linuxkms = ["slint/backend-linuxkms"]
+# "-noseat" skips libseat (session/seat-switching management for shared
+# multi-user graphical sessions) -- irrelevant for a dedicated single-purpose
+# kiosk device, and it means the target distro doesn't need a seatd-like
+# daemon either. Without it, the backend opens /dev/dri/* directly, which
+# just needs the process to have permission (e.g. run as root, or be in the
+# right group) on the target.
+backend-linuxkms = ["slint/backend-linuxkms-noseat"]
