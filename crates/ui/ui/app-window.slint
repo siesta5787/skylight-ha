@@ -1,6 +1,10 @@
 import { Theme } from "theme.slint";
 import { CalendarCard, CalendarDayData } from "calendar-card.slint";
 import { TodoCard, TodoColumnData } from "todo-card.slint";
+// Embeds the font at compile time (Slint's recommended approach -- see
+// i-slint-compiler's font import handling) since the target device has no
+// system fonts or fontconfig at all (see crates/ui/Cargo.toml).
+import "../assets/fonts/Inter-Regular.ttf";
 
 export { CalendarDayData, TodoColumnData }
 
@@ -9,6 +13,7 @@ export component AppWindow inherits Window {
     background: Theme.background;
     preferred-width: 1100px;
     preferred-height: 600px;
+    default-font-family: "Inter";
 
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
