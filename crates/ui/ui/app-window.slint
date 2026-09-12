@@ -22,6 +22,7 @@ export component AppWindow inherits Window {
     in property <[TodoColumnData]> todo-columns;
 
     callback todo-item-toggled(int, int);
+    callback calendar-day-selected(int /* week */, int /* day */);
 
     VerticalLayout {
         alignment: start;
@@ -57,6 +58,7 @@ export component AppWindow inherits Window {
                 weeks: calendar-weeks;
                 month-label: month-label;
                 horizontal-stretch: 2;
+                day-selected(week, day) => { calendar-day-selected(week, day); }
             }
 
             TodoCard {

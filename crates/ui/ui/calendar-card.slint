@@ -19,29 +19,39 @@ component WeekdayHeader inherits Text {
 
 component DayCell inherits Rectangle {
     in property <CalendarDayData> day;
+    in property <bool> selected;
+    callback tapped();
 
-    background: day.is-today ? Theme.accent.with-alpha(0.18) : transparent;
     border-radius: 10px;
+    border-width: selected ? 2px : 0px;
+    border-color: Theme.accent;
+    background: touch.pressed
+        ? Theme.accent.with-alpha(0.30)
+        : (day.is-today ? Theme.accent.with-alpha(0.18) : transparent);
 
-    VerticalLayout {
-        alignment: start;
-        padding: 6px;
-        spacing: 4px;
+    touch := TouchArea {
+        clicked => { tapped(); }
 
-        Text {
-            text: day.day-number;
-            color: day.in-current-month ? Theme.text-primary : Theme.text-muted;
-            font-weight: day.is-today ? 700 : 400;
-            font-size: 15px;
-        }
+        VerticalLayout {
+            alignment: start;
+            padding: 6px;
+            spacing: 4px;
 
-        HorizontalLayout {
-            spacing: 3px;
-            for dot in day.events: Rectangle {
-                width: 6px;
-                height: 6px;
-                border-radius: 3px;
-                background: dot.member-color;
+            Text {
+                text: day.day-number;
+                color: day.in-current-month ? Theme.text-primary : Theme.text-muted;
+                font-weight: day.is-today ? 700 : 400;
+                font-size: 15px;
+            }
+
+            HorizontalLayout {
+                spacing: 3px;
+                for dot in day.events: Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: dot.member-color;
+                }
             }
         }
     }
@@ -50,6 +60,10 @@ component DayCell inherits Rectangle {
 export component CalendarCard inherits Rectangle {
     in property <[[CalendarDayData]]> weeks;
     in property <string> month-label;
+    // Which cell is currently selected, as (week, day) grid indices; -1 = none.
+    out property <int> selected-week: -1;
+    out property <int> selected-day: -1;
+    callback day-selected(int /* week */, int /* day */);
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -77,12 +91,18 @@ export component CalendarCard inherits Rectangle {
             WeekdayHeader { text: "Sat"; }
         }
 
-        for week in weeks: HorizontalLayout {
+        for week[week-idx] in weeks: HorizontalLayout {
             spacing: 4px;
-            for day in week: DayCell {
+            for day[day-idx] in week: DayCell {
                 day: day;
+                selected: root.selected-week == week-idx && root.selected-day == day-idx;
                 horizontal-stretch: 1;
                 height: 64px;
+                tapped => {
+                    root.selected-week = week-idx;
+                    root.selected-day = day-idx;
+                    root.day-selected(week-idx, day-idx);
+                }
             }
         }
     }

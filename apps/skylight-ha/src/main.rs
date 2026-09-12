@@ -30,6 +30,12 @@ fn main() {
         tracing::debug!(col, item, "todo item toggled (not yet wired to HA)");
     });
 
+    app.on_calendar_day_selected(move |week, day| {
+        // Grid coordinates into the 6x7 month view built by `build_month_weeks`.
+        // A day-detail / event view will hang off this in a later phase.
+        tracing::debug!(week, day, "calendar day selected");
+    });
+
     let clock_weak = app.as_weak();
     let clock_timer = slint::Timer::default();
     clock_timer.start(
