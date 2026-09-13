@@ -4,41 +4,47 @@ import { WeekDayColumnData, WeekEventData, AllDayBannerData } from "time-grid-vi
 component AgendaRow inherits Rectangle {
     in property <WeekEventData> event;
     in property <[bool]> member-visible;
+    callback tapped();
     visible: root.event.member-index < 0 || root.member-visible.length == 0
         || root.event.member-index >= root.member-visible.length
         || root.member-visible[root.event.member-index];
 
     height: 44px;
+    background: touch.pressed ? Theme.border : transparent;
 
-    HorizontalLayout {
-        padding-left: 4px;
-        padding-right: 4px;
-        spacing: 10px;
+    touch := TouchArea {
+        clicked => { root.tapped(); }
 
-        Rectangle {
-            width: 10px;
-            height: 10px;
-            border-radius: 5px;
-            background: event.member-color;
-            y: (parent.height - self.height) / 2;
-        }
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            spacing: 10px;
 
-        Text {
-            text: event.time-label;
-            font-size: 12px;
-            color: Theme.text-muted;
-            width: 110px;
-            vertical-alignment: center;
-        }
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: event.member-color;
+                y: (parent.height - self.height) / 2;
+            }
 
-        Text {
-            text: event.summary;
-            font-size: 14px;
-            font-weight: 600;
-            color: Theme.text-primary;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            overflow: elide;
+            Text {
+                text: event.time-label;
+                font-size: 12px;
+                color: Theme.text-muted;
+                width: 110px;
+                vertical-alignment: center;
+            }
+
+            Text {
+                text: event.summary;
+                font-size: 14px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
         }
     }
 }
@@ -58,6 +64,7 @@ component AgendaBanner inherits Text {
 component AgendaDay inherits Rectangle {
     in property <WeekDayColumnData> day;
     in property <[bool]> member-visible;
+    callback event-tapped(WeekEventData);
 
     VerticalLayout {
         alignment: start;
@@ -76,6 +83,7 @@ component AgendaDay inherits Rectangle {
         for event in day.events: AgendaRow {
             event: event;
             member-visible: root.member-visible;
+            tapped => { root.event-tapped(event); }
         }
     }
 }
@@ -86,6 +94,7 @@ component AgendaDay inherits Rectangle {
 export component AgendaView inherits Rectangle {
     in property <[WeekDayColumnData]> days;
     in property <[bool]> member-visible;
+    callback event-tapped(WeekEventData);
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -106,6 +115,7 @@ export component AgendaView inherits Rectangle {
             for day in days: AgendaDay {
                 day: day;
                 member-visible: root.member-visible;
+                event-tapped(ev) => { root.event-tapped(ev); }
             }
         }
     }

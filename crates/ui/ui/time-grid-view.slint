@@ -78,6 +78,7 @@ component DayHeader inherits Rectangle {
 component EventCard inherits Rectangle {
     in property <WeekEventData> event;
     in property <[bool]> member-visible;
+    callback tapped();
     visible: root.event.member-index < 0 || root.member-visible.length == 0
         || root.event.member-index >= root.member-visible.length
         || root.member-visible[root.event.member-index];
@@ -89,10 +90,7 @@ component EventCard inherits Rectangle {
     clip: true;
 
     touch := TouchArea {
-        clicked => {
-            // No event-detail view yet -- just confirms the tap landed.
-            debug("calendar event tapped: " + event.summary);
-        }
+        clicked => { root.tapped(); }
     }
 
     VerticalLayout {
@@ -139,6 +137,7 @@ component DayColumn inherits Rectangle {
     in property <length> row-height;
     in property <int> column-index;
     callback slot-tapped(int /* column */, int /* hour */);
+    callback event-tapped(WeekEventData);
 
     background: day.is-today ? Theme.accent.with-alpha(0.06) : transparent;
     height: row-height * 24;
@@ -163,6 +162,7 @@ component DayColumn inherits Rectangle {
         width: root.width - 4px;
         y: root.row-height * event.start-minutes / 60;
         height: root.row-height * event.duration-minutes / 60;
+        tapped => { root.event-tapped(event); }
     }
 }
 
@@ -179,6 +179,9 @@ export component TimeGridView inherits Rectangle {
     // never show anything but the current week/today, so it can always
     // resolve "column N of what's currently displayed" itself.
     callback slot-tapped(int /* column */, int /* hour */);
+    // Handled entirely in `.slint` (see AppWindow) -- everything needed to
+    // show details is already in `WeekEventData`, no Rust round-trip needed.
+    callback event-tapped(WeekEventData);
 
     property <length> row-height: 64px;
     property <length> ruler-width: 56px;
@@ -236,6 +239,7 @@ export component TimeGridView inherits Rectangle {
                     column-index: idx;
                     horizontal-stretch: 1;
                     slot-tapped(col, h) => { root.slot-tapped(col, h); }
+                    event-tapped(ev) => { root.event-tapped(ev); }
                 }
             }
         }

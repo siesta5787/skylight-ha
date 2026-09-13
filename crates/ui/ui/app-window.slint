@@ -8,6 +8,7 @@ import { AgendaView } from "agenda-view.slint";
 import { TodoCard, TodoColumnData } from "todo-card.slint";
 import { PlaceholderView } from "placeholder-view.slint";
 import { EventCreateForm, EventFormMember } from "event-create-form.slint";
+import { EventDetailView } from "event-detail-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -167,10 +168,28 @@ export component AppWindow inherits Window {
     in property <[EventFormMember]> event-form-members;
     callback event-create-confirmed(int /* member index */, int /* duration minutes */);
 
+    // Viewing an existing event's details is handled entirely in `.slint`:
+    // everything needed (summary/time/color/member index) is already in the
+    // `WeekEventData` that was tapped, no Rust round-trip required.
+    property <bool> event-detail-open: false;
+    property <string> event-detail-summary;
+    property <string> event-detail-time;
+    property <string> event-detail-member-name;
+    property <color> event-detail-member-color;
+
     // Page/view-mode switching is pure `.slint` state -- Rust never needs to
     // know which page or calendar mode is active.
     property <Page> current-page: Page.Calendar;
     property <CalendarViewMode> current-calendar-mode: CalendarViewMode.Month;
+
+    function show-event-detail(ev: WeekEventData) {
+        event-detail-summary = ev.summary;
+        event-detail-time = ev.time-label;
+        event-detail-member-color = ev.member-color;
+        event-detail-member-name = (ev.member-index >= 0 && ev.member-index < members.length)
+            ? members[ev.member-index].name : "";
+        event-detail-open = true;
+    }
 
     HorizontalLayout {
         Sidebar {
@@ -271,6 +290,7 @@ export component AppWindow inherits Window {
                             member-visible: root.member-visible;
                             hour-labels: root.hour-labels;
                             slot-tapped(col, hour) => { root.week-slot-tapped(col, hour); }
+                            event-tapped(ev) => { root.show-event-detail(ev); }
                         }
                         if root.current-calendar-mode == CalendarViewMode.Day: TimeGridView {
                             width: 100%;
@@ -279,12 +299,14 @@ export component AppWindow inherits Window {
                             member-visible: root.member-visible;
                             hour-labels: root.hour-labels;
                             slot-tapped(col, hour) => { root.day-slot-tapped(hour); }
+                            event-tapped(ev) => { root.show-event-detail(ev); }
                         }
                         if root.current-calendar-mode == CalendarViewMode.Agenda: AgendaView {
                             width: 100%;
                             height: 100%;
                             days: root.calendar-agenda;
                             member-visible: root.member-visible;
+                            event-tapped(ev) => { root.show-event-detail(ev); }
                         }
 
                         NewEventButton {
@@ -332,5 +354,14 @@ export component AppWindow inherits Window {
             root.event-form-open = false;
             root.event-create-confirmed(event_form.selected-member, event_form.duration-minutes);
         }
+    }
+
+    EventDetailView {
+        open: root.event-detail-open;
+        summary: root.event-detail-summary;
+        time-label: root.event-detail-time;
+        member-name: root.event-detail-member-name;
+        member-color: root.event-detail-member-color;
+        closed => { root.event-detail-open = false; }
     }
 }

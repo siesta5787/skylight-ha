@@ -644,8 +644,10 @@ fn build_calendar_grids(
                     ev.end.date_time.map(|dt| dt.to_offset(local_offset)).unwrap_or(local_start);
                 let start_minutes = local_start.hour() as i32 * 60 + local_start.minute() as i32;
                 // Clamped to a sane minimum so very short (or zero-length,
-                // e.g. malformed) events still render as a visible block.
-                let duration_minutes = ((local_end - local_start).whole_minutes() as i32).max(20);
+                // e.g. malformed) events still render as a visible, tappable
+                // block -- 20min (~21px at the default row height) turned
+                // out to be a hard target to hit precisely on a touchscreen.
+                let duration_minutes = ((local_end - local_start).whole_minutes() as i32).max(30);
 
                 let bucket = buckets.entry(local_start.date()).or_default();
                 bucket.month_entries.push(CalendarEventDot {
