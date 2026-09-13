@@ -7,19 +7,26 @@ base_url = "http://homeassistant.local:8123"
 # permissions restricted (chmod 600 on the target device).
 token_path = "./ha-token.secret"
 
-[[family]]
-id = "alice"
-name = "Alice"
-color = "#e0607a"
-todo_entity = "todo.chores_alice"
-calendar_entity = "calendar.alice"
-
-[[family]]
-id = "bob"
-name = "Bob"
-color = "#4f8ef7"
-todo_entity = "todo.chores_bob"
-calendar_entity = "calendar.bob"
+# No [[family]] entries needed -- the dashboard auto-discovers the family
+# roster from whatever todo.*/calendar.* entities exist in HA once it
+# connects (see discover_family in apps/skylight-ha/src/main.rs): each
+# todo.* entity becomes a member, and a calendar.* entity attaches to the
+# member with the same slug (e.g. todo.alice + calendar.alice) if one
+# exists, or becomes its own member otherwise (e.g. a shared household
+# calendar that isn't any one person's). Names come from each entity's
+# friendly_name, colors are auto-assigned from a fixed palette.
+#
+# Add [[family]] blocks below only if you want to override that -- custom
+# colors, a specific display order, or pairing a todo list with a calendar
+# that doesn't share its entity-id slug. Non-empty [[family]] here is used
+# verbatim instead of discovery. Example:
+#
+# [[family]]
+# id = "alice"
+# name = "Alice"
+# color = "#e0607a"
+# todo_entity = "todo.chores_alice"
+# calendar_entity = "calendar.alice"
 
 [[views]]
 name = "Home"
