@@ -479,8 +479,21 @@ async fn refresh_calendar_and_todos(
     // thread and handed across into that closure.
     let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
     let (per_member_todos, connection_alive) = fetch_todos(client, family).await;
-    let family_owned = family.to_vec();
 
+    if !connection_alive {
+        // Don't push this over what's already correctly on screen -- a
+        // dead-connection fetch means `per_member_todos` is empty for
+        // everyone, and briefly showing that (then the real data popping
+        // back in once reconnected) is exactly the flash the previous fix
+        // still had: it reconnected promptly, but still committed the
+        // empty result to the UI the instant it noticed, before the
+        // reconnect even started. Leaving the old data in place and letting
+        // the caller's immediate retry-after-reconnect refresh it is the
+        // fix -- nothing visibly changes unless a fetch actually succeeds.
+        return false;
+    }
+
+    let family_owned = family.to_vec();
     let app_weak = app_weak.clone();
     let todo_uids = todo_uids.clone();
     let _ = slint::invoke_from_event_loop(move || {
@@ -493,7 +506,7 @@ async fn refresh_calendar_and_todos(
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
     });
 
-    connection_alive
+    true
 }
 
 /// Connects to HA, resolves the family roster (config.toml's `[[family]]`
