@@ -116,13 +116,22 @@ export component TopBar inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
-            spacing: 8px;
-            alignment: start;
-            for member[idx] in members: MemberChip {
-                member: member;
-                visible-on-calendar: idx < root.member-visible.length && root.member-visible[idx];
-                tapped => { root.member-toggled(idx); }
+        // Scrollable rather than a plain HorizontalLayout: with a large or
+        // auto-discovered family (see discover_family in main.rs -- a real
+        // household ended up with 10 entries) a fixed-width row of chips
+        // can overflow the window, same overflow bug the event-creation
+        // form's member picker had.
+        Flickable {
+            height: 30px;
+            HorizontalLayout {
+                height: 30px;
+                spacing: 8px;
+                alignment: start;
+                for member[idx] in members: MemberChip {
+                    member: member;
+                    visible-on-calendar: idx < root.member-visible.length && root.member-visible[idx];
+                    tapped => { root.member-toggled(idx); }
+                }
             }
         }
     }

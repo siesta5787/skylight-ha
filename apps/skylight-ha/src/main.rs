@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dashboard_config::{Config, FamilyMember};
-use ha_client::entities::{CalendarEvent, TodoItem, TodoStatus};
+use ha_client::entities::{CalendarEvent, EntityState, TodoItem, TodoStatus};
 use ha_client::{Client, RestClient};
 use slint::{ComponentHandle, Model, SharedString};
 use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Weekday};
@@ -36,29 +36,18 @@ fn main() {
     app.set_month_label(month_label_for(today).into());
 
     // Correctly-shaped but empty grids/columns, so the layout is right
-    // immediately rather than popping in once HA responds.
+    // immediately rather than popping in once HA responds. The family
+    // roster itself (chips/columns/member-visible/event-form-members) stays
+    // empty until `run_ha_sync` resolves it below -- `config.family` is
+    // usually empty too (see `discover_family`), so there's nothing
+    // meaningful to seed it with yet anyway.
     let empty_grids = build_calendar_grids(local_offset, today, &[]);
     apply_calendar_grids(&app, empty_grids);
     let (empty_todos, _, empty_chips) =
         build_todo_model(&config.family, &vec![Vec::new(); config.family.len()]);
     app.set_todo_columns(empty_todos);
     app.set_members(slint::ModelRc::new(slint::VecModel::from(empty_chips)));
-    // Set once, here, and never touched again -- toggling a chip afterward
-    // is pure `.slint` state (see app-window.slint's `member-visible`).
-    app.set_member_visible(slint::ModelRc::new(slint::VecModel::from(vec![
-        true;
-        config.family.len()
-    ])));
-    app.set_event_form_members(slint::ModelRc::new(slint::VecModel::from(
-        config
-            .family
-            .iter()
-            .map(|m| EventFormMember {
-                name: m.name.clone().into(),
-                color: parse_hex_color(&m.color),
-            })
-            .collect::<Vec<_>>(),
-    )));
+    apply_family_roster(&app, &config.family);
 
     // Runtime is created up front (rather than just before `app.run()`, as
     // before) so its `Handle` can be captured by callbacks below that need
@@ -71,20 +60,23 @@ fn main() {
     // registered before that happens, so they reach through these.
     let live_client: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
     let live_rest: Arc<Mutex<Option<RestClient>>> = Arc::new(Mutex::new(None));
-    // [column][item] -> that item's HA uid, refreshed on every fetch so the
-    // todo-toggle callback can resolve which item was tapped.
-    let todo_uids: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    // The actual family roster -- either `config.family` verbatim (if you
+    // filled it in) or auto-discovered from HA's todo/calendar entities
+    // (see `discover_family`) once `run_ha_sync` connects. Every callback
+    // below reads this fresh at call time rather than capturing a snapshot,
+    // since it isn't known for certain until after connecting.
+    let family_state: Arc<Mutex<Vec<FamilyMember>>> = Arc::new(Mutex::new(config.family.clone()));
+    // (column index into the Tasks page) -> (that column's todo entity id,
+    // the uid of each item) -- only members with a todo_entity get a
+    // column, so this is a *different*, potentially shorter, index space
+    // than `family_state`. Refreshed on every fetch.
+    let todo_uids: Arc<Mutex<Vec<(String, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
     // The date Month/Week/Day view are currently centered on -- shared
     // across all three (switching view mode keeps your place), moved by the
     // nav-prev/next/today callbacks below. `Arc<Mutex<_>>` rather than
     // `Rc<RefCell<_>>` because the periodic refresh reads it from a tokio
     // worker thread.
     let reference_date: Arc<Mutex<Date>> = Arc::new(Mutex::new(today));
-    let todo_entities: Vec<String> =
-        config.family.iter().map(|m| m.todo_entity.clone()).collect();
-    let calendar_entities: Vec<Option<String>> =
-        config.family.iter().map(|m| m.calendar_entity.clone()).collect();
-    let family: Vec<FamilyMember> = config.family.clone();
     // (date, hour) of the last-tapped empty calendar slot, read back when
     // the create-event form is confirmed. UI-thread-only, so a plain
     // `Rc<RefCell<_>>` is fine -- unlike the `Arc<Mutex<_>>`s above, nothing
@@ -98,28 +90,29 @@ fn main() {
         let rt_handle = rt_handle.clone();
         app.on_todo_item_toggled(move |col, item| {
             let Some(app) = app_weak.upgrade() else { return };
-            let Some(entity_id) = todo_entities.get(col as usize) else { return };
-            let Some(uid) = todo_uids
+            let entry = todo_uids
                 .lock()
                 .unwrap()
                 .get(col as usize)
-                .and_then(|items| items.get(item as usize).cloned())
-            else {
-                return;
-            };
+                .and_then(|(entity_id, uids)| {
+                    uids.get(item as usize).map(|uid| (entity_id.clone(), uid.clone()))
+                });
+            let Some((entity_id, uid)) = entry else { return };
 
             // Optimistic UI update -- flip the checkbox immediately rather
             // than waiting on the HA round-trip; a failed call gets quietly
             // corrected by the next periodic refresh.
             let Some(column) = app.get_todo_columns().row_data(col as usize) else { return };
-            let Some(mut entry) = column.items.row_data(item as usize) else { return };
-            entry.completed = !entry.completed;
-            let new_status =
-                if entry.completed { TodoStatus::Completed } else { TodoStatus::NeedsAction };
-            column.items.set_row_data(item as usize, entry);
+            let Some(mut item_entry) = column.items.row_data(item as usize) else { return };
+            item_entry.completed = !item_entry.completed;
+            let new_status = if item_entry.completed {
+                TodoStatus::Completed
+            } else {
+                TodoStatus::NeedsAction
+            };
+            column.items.set_row_data(item as usize, item_entry);
 
             if let Some(client) = live_client.lock().unwrap().clone() {
-                let entity_id = entity_id.clone();
                 rt_handle.spawn(async move {
                     if let Err(err) = client.todo_update_item(&entity_id, &uid, new_status).await {
                         tracing::warn!(%err, "failed to update HA todo item");
@@ -178,14 +171,14 @@ fn main() {
         });
     }
     {
-        let app_weak = app.as_weak();
         let live_client = live_client.clone();
         let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let pending_slot = pending_slot.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
+        let app_weak = app.as_weak();
         app.on_event_create_confirmed(move |member_index, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
             // Falls back to whichever family member actually has a
@@ -194,12 +187,14 @@ fn main() {
             // calendar per person -- has exactly one member configured with
             // calendar_entity at all, so picking anyone else in the form
             // used to silently create nothing).
-            let Some(entity_id) = calendar_entities
-                .get(member_index as usize)
-                .cloned()
-                .flatten()
-                .or_else(|| calendar_entities.iter().flatten().next().cloned())
-            else {
+            let entity_id = {
+                let family = family_state.lock().unwrap();
+                family
+                    .get(member_index as usize)
+                    .and_then(|m| m.calendar_entity.clone())
+                    .or_else(|| family.iter().find_map(|m| m.calendar_entity.clone()))
+            };
+            let Some(entity_id) = entity_id else {
                 tracing::warn!("no family member has a calendar_entity configured, can't create event");
                 return;
             };
@@ -215,7 +210,7 @@ fn main() {
             let live_rest = live_rest.clone();
             let todo_uids = todo_uids.clone();
             let ref_date = *reference_date.lock().unwrap();
-            let family = family.clone();
+            let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
                 // Fixed placeholder title -- no on-screen keyboard exists
                 // yet in this app, so free-text entry isn't wired up here.
@@ -228,10 +223,9 @@ fn main() {
                 // The whole point of tapping "Create" is to see it show up
                 // -- don't make the user wait up to 5 minutes for the next
                 // periodic refresh. (Binding the guard first and dropping it
-                // before the `if let` matters: a `MutexGuard` created
-                // directly in an `if let` scrutinee stays alive for the
-                // whole block, including across the `.await` below, which
-                // isn't `Send`.)
+                // before use matters -- a `MutexGuard` created directly in
+                // an `if let` scrutinee stays alive for the whole block,
+                // including across the `.await` below, which isn't `Send`.)
                 let rest = live_rest.lock().unwrap().clone();
                 if let Some(rest) = rest {
                     refresh_calendar_and_todos(
@@ -260,7 +254,7 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
         app.on_nav_month(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -268,6 +262,7 @@ fn main() {
                 *guard
             };
             navigate(&app_weak, new_date);
+            let family = family_state.lock().unwrap().clone();
             spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
         });
     }
@@ -278,7 +273,7 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
         app.on_nav_week(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -286,6 +281,7 @@ fn main() {
                 *guard
             };
             navigate(&app_weak, new_date);
+            let family = family_state.lock().unwrap().clone();
             spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
         });
     }
@@ -296,7 +292,7 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
         app.on_nav_day(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -304,6 +300,7 @@ fn main() {
                 *guard
             };
             navigate(&app_weak, new_date);
+            let family = family_state.lock().unwrap().clone();
             spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
         });
     }
@@ -314,11 +311,12 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
         app.on_nav_today(move || {
             let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
             *reference_date.lock().unwrap() = new_date;
             navigate(&app_weak, new_date);
+            let family = family_state.lock().unwrap().clone();
             spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
         });
     }
@@ -329,9 +327,10 @@ fn main() {
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
-        let family = family.clone();
+        let family_state = family_state.clone();
         app.on_manual_refresh_requested(move || {
             let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
             spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids);
         });
     }
@@ -353,7 +352,16 @@ fn main() {
         },
     );
 
-    rt.spawn(run_ha_sync(config, app.as_weak(), local_offset, live_client, live_rest, todo_uids, reference_date));
+    rt.spawn(run_ha_sync(
+        config,
+        app.as_weak(),
+        local_offset,
+        live_client,
+        live_rest,
+        todo_uids,
+        reference_date,
+        family_state,
+    ));
 
     app.run().expect("event loop error");
 }
@@ -362,6 +370,23 @@ fn navigate(app_weak: &slint::Weak<AppWindow>, new_date: Date) {
     if let Some(app) = app_weak.upgrade() {
         app.set_month_label(month_label_for(new_date).into());
     }
+}
+
+/// Sets the UI state that only changes when the family roster itself
+/// changes (as opposed to `members`/`todo_columns`, which are rebuilt on
+/// every fetch): the calendar-visibility toggle array and the
+/// event-creation form's member picker.
+fn apply_family_roster(app: &AppWindow, family: &[FamilyMember]) {
+    app.set_member_visible(slint::ModelRc::new(slint::VecModel::from(vec![true; family.len()])));
+    app.set_event_form_members(slint::ModelRc::new(slint::VecModel::from(
+        family
+            .iter()
+            .map(|m| EventFormMember {
+                name: m.name.clone().into(),
+                color: parse_hex_color(&m.color),
+            })
+            .collect::<Vec<_>>(),
+    )));
 }
 
 /// Fetches + rebuilds + pushes to the UI using whichever `Client`/`RestClient`
@@ -375,7 +400,7 @@ fn spawn_refresh(
     local_offset: UtcOffset,
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
-    todo_uids: &Arc<Mutex<Vec<Vec<String>>>>,
+    todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
 ) {
     let (Some(rest), Some(client)) =
         (live_rest.lock().unwrap().clone(), live_client.lock().unwrap().clone())
@@ -386,16 +411,8 @@ fn spawn_refresh(
     let app_weak = app_weak.clone();
     let todo_uids = todo_uids.clone();
     rt_handle.spawn(async move {
-        refresh_calendar_and_todos(
-            &rest,
-            &client,
-            &family,
-            local_offset,
-            reference_date,
-            &app_weak,
-            &todo_uids,
-        )
-        .await;
+        refresh_calendar_and_todos(&rest, &client, &family, local_offset, reference_date, &app_weak, &todo_uids)
+            .await;
     });
 }
 
@@ -448,7 +465,7 @@ async fn refresh_calendar_and_todos(
     local_offset: UtcOffset,
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
-    todo_uids: &Arc<Mutex<Vec<Vec<String>>>>,
+    todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
 ) {
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let range_start = grid_start.midnight().assume_offset(local_offset);
@@ -476,18 +493,22 @@ async fn refresh_calendar_and_todos(
     });
 }
 
-/// Connects to HA, then keeps calendar/todo data flowing into the UI on a
-/// fixed interval (`tokio::time::interval`'s first tick fires immediately,
-/// so this one loop covers both "on connect" and "periodically"). Nav taps
-/// and event creation refresh independently of this loop via `spawn_refresh`.
+/// Connects to HA, resolves the family roster (config.toml's `[[family]]`
+/// if you filled it in, otherwise auto-discovered -- see `discover_family`),
+/// then keeps calendar/todo data flowing into the UI on a fixed interval
+/// (`tokio::time::interval`'s first tick fires immediately, so this one loop
+/// covers both "on connect" and "periodically"). Nav taps and event
+/// creation refresh independently of this loop via `spawn_refresh`.
+#[allow(clippy::too_many_arguments)]
 async fn run_ha_sync(
     config: Config,
     app_weak: slint::Weak<AppWindow>,
     local_offset: UtcOffset,
     live_client: Arc<Mutex<Option<Client>>>,
     live_rest: Arc<Mutex<Option<RestClient>>>,
-    todo_uids: Arc<Mutex<Vec<Vec<String>>>>,
+    todo_uids: Arc<Mutex<Vec<(String, Vec<String>)>>>,
     reference_date: Arc<Mutex<Date>>,
+    family_state: Arc<Mutex<Vec<FamilyMember>>>,
 ) {
     let token = match config.ha.load_token() {
         Ok(token) => token,
@@ -508,23 +529,119 @@ async fn run_ha_sync(
     let rest = RestClient::new(&config.ha.base_url, &token);
     *live_rest.lock().unwrap() = Some(rest.clone());
 
+    // `config.toml`'s `[[family]]` is a manual override for people who want
+    // custom colors/order/pairing; leaving it empty (the default going
+    // forward) means nobody has to hand-edit entity ids to get a working
+    // dashboard -- it's discovered from whatever todo/calendar entities
+    // actually exist in HA instead.
+    let family = if config.family.is_empty() {
+        let discovered = discover_family(&client).await;
+        tracing::info!(count = discovered.len(), "discovered family roster from HA");
+        discovered
+    } else {
+        config.family.clone()
+    };
+    *family_state.lock().unwrap() = family.clone();
+    {
+        let app_weak = app_weak.clone();
+        let family = family.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = app_weak.upgrade() {
+                apply_family_roster(&app, &family);
+            }
+        });
+    }
+
     // docs/plan.md's stated cadence for calendar polling (it isn't pushed
     // over the HA websocket, unlike todos/entity states).
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     loop {
         interval.tick().await;
         let ref_date = *reference_date.lock().unwrap();
-        refresh_calendar_and_todos(
-            &rest,
-            &client,
-            &config.family,
-            local_offset,
-            ref_date,
-            &app_weak,
-            &todo_uids,
-        )
-        .await;
+        let family = family_state.lock().unwrap().clone();
+        refresh_calendar_and_todos(&rest, &client, &family, local_offset, ref_date, &app_weak, &todo_uids).await;
     }
+}
+
+/// Builds a family roster from whatever `todo.*`/`calendar.*` entities
+/// exist in HA, rather than requiring `[[family]]` to be hand-written in
+/// config.toml. A `todo.*` entity becomes a member (named from its
+/// `friendly_name`, falling back to title-casing the entity id); a
+/// `calendar.*` entity is attached to the member with the same slug (e.g.
+/// `todo.jesse` + `calendar.jesse`) if one exists, otherwise it becomes its
+/// own member with no todo list (e.g. a shared household calendar that
+/// isn't any one person's).
+async fn discover_family(client: &Client) -> Vec<FamilyMember> {
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to list HA entities for family-roster discovery");
+            return Vec::new();
+        }
+    };
+
+    fn friendly_name(state: &EntityState) -> Option<String> {
+        state.attributes.get("friendly_name")?.as_str().map(str::to_string)
+    }
+
+    let mut todos: Vec<(String, String, String)> = Vec::new(); // (slug, entity_id, name)
+    let mut calendars: BTreeMap<String, (String, String)> = BTreeMap::new(); // slug -> (entity_id, name)
+
+    for state in &states {
+        if let Some(slug) = state.entity_id.strip_prefix("todo.") {
+            let name = friendly_name(state).unwrap_or_else(|| titlecase_slug(slug));
+            todos.push((slug.to_string(), state.entity_id.clone(), name));
+        } else if let Some(slug) = state.entity_id.strip_prefix("calendar.") {
+            let name = friendly_name(state).unwrap_or_else(|| titlecase_slug(slug));
+            calendars.insert(slug.to_string(), (state.entity_id.clone(), name));
+        }
+    }
+    todos.sort_by(|a, b| a.0.cmp(&b.0)); // stable across runs
+
+    const PALETTE: &[&str] = &[
+        "#4f8ef7", "#e0607a", "#f2b705", "#8b5cf6", "#22c55e", "#f97316", "#64748b", "#06b6d4",
+        "#ec4899", "#84cc16",
+    ];
+    let mut members = Vec::new();
+
+    for (slug, todo_entity, name) in todos {
+        let calendar_entity = calendars.remove(&slug).map(|(id, _)| id);
+        let color = PALETTE[members.len() % PALETTE.len()].to_string();
+        members.push(FamilyMember {
+            id: slug,
+            name,
+            color,
+            todo_entity: Some(todo_entity),
+            calendar_entity,
+        });
+    }
+
+    // Calendars that didn't match any todo list's slug -- most commonly a
+    // single shared household calendar -- become their own entries.
+    let mut leftover_calendars: Vec<_> = calendars.into_iter().collect();
+    leftover_calendars.sort_by(|a, b| a.0.cmp(&b.0));
+    for (slug, (entity_id, name)) in leftover_calendars {
+        let color = PALETTE[members.len() % PALETTE.len()].to_string();
+        members.push(FamilyMember { id: slug, name, color, todo_entity: None, calendar_entity: Some(entity_id) });
+    }
+
+    members
+}
+
+/// "brielle_todo" -> "Brielle Todo" -- used when an entity has no
+/// `friendly_name` attribute to fall back on.
+fn titlecase_slug(slug: &str) -> String {
+    slug.split('_')
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn fetch_calendar_events(
@@ -551,12 +668,15 @@ async fn fetch_calendar_events(
 async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> Vec<Vec<TodoItem>> {
     let mut out = Vec::with_capacity(family.len());
     for member in family {
-        let items = match client.todo_items(&member.todo_entity).await {
-            Ok(items) => items,
-            Err(err) => {
-                tracing::warn!(entity = %member.todo_entity, %err, "failed to fetch todo items");
-                Vec::new()
-            }
+        let items = match &member.todo_entity {
+            Some(entity) => match client.todo_items(entity).await {
+                Ok(items) => items,
+                Err(err) => {
+                    tracing::warn!(entity = %entity, %err, "failed to fetch todo items");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
         };
         out.push(items);
     }
@@ -743,22 +863,32 @@ fn build_calendar_grids(
     }
 }
 
-/// One column/tab per configured family member: their todo list (for the
-/// Tasks page), the uid of each item (so the toggle callback can resolve
-/// which item was tapped), and their completion ratio (for the top-bar chip).
+/// Builds the Tasks page's columns (only members with a `todo_entity` get
+/// one -- a calendar-only entry, e.g. a shared household calendar, has
+/// nothing to show there), the uid map that goes with those columns in the
+/// same order (so the toggle callback can resolve which item was tapped),
+/// and the top-bar chips (every member, calendar-only ones included, since
+/// they're still toggleable for calendar visibility).
 fn build_todo_model(
     family: &[FamilyMember],
     per_member_items: &[Vec<TodoItem>],
-) -> (slint::ModelRc<TodoColumnData>, Vec<Vec<String>>, Vec<MemberChipData>) {
-    let mut columns = Vec::with_capacity(family.len());
-    let mut uid_map = Vec::with_capacity(family.len());
+) -> (slint::ModelRc<TodoColumnData>, Vec<(String, Vec<String>)>, Vec<MemberChipData>) {
+    let mut columns = Vec::new();
+    let mut uid_map = Vec::new();
     let mut chips = Vec::with_capacity(family.len());
 
     for (member, items) in family.iter().zip(per_member_items) {
         let color = parse_hex_color(&member.color);
         let completed = items.iter().filter(|i| i.status == TodoStatus::Completed).count();
 
-        uid_map.push(items.iter().map(|i| i.uid.clone()).collect());
+        chips.push(MemberChipData {
+            name: member.name.clone().into(),
+            color,
+            completed: completed as i32,
+            total: items.len() as i32,
+        });
+
+        let Some(todo_entity) = &member.todo_entity else { continue };
 
         let item_data: Vec<TodoItemData> = items
             .iter()
@@ -772,13 +902,7 @@ fn build_todo_model(
             member_color: color,
             items: slint::ModelRc::new(slint::VecModel::from(item_data)),
         });
-
-        chips.push(MemberChipData {
-            name: member.name.clone().into(),
-            color,
-            completed: completed as i32,
-            total: items.len() as i32,
-        });
+        uid_map.push((todo_entity.clone(), items.iter().map(|i| i.uid.clone()).collect()));
     }
 
     (slint::ModelRc::new(slint::VecModel::from(columns)), uid_map, chips)

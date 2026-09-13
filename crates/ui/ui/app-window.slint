@@ -191,6 +191,17 @@ export component AppWindow inherits Window {
         event-detail-open = true;
     }
 
+    // Month view's dots carry no per-event time (day-level grouping only),
+    // so this variant just leaves that line blank.
+    function show-calendar-event-detail(dot: CalendarEventDot) {
+        event-detail-summary = dot.summary;
+        event-detail-time = "";
+        event-detail-member-color = dot.member-color;
+        event-detail-member-name = (dot.member-index >= 0 && dot.member-index < members.length)
+            ? members[dot.member-index].name : "";
+        event-detail-open = true;
+    }
+
     HorizontalLayout {
         Sidebar {
             active-page: root.current-page;
@@ -282,6 +293,7 @@ export component AppWindow inherits Window {
                             weeks: root.calendar-month;
                             member-visible: root.member-visible;
                             day-selected(week, day) => { root.month-slot-tapped(week, day); }
+                            event-tapped(dot) => { root.show-calendar-event-detail(dot); }
                         }
                         if root.current-calendar-mode == CalendarViewMode.Week: TimeGridView {
                             width: 100%;

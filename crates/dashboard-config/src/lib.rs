@@ -50,13 +50,19 @@ impl HaConnection {
 
 /// A family member the dashboard tracks. Todos are per-person: each member
 /// has their own HA `todo.*` entity rather than everyone sharing one list.
+/// Usually built by auto-discovering `todo.*`/`calendar.*` entities from HA
+/// at connect time (see `apps/skylight-ha`'s `discover_family`) rather than
+/// hand-written here -- `[[family]]` in config.toml is only consulted as a
+/// manual override when non-empty (custom colors/order/pairing). Either way
+/// isn't guaranteed to have both: a shared household calendar with no
+/// matching todo list becomes its own entry with `todo_entity: None`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FamilyMember {
     pub id: String,
     pub name: String,
     /// Hex color, e.g. "#4f8ef7", used for their calendar events and todo tab.
     pub color: String,
-    pub todo_entity: String,
+    pub todo_entity: Option<String>,
     pub calendar_entity: Option<String>,
 }
 

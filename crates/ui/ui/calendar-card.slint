@@ -21,20 +21,25 @@ component EventLine inherits Rectangle {
         || dot.member-index >= root.member-visible.length
         || root.member-visible[dot.member-index];
     in property <[bool]> member-visible;
+    callback tapped();
 
     height: 15px;
-    background: dot.member-color.with-alpha(0.20);
+    background: dot.member-color.with-alpha(touch.pressed ? 0.40 : 0.20);
     border-radius: 3px;
 
-    Text {
-        x: 4px;
-        width: parent.width - 6px;
-        text: dot.summary;
-        font-size: 9px;
-        font-weight: 600;
-        color: Theme.text-primary;
-        overflow: elide;
-        vertical-alignment: center;
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+
+        Text {
+            x: 4px;
+            width: parent.width - 6px;
+            text: dot.summary;
+            font-size: 9px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            overflow: elide;
+            vertical-alignment: center;
+        }
     }
 }
 
@@ -51,6 +56,7 @@ component DayCell inherits Rectangle {
     // Tapping an empty part of a day cell is how new events get created in
     // Month view too (mirrors tapping an hour slot in Week/Day view).
     callback tapped();
+    callback event-tapped(CalendarEventDot);
 
     border-width: 1px;
     border-color: Theme.border;
@@ -89,6 +95,7 @@ component DayCell inherits Rectangle {
             for dot in day.events: EventLine {
                 dot: dot;
                 member-visible: root.member-visible;
+                tapped => { root.event-tapped(dot); }
             }
         }
     }
@@ -104,6 +111,9 @@ export component CalendarCard inherits Rectangle {
     // (week, day) grid indices of the tapped cell -- used to open the
     // event-creation form pre-filled to that date.
     callback day-selected(int /* week */, int /* day */);
+    // Handled entirely in `.slint` (see AppWindow) -- everything needed to
+    // show details is already in `CalendarEventDot`.
+    callback event-tapped(CalendarEventDot);
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -133,6 +143,7 @@ export component CalendarCard inherits Rectangle {
                 day: day;
                 member-visible: root.member-visible;
                 tapped => { root.day-selected(week-idx, day-idx); }
+                event-tapped(dot) => { root.event-tapped(dot); }
             }
         }
     }
