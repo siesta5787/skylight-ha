@@ -110,7 +110,7 @@ export component EventCreateForm inherits Rectangle {
     }
 
     Rectangle {
-        width: 460px;
+        width: 620px;
         height: 360px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
@@ -118,6 +118,7 @@ export component EventCreateForm inherits Rectangle {
         border-radius: Theme.radius;
         border-width: 1px;
         border-color: Theme.border;
+        clip: true;
 
         VerticalLayout {
             padding: 22px;
@@ -141,13 +142,22 @@ export component EventCreateForm inherits Rectangle {
                 font-weight: 600;
                 color: Theme.text-muted;
             }
-            HorizontalLayout {
-                spacing: 10px;
-                alignment: start;
-                for member[idx] in root.members: MemberButton {
-                    member: member;
-                    selected: idx == root.selected-member;
-                    tapped => { root.selected-member = idx; }
+            // Scrollable rather than a plain HorizontalLayout: a fixed-width
+            // row of fixed-size buttons overflows once there are more than
+            // ~5-6 family members (this bit a real 7-person household --
+            // the later buttons, including the one that actually had a
+            // calendar, were pushed off the edge and unreachable).
+            Flickable {
+                height: 74px;
+                HorizontalLayout {
+                    height: 74px;
+                    spacing: 10px;
+                    alignment: start;
+                    for member[idx] in root.members: MemberButton {
+                        member: member;
+                        selected: idx == root.selected-member;
+                        tapped => { root.selected-member = idx; }
+                    }
                 }
             }
 

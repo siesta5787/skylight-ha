@@ -3,11 +3,11 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use dashboard_config::Config;
+use dashboard_config::{Config, FamilyMember};
 use ha_client::entities::{CalendarEvent, TodoItem, TodoStatus};
 use ha_client::{Client, RestClient};
 use slint::{ComponentHandle, Model, SharedString};
-use time::{Date, Duration as TimeDuration, OffsetDateTime, UtcOffset, Weekday};
+use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Weekday};
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, EventFormMember,
     MemberChipData, TodoColumnData, TodoItemData, WeekDayColumnData, WeekEventData,
@@ -20,6 +20,7 @@ fn main() {
     // Unix it reads TZ state that a concurrent fork/exec could race), so this
     // has to happen before the tokio runtime spawns any worker threads.
     let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
+    let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
     let config = match Config::load(&config_path) {
@@ -32,10 +33,11 @@ fn main() {
 
     let app = AppWindow::new().expect("failed to create window");
     app.set_hour_labels(slint::ModelRc::new(slint::VecModel::from(hour_labels())));
+    app.set_month_label(month_label_for(today).into());
 
     // Correctly-shaped but empty grids/columns, so the layout is right
     // immediately rather than popping in once HA responds.
-    let empty_grids = build_calendar_grids(local_offset, &[]);
+    let empty_grids = build_calendar_grids(local_offset, today, &[]);
     apply_calendar_grids(&app, empty_grids);
     let (empty_todos, _, empty_chips) =
         build_todo_model(&config.family, &vec![Vec::new(); config.family.len()]);
@@ -65,19 +67,27 @@ fn main() {
     let rt_handle = rt.handle().clone();
     let _guard = rt.enter();
 
-    // Set once the HA WS connection comes up; several callbacks below are
-    // registered before that happens, so they reach through this.
+    // Set once the HA connection comes up; several callbacks below are
+    // registered before that happens, so they reach through these.
     let live_client: Arc<Mutex<Option<Client>>> = Arc::new(Mutex::new(None));
-    // [column][item] -> that item's HA uid, refreshed on every periodic
-    // fetch so the todo-toggle callback can resolve which item was tapped.
+    let live_rest: Arc<Mutex<Option<RestClient>>> = Arc::new(Mutex::new(None));
+    // [column][item] -> that item's HA uid, refreshed on every fetch so the
+    // todo-toggle callback can resolve which item was tapped.
     let todo_uids: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    // The date Month/Week/Day view are currently centered on -- shared
+    // across all three (switching view mode keeps your place), moved by the
+    // nav-prev/next/today callbacks below. `Arc<Mutex<_>>` rather than
+    // `Rc<RefCell<_>>` because the periodic refresh reads it from a tokio
+    // worker thread.
+    let reference_date: Arc<Mutex<Date>> = Arc::new(Mutex::new(today));
     let todo_entities: Vec<String> =
         config.family.iter().map(|m| m.todo_entity.clone()).collect();
     let calendar_entities: Vec<Option<String>> =
         config.family.iter().map(|m| m.calendar_entity.clone()).collect();
+    let family: Vec<FamilyMember> = config.family.clone();
     // (date, hour) of the last-tapped empty calendar slot, read back when
     // the create-event form is confirmed. UI-thread-only, so a plain
-    // `Rc<RefCell<_>>` is fine -- unlike `live_client`/`todo_uids`, nothing
+    // `Rc<RefCell<_>>` is fine -- unlike the `Arc<Mutex<_>>`s above, nothing
     // here ever crosses onto a tokio worker thread.
     let pending_slot: Rc<RefCell<Option<(Date, u8)>>> = Rc::new(RefCell::new(None));
 
@@ -119,16 +129,17 @@ fn main() {
         });
     }
 
-    // Slot taps: Month/Week/Day view all forward here, resolving to an
-    // actual (date, hour) themselves -- Week/Day/Month never show anything
-    // but the current week/today/this month, so "column 3" or grid cell
-    // (2,4) is always unambiguous, no extra data needs to flow out of Slint.
+    // Slot taps: Week/Day/Month view all forward here, resolving to an
+    // actual (date, hour) themselves using `reference_date` -- no extra
+    // data needs to flow out of Slint.
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let reference_date = reference_date.clone();
         app.on_month_slot_tapped(move |week, day| {
             let Some(app) = app_weak.upgrade() else { return };
-            let (grid_start, _) = month_grid_range(local_offset);
+            let ref_date = *reference_date.lock().unwrap();
+            let (grid_start, _) = month_grid_range(ref_date);
             let date = grid_start + TimeDuration::days(week as i64 * 7 + day as i64);
             open_event_form(&app, &pending_slot, date, 9);
         });
@@ -136,11 +147,12 @@ fn main() {
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let reference_date = reference_date.clone();
         app.on_week_slot_tapped(move |col, hour| {
             let Some(app) = app_weak.upgrade() else { return };
-            let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
+            let ref_date = *reference_date.lock().unwrap();
             let week_start =
-                today - TimeDuration::days(today.weekday().number_days_from_sunday() as i64);
+                ref_date - TimeDuration::days(ref_date.weekday().number_days_from_sunday() as i64);
             let date = week_start + TimeDuration::days(col as i64);
             open_event_form(&app, &pending_slot, date, hour as u8);
         });
@@ -148,10 +160,11 @@ fn main() {
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let reference_date = reference_date.clone();
         app.on_day_slot_tapped(move |hour| {
             let Some(app) = app_weak.upgrade() else { return };
-            let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
-            open_event_form(&app, &pending_slot, today, hour as u8);
+            let ref_date = *reference_date.lock().unwrap();
+            open_event_form(&app, &pending_slot, ref_date, hour as u8);
         });
     }
     {
@@ -165,15 +178,29 @@ fn main() {
         });
     }
     {
+        let app_weak = app.as_weak();
         let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let pending_slot = pending_slot.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
         app.on_event_create_confirmed(move |member_index, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
-            let Some(Some(entity_id)) =
-                calendar_entities.get(member_index as usize).cloned()
+            // Falls back to whichever family member actually has a
+            // calendar_entity if the selected one doesn't (a household with
+            // one shared calendar and per-person todo lists -- not a
+            // calendar per person -- has exactly one member configured with
+            // calendar_entity at all, so picking anyone else in the form
+            // used to silently create nothing).
+            let Some(entity_id) = calendar_entities
+                .get(member_index as usize)
+                .cloned()
+                .flatten()
+                .or_else(|| calendar_entities.iter().flatten().next().cloned())
             else {
-                tracing::warn!(member_index, "selected family member has no calendar_entity configured, can't create event");
+                tracing::warn!("no family member has a calendar_entity configured, can't create event");
                 return;
             };
             let Some(client) = live_client.lock().unwrap().clone() else {
@@ -184,6 +211,11 @@ fn main() {
             let start = start_naive.assume_offset(local_offset);
             let end = start + TimeDuration::minutes(duration_minutes as i64);
 
+            let app_weak = app_weak.clone();
+            let live_rest = live_rest.clone();
+            let todo_uids = todo_uids.clone();
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family.clone();
             rt_handle.spawn(async move {
                 // Fixed placeholder title -- no on-screen keyboard exists
                 // yet in this app, so free-text entry isn't wired up here.
@@ -191,8 +223,116 @@ fn main() {
                     create_calendar_event(&client, &entity_id, "New Event", start, end).await
                 {
                     tracing::warn!(%err, "failed to create HA calendar event");
+                    return;
+                }
+                // The whole point of tapping "Create" is to see it show up
+                // -- don't make the user wait up to 5 minutes for the next
+                // periodic refresh. (Binding the guard first and dropping it
+                // before the `if let` matters: a `MutexGuard` created
+                // directly in an `if let` scrutinee stays alive for the
+                // whole block, including across the `.await` below, which
+                // isn't `Send`.)
+                let rest = live_rest.lock().unwrap().clone();
+                if let Some(rest) = rest {
+                    refresh_calendar_and_todos(
+                        &rest,
+                        &client,
+                        &family,
+                        local_offset,
+                        ref_date,
+                        &app_weak,
+                        &todo_uids,
+                    )
+                    .await;
                 }
             });
+        });
+    }
+
+    // Prev/next/today: which unit a nav tap moves by (day/week/month) is
+    // decided in `.slint` based on the currently-active calendar view mode
+    // -- Rust doesn't track that, it just moves `reference_date` by
+    // whatever unit it's told and refreshes.
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
+        app.on_nav_month(move |delta| {
+            let new_date = {
+                let mut guard = reference_date.lock().unwrap();
+                *guard = add_months(*guard, delta);
+                *guard
+            };
+            navigate(&app_weak, new_date);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
+        app.on_nav_week(move |delta| {
+            let new_date = {
+                let mut guard = reference_date.lock().unwrap();
+                *guard += TimeDuration::days(7 * delta as i64);
+                *guard
+            };
+            navigate(&app_weak, new_date);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
+        app.on_nav_day(move |delta| {
+            let new_date = {
+                let mut guard = reference_date.lock().unwrap();
+                *guard += TimeDuration::days(delta as i64);
+                *guard
+            };
+            navigate(&app_weak, new_date);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
+        app.on_nav_today(move || {
+            let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
+            *reference_date.lock().unwrap() = new_date;
+            navigate(&app_weak, new_date);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family = family.clone();
+        app.on_manual_refresh_requested(move || {
+            let ref_date = *reference_date.lock().unwrap();
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids);
         });
     }
 
@@ -206,14 +346,57 @@ fn main() {
                 let now = OffsetDateTime::now_utc().to_offset(local_offset);
                 app.set_clock_text(format!("{:02}:{:02}", now.hour(), now.minute()).into());
                 app.set_date_text(format!("{}", now.date()).into());
-                app.set_month_label(format!("{} {}", now.month(), now.year()).into());
+                // Deliberately not touching `month_label` here -- it tracks
+                // `reference_date` (whatever's being navigated/viewed), not
+                // wall-clock "now"; the nav callbacks and initial setup own it.
             }
         },
     );
 
-    rt.spawn(run_ha_sync(config, app.as_weak(), local_offset, live_client, todo_uids));
+    rt.spawn(run_ha_sync(config, app.as_weak(), local_offset, live_client, live_rest, todo_uids, reference_date));
 
     app.run().expect("event loop error");
+}
+
+fn navigate(app_weak: &slint::Weak<AppWindow>, new_date: Date) {
+    if let Some(app) = app_weak.upgrade() {
+        app.set_month_label(month_label_for(new_date).into());
+    }
+}
+
+/// Fetches + rebuilds + pushes to the UI using whichever `Client`/`RestClient`
+/// are currently live; does nothing if HA isn't connected yet (the next nav
+/// tap or periodic refresh will pick it up once it is).
+fn spawn_refresh(
+    rt_handle: &tokio::runtime::Handle,
+    live_rest: &Arc<Mutex<Option<RestClient>>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    family: &[FamilyMember],
+    local_offset: UtcOffset,
+    reference_date: Date,
+    app_weak: &slint::Weak<AppWindow>,
+    todo_uids: &Arc<Mutex<Vec<Vec<String>>>>,
+) {
+    let (Some(rest), Some(client)) =
+        (live_rest.lock().unwrap().clone(), live_client.lock().unwrap().clone())
+    else {
+        return;
+    };
+    let family = family.to_vec();
+    let app_weak = app_weak.clone();
+    let todo_uids = todo_uids.clone();
+    rt_handle.spawn(async move {
+        refresh_calendar_and_todos(
+            &rest,
+            &client,
+            &family,
+            local_offset,
+            reference_date,
+            &app_weak,
+            &todo_uids,
+        )
+        .await;
+    });
 }
 
 fn open_event_form(
@@ -254,16 +437,57 @@ async fn create_calendar_event(
     Ok(())
 }
 
-/// Connects to HA and keeps calendar/todo data flowing into the UI: an
-/// initial fetch right after connecting, then a refresh on a fixed
-/// interval (`tokio::time::interval`'s first tick fires immediately, so
-/// this one loop covers both "on connect" and "periodically").
+/// One shared fetch (calendar events over the range around `reference_date`,
+/// plus todos) feeding all four calendar views + the Tasks page + top-bar
+/// chips. Used by the periodic refresh, right after creating an event, and
+/// by every nav callback.
+async fn refresh_calendar_and_todos(
+    rest: &RestClient,
+    client: &Client,
+    family: &[FamilyMember],
+    local_offset: UtcOffset,
+    reference_date: Date,
+    app_weak: &slint::Weak<AppWindow>,
+    todo_uids: &Arc<Mutex<Vec<Vec<String>>>>,
+) {
+    let (grid_start, grid_end) = month_grid_range(reference_date);
+    let range_start = grid_start.midnight().assume_offset(local_offset);
+    let range_end = grid_end.midnight().assume_offset(local_offset);
+
+    // Fetching returns plain (Send) data -- `CalendarEvent`/`TodoItem` are
+    // ordinary serde structs. Building the actual Slint models has to
+    // happen below, *inside* `invoke_from_event_loop`: `ModelRc` is
+    // `Rc`-based (not `Send`), so it can't be constructed on a tokio worker
+    // thread and handed across into that closure.
+    let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
+    let per_member_todos = fetch_todos(client, family).await;
+    let family_owned = family.to_vec();
+
+    let app_weak = app_weak.clone();
+    let todo_uids = todo_uids.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = app_weak.upgrade() else { return };
+        let grids = build_calendar_grids(local_offset, reference_date, &per_member_events);
+        apply_calendar_grids(&app, grids);
+        let (todo_columns, uid_map, chips) = build_todo_model(&family_owned, &per_member_todos);
+        *todo_uids.lock().unwrap() = uid_map;
+        app.set_todo_columns(todo_columns);
+        app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
+    });
+}
+
+/// Connects to HA, then keeps calendar/todo data flowing into the UI on a
+/// fixed interval (`tokio::time::interval`'s first tick fires immediately,
+/// so this one loop covers both "on connect" and "periodically"). Nav taps
+/// and event creation refresh independently of this loop via `spawn_refresh`.
 async fn run_ha_sync(
     config: Config,
     app_weak: slint::Weak<AppWindow>,
     local_offset: UtcOffset,
     live_client: Arc<Mutex<Option<Client>>>,
+    live_rest: Arc<Mutex<Option<RestClient>>>,
     todo_uids: Arc<Mutex<Vec<Vec<String>>>>,
+    reference_date: Arc<Mutex<Date>>,
 ) {
     let token = match config.ha.load_token() {
         Ok(token) => token,
@@ -281,55 +505,36 @@ async fn run_ha_sync(
     .await;
     tracing::info!("connected to Home Assistant");
     *live_client.lock().unwrap() = Some(client.clone());
-
     let rest = RestClient::new(&config.ha.base_url, &token);
-
-    // Same padded 6-week window the month grid needs; it's a superset of
-    // "this week"/"today" too, so one fetch covers all four calendar views.
-    let (grid_start, grid_end) = month_grid_range(local_offset);
-    let range_start = grid_start.midnight().assume_offset(local_offset);
-    let range_end = grid_end.midnight().assume_offset(local_offset);
+    *live_rest.lock().unwrap() = Some(rest.clone());
 
     // docs/plan.md's stated cadence for calendar polling (it isn't pushed
     // over the HA websocket, unlike todos/entity states).
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     loop {
         interval.tick().await;
-
-        // Fetching returns plain (Send) data -- `CalendarEvent`/`TodoItem`
-        // are ordinary serde structs. Building the actual Slint models has
-        // to happen below, *inside* `invoke_from_event_loop`: `ModelRc` is
-        // `Rc`-based (not `Send`), so it can't be constructed here on the
-        // tokio worker thread and then handed across into that closure.
-        let per_member_events = fetch_calendar_events(&rest, &config, range_start, range_end).await;
-        let per_member_todos = fetch_todos(&client, &config).await;
-        let family = config.family.clone();
-
-        let app_weak = app_weak.clone();
-        let todo_uids = todo_uids.clone();
-        let outcome = slint::invoke_from_event_loop(move || {
-            let Some(app) = app_weak.upgrade() else { return };
-            let grids = build_calendar_grids(local_offset, &per_member_events);
-            apply_calendar_grids(&app, grids);
-            let (todo_columns, uid_map, chips) = build_todo_model(&family, &per_member_todos);
-            *todo_uids.lock().unwrap() = uid_map;
-            app.set_todo_columns(todo_columns);
-            app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
-        });
-        if outcome.is_err() {
-            break; // window is gone
-        }
+        let ref_date = *reference_date.lock().unwrap();
+        refresh_calendar_and_todos(
+            &rest,
+            &client,
+            &config.family,
+            local_offset,
+            ref_date,
+            &app_weak,
+            &todo_uids,
+        )
+        .await;
     }
 }
 
 async fn fetch_calendar_events(
     rest: &RestClient,
-    config: &Config,
+    family: &[FamilyMember],
     start: OffsetDateTime,
     end: OffsetDateTime,
 ) -> Vec<(usize, slint::Color, Vec<CalendarEvent>)> {
     let mut out = Vec::new();
-    for (index, member) in config.family.iter().enumerate() {
+    for (index, member) in family.iter().enumerate() {
         let Some(entity) = &member.calendar_entity else { continue };
         let events = match rest.calendar_events(entity, start, end).await {
             Ok(events) => events,
@@ -343,9 +548,9 @@ async fn fetch_calendar_events(
     out
 }
 
-async fn fetch_todos(client: &Client, config: &Config) -> Vec<Vec<TodoItem>> {
-    let mut out = Vec::with_capacity(config.family.len());
-    for member in &config.family {
+async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> Vec<Vec<TodoItem>> {
+    let mut out = Vec::with_capacity(family.len());
+    for member in family {
         let items = match client.todo_items(&member.todo_entity).await {
             Ok(items) => items,
             Err(err) => {
@@ -374,15 +579,29 @@ fn apply_calendar_grids(app: &AppWindow, grids: CalendarGrids) {
     app.set_calendar_agenda(grids.agenda);
 }
 
-/// Sunday of the week containing the 1st, through the Saturday of the week
-/// containing the month's last day -- the same padded 6-week/42-day range
-/// the month grid has always used, now also doubling as the HA fetch window.
-fn month_grid_range(local_offset: UtcOffset) -> (Date, Date) {
-    let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
-    let first_of_month = today.replace_day(1).expect("day 1 is always valid");
+/// Sunday of the week containing `reference_date`'s 1st, through the
+/// Saturday of the week containing that month's last day -- the padded
+/// 6-week/42-day range the month grid needs, now also doubling as the HA
+/// fetch window.
+fn month_grid_range(reference_date: Date) -> (Date, Date) {
+    let first_of_month = reference_date.replace_day(1).expect("day 1 is always valid");
     let lead_days = first_of_month.weekday().number_days_from_sunday();
     let grid_start = first_of_month - TimeDuration::days(lead_days as i64);
     (grid_start, grid_start + TimeDuration::days(42))
+}
+
+/// Adds (or subtracts) whole months, clamping the day-of-month into the
+/// target month's actual length (e.g. Jan 31 + 1 month -> Feb 28/29).
+fn add_months(date: Date, delta: i32) -> Date {
+    let total_months = date.year() * 12 + (date.month() as i32 - 1) + delta;
+    let year = total_months.div_euclid(12);
+    let month = Month::try_from((total_months.rem_euclid(12) + 1) as u8).expect("0..12 -> valid month");
+    let last_day = month.length(year);
+    Date::from_calendar_date(year, month, date.day().min(last_day)).expect("clamped day is valid")
+}
+
+fn month_label_for(date: Date) -> String {
+    format!("{} {}", date.month(), date.year())
 }
 
 #[derive(Default, Clone)]
@@ -400,12 +619,16 @@ struct DayBucket {
 /// Builds the Month/Week/Day/Agenda projections from each member's fetched
 /// events (`per_member_events` is empty on first paint, before HA has
 /// responded -- still produces correctly-shaped, just event-less, grids).
+/// `reference_date` is whichever date Month/Week/Day are currently centered
+/// on (via nav); `is_today`/`in_current_month` still compare against the
+/// real wall-clock date, computed separately below.
 fn build_calendar_grids(
     local_offset: UtcOffset,
+    reference_date: Date,
     per_member_events: &[(usize, slint::Color, Vec<CalendarEvent>)],
 ) -> CalendarGrids {
-    let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
-    let (grid_start, grid_end) = month_grid_range(local_offset);
+    let real_today = OffsetDateTime::now_utc().to_offset(local_offset).date();
+    let (grid_start, grid_end) = month_grid_range(reference_date);
     let date_fmt = time::macros::format_description!("[year]-[month]-[day]");
 
     let mut buckets: BTreeMap<Date, DayBucket> = BTreeMap::new();
@@ -459,7 +682,7 @@ fn build_calendar_grids(
         }
     }
 
-    // Month: every day in the padded 6-week grid.
+    // Month: every day in the padded 6-week grid around `reference_date`.
     let mut month_weeks = Vec::with_capacity(6);
     let mut cursor = grid_start;
     for _ in 0..6 {
@@ -469,8 +692,8 @@ fn build_calendar_grids(
                 buckets.get(&cursor).map(|b| b.month_entries.clone()).unwrap_or_default();
             week.push(CalendarDayData {
                 day_number: cursor.day() as i32,
-                in_current_month: cursor.month() == today.month(),
-                is_today: cursor == today,
+                in_current_month: cursor.month() == reference_date.month(),
+                is_today: cursor == real_today,
                 events: slint::ModelRc::new(slint::VecModel::from(dots)),
             });
             cursor += TimeDuration::days(1);
@@ -485,19 +708,27 @@ fn build_calendar_grids(
         WeekDayColumnData {
             day_name: weekday_short(date.weekday()).into(),
             day_number: date.day() as i32,
-            is_today: date == today,
+            is_today: date == real_today,
             all_day_banners: slint::ModelRc::new(slint::VecModel::from(bucket.banners)),
             events: slint::ModelRc::new(slint::VecModel::from(events)),
         }
     };
 
-    let week_start = today - TimeDuration::days(today.weekday().number_days_from_sunday() as i64);
+    // Week/Day: around `reference_date`, so navigating either one moves the
+    // shared cursor Month also uses.
+    let week_start = reference_date
+        - TimeDuration::days(reference_date.weekday().number_days_from_sunday() as i64);
     let week_columns: Vec<WeekDayColumnData> =
         (0..7).map(|i| to_column(week_start + TimeDuration::days(i))).collect();
-    let day_columns = vec![to_column(today)];
+    let day_columns = vec![to_column(reference_date)];
 
+    // Agenda always looks forward from the real "now" regardless of
+    // Month/Week/Day navigation -- it has no nav controls of its own, so
+    // there'd be no way to get back to "upcoming" if navigating elsewhere
+    // also dragged Agenda along. Bounded by the currently-fetched window,
+    // so it can go empty if you've navigated Month far from the present.
     let agenda_columns: Vec<WeekDayColumnData> = buckets
-        .range(today..grid_end)
+        .range(real_today..grid_end)
         .filter(|(_, b)| !b.banners.is_empty() || !b.events.is_empty())
         .map(|(date, _)| to_column(*date))
         .collect();
@@ -514,7 +745,7 @@ fn build_calendar_grids(
 /// Tasks page), the uid of each item (so the toggle callback can resolve
 /// which item was tapped), and their completion ratio (for the top-bar chip).
 fn build_todo_model(
-    family: &[dashboard_config::FamilyMember],
+    family: &[FamilyMember],
     per_member_items: &[Vec<TodoItem>],
 ) -> (slint::ModelRc<TodoColumnData>, Vec<Vec<String>>, Vec<MemberChipData>) {
     let mut columns = Vec::with_capacity(family.len());

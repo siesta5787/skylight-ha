@@ -111,24 +111,27 @@ export component CalendarCard inherits Rectangle {
     border-color: Theme.border;
     clip: true;
 
-    VerticalLayout {
-        HorizontalLayout {
-            height: 28px;
-            WeekdayHeader { text: "Sun"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Mon"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Tue"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Wed"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Thu"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Fri"; horizontal-stretch: 1; }
-            WeekdayHeader { text: "Sat"; horizontal-stretch: 1; }
+    // A single GridLayout (header + all 42 day cells) rather than 7 separate
+    // HorizontalLayouts -- each of those divided the same width completely
+    // independently, and rounding could put the leftover pixel in a
+    // different column from one row to the next, so column edges visibly
+    // zigzagged between weeks. One shared grid guarantees every row uses
+    // identical column widths.
+    GridLayout {
+        Row {
+            WeekdayHeader { text: "Sun"; height: 28px; }
+            WeekdayHeader { text: "Mon"; height: 28px; }
+            WeekdayHeader { text: "Tue"; height: 28px; }
+            WeekdayHeader { text: "Wed"; height: 28px; }
+            WeekdayHeader { text: "Thu"; height: 28px; }
+            WeekdayHeader { text: "Fri"; height: 28px; }
+            WeekdayHeader { text: "Sat"; height: 28px; }
         }
 
-        for week[week-idx] in weeks: HorizontalLayout {
-            vertical-stretch: 1;
+        for week[week-idx] in weeks: Row {
             for day[day-idx] in week: DayCell {
                 day: day;
                 member-visible: root.member-visible;
-                horizontal-stretch: 1;
                 tapped => { root.day-selected(week-idx, day-idx); }
             }
         }

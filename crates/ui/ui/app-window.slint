@@ -18,6 +18,74 @@ export {
     AllDayBannerData, MemberChipData, EventFormMember,
 }
 
+component NavArrow inherits Rectangle {
+    in property <string> glyph;
+    callback tapped();
+
+    width: 32px;
+    height: 32px;
+    border-radius: 16px;
+    background: touch.pressed ? Theme.border : transparent;
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+        Text {
+            text: glyph;
+            font-size: 16px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component TodayButton inherits Rectangle {
+    callback tapped();
+
+    border-radius: 8px;
+    background: touch.pressed ? Theme.border : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+        Text {
+            text: "Today";
+            font-size: 13px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component SyncButton inherits Rectangle {
+    callback tapped();
+
+    width: 32px;
+    height: 32px;
+    border-radius: 16px;
+    background: touch.pressed ? Theme.border : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+        // "Sync" spelled out rather than a refresh-arrows glyph -- no icon
+        // font/asset pipeline exists yet (see sidebar.slint).
+        Text {
+            text: "Sync";
+            font-size: 9px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
 component NewEventButton inherits Rectangle {
     callback tapped();
 
@@ -67,13 +135,27 @@ export component AppWindow inherits Window {
     in property <[TodoColumnData]> todo-columns;
     callback todo-item-toggled(int, int);
 
-    // Rust resolves these back to an actual date (Week/Day/Month only ever
-    // show the current week/today/this month -- no date navigation yet --
-    // so "column 3" or "grid cell (2,4)" is always unambiguous).
+    // Rust resolves these back to an actual date using its own
+    // `reference_date` (whatever Month/Week/Day is currently centered on --
+    // moved by the nav callbacks below), so "column 3" or "grid cell (2,4)"
+    // is always unambiguous without threading a date through Slint.
     callback month-slot-tapped(int /* week */, int /* day */);
     callback week-slot-tapped(int /* column */, int /* hour */);
     callback day-slot-tapped(int /* hour */);
     callback new-event-requested();
+
+    // Prev/next moves `reference_date` by a day/week/month depending on
+    // which calendar mode is active -- decided below in `.slint` (Rust
+    // doesn't track the mode), then Rust re-fetches/rebuilds around the new
+    // date. Agenda has no nav controls (see time-grid-view/agenda-view: it
+    // always looks forward from "now", not from `reference_date`).
+    callback nav-month(int /* delta */);
+    callback nav-week(int /* delta */);
+    callback nav-day(int /* delta */);
+    callback nav-today();
+    // Manual force-refresh -- the periodic 5-min timer usually handles it,
+    // but tapping "Sync" doesn't need to wait on that.
+    callback manual-refresh-requested();
 
     // The event-creation form's open/prefill state is Rust-driven (it has
     // to compute the date/time labels from whichever slot was tapped);
@@ -122,6 +204,39 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
 
                     HorizontalLayout {
+                        spacing: 10px;
+
+                        // Agenda always looks forward from "now" and isn't
+                        // centered on `reference_date`, so navigating it
+                        // wouldn't do anything meaningful -- hidden there.
+                        if root.current-calendar-mode != CalendarViewMode.Agenda: NavArrow {
+                            glyph: "<";
+                            tapped => {
+                                if root.current-calendar-mode == CalendarViewMode.Month {
+                                    root.nav-month(-1);
+                                } else if root.current-calendar-mode == CalendarViewMode.Week {
+                                    root.nav-week(-1);
+                                } else {
+                                    root.nav-day(-1);
+                                }
+                            }
+                        }
+                        if root.current-calendar-mode != CalendarViewMode.Agenda: NavArrow {
+                            glyph: ">";
+                            tapped => {
+                                if root.current-calendar-mode == CalendarViewMode.Month {
+                                    root.nav-month(1);
+                                } else if root.current-calendar-mode == CalendarViewMode.Week {
+                                    root.nav-week(1);
+                                } else {
+                                    root.nav-day(1);
+                                }
+                            }
+                        }
+                        if root.current-calendar-mode != CalendarViewMode.Agenda: TodayButton {
+                            tapped => { root.nav-today(); }
+                        }
+
                         Text {
                             text: root.month-label;
                             font-size: 20px;
@@ -133,6 +248,9 @@ export component AppWindow inherits Window {
                         CalendarViewSwitcher {
                             mode: root.current-calendar-mode;
                             mode-selected(m) => { root.current-calendar-mode = m; }
+                        }
+                        SyncButton {
+                            tapped => { root.manual-refresh-requested(); }
                         }
                     }
 
