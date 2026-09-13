@@ -327,10 +327,22 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.current-page == Page.Tasks: TodoCard {
-                    columns: root.todo-columns;
+                if root.current-page == Page.Tasks: VerticalLayout {
+                    spacing: Theme.gap;
                     vertical-stretch: 1;
-                    item-toggled(col, item) => { root.todo-item-toggled(col, item); }
+
+                    HorizontalLayout {
+                        Rectangle { horizontal-stretch: 1; }
+                        SyncButton {
+                            tapped => { root.manual-refresh-requested(); }
+                        }
+                    }
+
+                    TodoCard {
+                        columns: root.todo-columns;
+                        vertical-stretch: 1;
+                        item-toggled(col, item) => { root.todo-item-toggled(col, item); }
+                    }
                 }
 
                 if root.current-page == Page.Dashboard: PlaceholderView {

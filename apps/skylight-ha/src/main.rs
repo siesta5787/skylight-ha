@@ -112,12 +112,19 @@ fn main() {
             };
             column.items.set_row_data(item as usize, item_entry);
 
-            if let Some(client) = live_client.lock().unwrap().clone() {
-                rt_handle.spawn(async move {
-                    if let Err(err) = client.todo_update_item(&entity_id, &uid, new_status).await {
-                        tracing::warn!(%err, "failed to update HA todo item");
-                    }
-                });
+            match live_client.lock().unwrap().clone() {
+                Some(client) => {
+                    rt_handle.spawn(async move {
+                        if let Err(err) = client.todo_update_item(&entity_id, &uid, new_status).await {
+                            tracing::warn!(%err, "failed to update HA todo item");
+                        }
+                    });
+                }
+                // Previously fell through here silently -- toggling while
+                // disconnected (e.g. mid-reconnect) looked identical to a
+                // successful write that just hadn't landed yet, until the
+                // next refresh reverted it with no indication why.
+                None => tracing::warn!("not connected to HA, todo change won't be saved"),
             }
         });
     }
@@ -580,11 +587,51 @@ async fn run_ha_sync(
             family_resolved = true;
         }
 
-        // docs/plan.md's stated cadence for calendar polling (it isn't
-        // pushed over the HA websocket, unlike todos/entity states).
+        // Calendar event ranges aren't pushed over the WS event bus (per
+        // docs/plan.md), only polled -- but a todo entity's own `state` is
+        // its needs-action count, which *does* change (and gets pushed as
+        // a state_changed event) the instant an item is added/checked
+        // off/removed anywhere, phone included. Subscribing to that turns
+        // "wait up to 5 minutes" into "near-instant" for the common case
+        // (todos) without needing to poll more aggressively for everything.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        let mut state_events = client.subscribe_state_changed();
         loop {
-            interval.tick().await;
+            enum Wake {
+                Interval,
+                RelevantStateChange,
+                Irrelevant,
+                ConnectionDead,
+            }
+            let wake = tokio::select! {
+                _ = interval.tick() => Wake::Interval,
+                event = state_events.recv() => match event {
+                    Ok(state) => {
+                        let is_todo = family_state
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m.todo_entity.as_deref() == Some(state.entity_id.as_str()));
+                        if is_todo { Wake::RelevantStateChange } else { Wake::Irrelevant }
+                    }
+                    // Lagged just means we missed some events under load --
+                    // refreshing anyway is the safe default. A closed
+                    // channel means the actor (and so the whole connection)
+                    // has died, same as a failed fetch below.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Wake::RelevantStateChange,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::ConnectionDead,
+                },
+            };
+            if matches!(wake, Wake::Irrelevant) {
+                continue;
+            }
+            if matches!(wake, Wake::ConnectionDead) {
+                tracing::warn!("HA event stream closed, reconnecting");
+                *live_client.lock().unwrap() = None;
+                *live_rest.lock().unwrap() = None;
+                break;
+            }
+
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             let alive = refresh_calendar_and_todos(

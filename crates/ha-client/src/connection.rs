@@ -135,9 +135,22 @@ impl Client {
         uid: &str,
         status: crate::entities::TodoStatus,
     ) -> Result<(), Error> {
+        // There's no dedicated `todo/item/update` WS command -- that's what
+        // this used to call, and HA rejected it every single time with
+        // "unknown_command" (confirmed against a real instance). Updating
+        // an item is the `todo.update_item` *service*, called the same way
+        // as any other (see `Client::call`'s `call_service` usage in
+        // apps/skylight-ha's create_calendar_event). Confirmed empirically
+        // that `item` accepts the item's uid directly, not just its summary
+        // text (the service's own field docs only show a summary example).
         self.call(
-            "todo/item/update",
-            json!({ "entity_id": entity_id, "item": uid, "status": status }),
+            "call_service",
+            json!({
+                "domain": "todo",
+                "service": "update_item",
+                "target": { "entity_id": entity_id },
+                "service_data": { "item": uid, "status": status },
+            }),
         )
         .await?;
         Ok(())
