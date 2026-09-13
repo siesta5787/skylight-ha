@@ -1,0 +1,224 @@
+import { Theme } from "theme.slint";
+
+// Which full-page section of the app is showing. Page switching is pure
+// `.slint` state (see AppWindow) -- Rust never needs to know the current page.
+export enum Page {
+    Dashboard,
+    Calendar,
+    Tasks,
+    Photos,
+    Settings,
+}
+
+// Small hand-drawn line icons -- no icon font/asset pipeline exists yet.
+// Kept to straight lines and plain rectangles (no arcs/curves) to stay easy
+// to get right without a live preview.
+component HouseIcon inherits Path {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    fill: transparent;
+    stroke: icon-color;
+    stroke-width: 1.6px;
+    commands: "M3 11 L12 4 L21 11 M5.5 9.5 L5.5 20 L18.5 20 L18.5 9.5";
+}
+
+component CalendarIcon inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 3px;
+        border-width: 1.6px;
+        border-color: icon-color;
+    }
+    Rectangle {
+        y: 0;
+        width: 100%;
+        height: 6px;
+        background: icon-color;
+        border-top-left-radius: 3px;
+        border-top-right-radius: 3px;
+    }
+    Rectangle {
+        x: 4px;
+        y: -2px;
+        width: 2px;
+        height: 5px;
+        background: icon-color;
+    }
+    Rectangle {
+        x: parent.width - 6px;
+        y: -2px;
+        width: 2px;
+        height: 5px;
+        background: icon-color;
+    }
+}
+
+component TasksIcon inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 4px;
+        border-width: 1.6px;
+        border-color: icon-color;
+    }
+    Path {
+        x: 3px;
+        y: 3px;
+        width: parent.width - 6px;
+        height: parent.height - 6px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: transparent;
+        stroke: icon-color;
+        stroke-width: 2.4px;
+        commands: "M4 13 L9.5 18.5 L20 6";
+    }
+}
+
+component PhotosIcon inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 3px;
+        border-width: 1.6px;
+        border-color: icon-color;
+        clip: true;
+
+        Path {
+            x: 2px;
+            y: parent.height - 11px;
+            width: parent.width - 4px;
+            height: 9px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            fill: icon-color;
+            commands: "M0 24 L8 12 L13 17 L18 10 L24 24 Z";
+        }
+    }
+}
+
+component SettingsIcon inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    for row in 3: Rectangle {
+        y: row * 8px;
+        width: 100%;
+        height: 2px;
+        background: icon-color.with-alpha(0.5);
+
+        Rectangle {
+            x: row == 1 ? parent.width - 8px : 2px;
+            y: -3px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: icon-color;
+        }
+    }
+}
+
+// A single nav row: an icon plus a small caption, highlighted when it's the
+// active page.
+component NavItem inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback tapped();
+
+    height: 78px;
+    background: touch.pressed ? Theme.border : transparent;
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 14px;
+
+            Rectangle {
+                @children
+            }
+
+            Text {
+                text: label;
+                font-size: 10px;
+                color: active ? Theme.accent : Theme.text-muted;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}
+
+export component Sidebar inherits Rectangle {
+    in property <Page> active-page;
+    callback page-selected(Page);
+
+    width: Theme.sidebar-width;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    property <color> dashboard-color: root.active-page == Page.Dashboard ? Theme.accent : Theme.text-muted;
+    property <color> calendar-color: root.active-page == Page.Calendar ? Theme.accent : Theme.text-muted;
+    property <color> tasks-color: root.active-page == Page.Tasks ? Theme.accent : Theme.text-muted;
+    property <color> photos-color: root.active-page == Page.Photos ? Theme.accent : Theme.text-muted;
+    property <color> settings-color: root.active-page == Page.Settings ? Theme.accent : Theme.text-muted;
+
+    VerticalLayout {
+        alignment: start;
+        padding-top: 12px;
+
+        NavItem {
+            label: "Dashboard";
+            active: root.active-page == Page.Dashboard;
+            tapped => { root.page-selected(Page.Dashboard); }
+            HouseIcon { icon-color: root.dashboard-color; }
+        }
+        NavItem {
+            label: "Calendar";
+            active: root.active-page == Page.Calendar;
+            tapped => { root.page-selected(Page.Calendar); }
+            CalendarIcon { icon-color: root.calendar-color; }
+        }
+        NavItem {
+            label: "Tasks";
+            active: root.active-page == Page.Tasks;
+            tapped => { root.page-selected(Page.Tasks); }
+            TasksIcon { icon-color: root.tasks-color; }
+        }
+        NavItem {
+            label: "Photos";
+            active: root.active-page == Page.Photos;
+            tapped => { root.page-selected(Page.Photos); }
+            PhotosIcon { icon-color: root.photos-color; }
+        }
+
+        // Pushes Settings to the bottom of the rail rather than packing
+        // directly under Photos.
+        Rectangle { vertical-stretch: 1; }
+
+        NavItem {
+            label: "Settings";
+            active: root.active-page == Page.Settings;
+            tapped => { root.page-selected(Page.Settings); }
+            SettingsIcon { icon-color: root.settings-color; }
+        }
+    }
+}

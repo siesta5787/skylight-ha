@@ -1,10 +1,15 @@
 export global Theme {
-    out property <color> background: #14161f;
-    out property <color> surface: #1e2130;
-    out property <color> surface-alt: #262a3d;
-    out property <color> text-primary: #f2f3f7;
-    out property <color> text-muted: #9096ab;
-    out property <color> accent: #6c8dfa;
+    // Light/cream palette to match the Skylight Calendar reference look
+    // (this used to be a dark theme -- switched wholesale, not layered, since
+    // every existing surface reads from these same tokens).
+    out property <color> background: #f6f1e6;
+    out property <color> surface: #ffffff;
+    out property <color> surface-alt: #fbf8f1;
+    out property <color> border: #e8e1d1;
+    out property <color> text-primary: #2c2a26;
+    out property <color> text-muted: #8b8579;
+    out property <color> accent: #3fa79a;
     out property <length> radius: 16px;
     out property <length> gap: 16px;
+    out property <length> sidebar-width: 84px;
 }

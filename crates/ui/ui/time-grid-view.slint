@@ -1,0 +1,243 @@
+import { Theme } from "theme.slint";
+
+// One positioned event within a day column.
+export struct WeekEventData {
+    summary: string,
+    time-label: string,
+    start-minutes: int,
+    // Rust clamps this to a sane minimum (e.g. 20min) so short events still
+    // render as a visible block.
+    duration-minutes: int,
+    member-color: color,
+    // Indexes `member-visible` (see TimeGridView) -- lets a tapped top-bar
+    // chip hide/show this event without a Rust round-trip.
+    member-index: int,
+}
+
+export struct AllDayBannerData {
+    text: string,
+    member-color: color,
+    member-index: int,
+}
+
+// One day's worth of events, used both for Week view (7 of these) and Day
+// view (1 of these) -- the component below doesn't know which mode it's in.
+export struct WeekDayColumnData {
+    day-name: string,
+    day-number: int,
+    is-today: bool,
+    all-day-banners: [AllDayBannerData],
+    events: [WeekEventData],
+}
+
+component AllDayBanner inherits Rectangle {
+    in property <AllDayBannerData> banner;
+    in property <[bool]> member-visible;
+    visible: root.banner.member-index < 0 || root.member-visible.length == 0
+        || root.banner.member-index >= root.member-visible.length
+        || root.member-visible[root.banner.member-index];
+
+    height: 18px;
+    border-radius: 5px;
+    background: banner.member-color.with-alpha(0.22);
+    Text {
+        text: banner.text;
+        font-size: 10px;
+        font-weight: 600;
+        color: Theme.text-primary;
+        overflow: elide;
+        x: 6px;
+        vertical-alignment: center;
+        width: parent.width - 12px;
+    }
+}
+
+component DayHeader inherits Rectangle {
+    in property <WeekDayColumnData> day;
+    in property <[bool]> member-visible;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: 4px;
+        padding: 4px;
+
+        Text {
+            text: day.day-name + " " + day.day-number;
+            font-size: 14px;
+            font-weight: day.is-today ? 700 : 600;
+            color: day.is-today ? Theme.accent : Theme.text-primary;
+            horizontal-alignment: center;
+        }
+        for banner in day.all-day-banners: AllDayBanner {
+            banner: banner;
+            member-visible: root.member-visible;
+        }
+    }
+}
+
+component EventCard inherits Rectangle {
+    in property <WeekEventData> event;
+    in property <[bool]> member-visible;
+    visible: root.event.member-index < 0 || root.member-visible.length == 0
+        || root.event.member-index >= root.member-visible.length
+        || root.member-visible[root.event.member-index];
+
+    border-radius: 6px;
+    background: touch.pressed ? event.member-color.with-alpha(0.45) : event.member-color.with-alpha(0.30);
+    border-width: 1px;
+    border-color: event.member-color;
+    clip: true;
+
+    touch := TouchArea {
+        clicked => {
+            // No event-detail view yet -- just confirms the tap landed.
+            debug("calendar event tapped: " + event.summary);
+        }
+    }
+
+    VerticalLayout {
+        padding: 4px;
+        alignment: start;
+        Text {
+            text: event.summary;
+            font-size: 11px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            overflow: elide;
+        }
+        Text {
+            text: event.time-label;
+            font-size: 9px;
+            color: Theme.text-muted;
+            overflow: elide;
+        }
+    }
+}
+
+component HourRow inherits Rectangle {
+    in property <length> row-height;
+    // Which column (index into TimeGridView's `days`) and hour this cell
+    // is -- bubbled up so a tap on empty space opens the event-creation
+    // form prefilled to this day/hour.
+    in property <int> column-index;
+    in property <int> hour;
+    callback slot-tapped(int /* column */, int /* hour */);
+
+    height: row-height;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: touch.pressed ? Theme.accent.with-alpha(0.12) : transparent;
+
+    touch := TouchArea {
+        clicked => { root.slot-tapped(column-index, hour); }
+    }
+}
+
+component DayColumn inherits Rectangle {
+    in property <WeekDayColumnData> day;
+    in property <[bool]> member-visible;
+    in property <length> row-height;
+    in property <int> column-index;
+    callback slot-tapped(int /* column */, int /* hour */);
+
+    background: day.is-today ? Theme.accent.with-alpha(0.06) : transparent;
+    height: row-height * 24;
+
+    // Hour gridlines (and empty-slot tap targets), drawn first so event
+    // cards layer on top of them.
+    VerticalLayout {
+        width: 100%;
+        height: 100%;
+        for hour in 24: HourRow {
+            row-height: root.row-height;
+            column-index: root.column-index;
+            hour: hour;
+            slot-tapped(col, h) => { root.slot-tapped(col, h); }
+        }
+    }
+
+    for event in day.events: EventCard {
+        event: event;
+        member-visible: root.member-visible;
+        x: 2px;
+        width: root.width - 4px;
+        y: root.row-height * event.start-minutes / 60;
+        height: root.row-height * event.duration-minutes / 60;
+    }
+}
+
+// Hourly time-axis grid. Used for both Week view (7-entry `days`) and Day
+// view (1-entry `days`) -- same component either way.
+export component TimeGridView inherits Rectangle {
+    in property <[WeekDayColumnData]> days;
+    in property <[bool]> member-visible;
+    // Built once in Rust (["12 AM", "1 AM", ..., "11 PM"]) rather than
+    // formatted here -- Slint's expression language has no numeric-to-label
+    // formatting for this.
+    in property <[string]> hour-labels;
+    // Rust maps (column, hour) back to an actual date -- Week/Day view
+    // never show anything but the current week/today, so it can always
+    // resolve "column N of what's currently displayed" itself.
+    callback slot-tapped(int /* column */, int /* hour */);
+
+    property <length> row-height: 64px;
+    property <length> ruler-width: 56px;
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    VerticalLayout {
+        // Fixed header row: stays put while the grid below scrolls.
+        HorizontalLayout {
+            height: 56px;
+            Rectangle { width: ruler-width; }
+            for day in days: DayHeader {
+                day: day;
+                member-visible: root.member-visible;
+                horizontal-stretch: 1;
+            }
+        }
+
+        Rectangle {
+            border-width: 1px;
+            border-color: Theme.border;
+        }
+
+        Flickable {
+            vertical-stretch: 1;
+            viewport-height: row-height * 24;
+            // Opens roughly at 7 AM rather than midnight -- a plain initial
+            // value, so it stays fully touch-scrollable in both directions
+            // afterwards (this is the finger-scroll the user asked for).
+            viewport-y: -7 * 64px;
+
+            HorizontalLayout {
+                width: parent.width;
+                height: row-height * 24;
+
+                VerticalLayout {
+                    width: ruler-width;
+                    for label in hour-labels: Text {
+                        height: row-height;
+                        text: label;
+                        font-size: 10px;
+                        color: Theme.text-muted;
+                        horizontal-alignment: right;
+                        vertical-alignment: top;
+                        x: -4px;
+                    }
+                }
+
+                for day[idx] in days: DayColumn {
+                    day: day;
+                    member-visible: root.member-visible;
+                    row-height: root.row-height;
+                    column-index: idx;
+                    horizontal-stretch: 1;
+                    slot-tapped(col, h) => { root.slot-tapped(col, h); }
+                }
+            }
+        }
+    }
+}

@@ -6,7 +6,13 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-tokio-tungstenite = { workspace = true }
+# `wss://` needs an explicit TLS backend -- tokio-tungstenite doesn't enable
+# one by default. rustls (not native-tls/OpenSSL) for the same
+# static-musl-friendly reasons as reqwest below; webpki-roots (a bundled
+# root CA store) rather than native-roots so it doesn't depend on the
+# target system having its own CA trust store, matching this project's
+# "nothing borrowed from the OS" approach (see docs/plan.md).
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true

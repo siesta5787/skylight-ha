@@ -95,17 +95,32 @@ skylight-ha/
 
 ## Default view (Skylight-style)
 
-- **Header**: clock, date, weather chip.
-- **Main**: month calendar grid, one color per family calendar/person, today
-  highlighted, tap a day for an agenda popup of that day's events.
-- **Panel**: todo/chore lists organized **per family member**, not one flat list —
-  each person gets a column/tab (name, avatar/color) backed by their own `todo.*`
-  entity (HA supports multiple todo lists, e.g. `todo.chores_alice`,
-  `todo.chores_bob`), with checkable items. Interactive, not just a readout,
-  since it's a family workflow tool.
-- Secondary views (room controls, media, energy — tunet-style tiles) are
-  architected for via the card/view system but **not built in v1**; v1 scope is
-  the calendar+tasks home view per your stated priority.
+- **Shell**: a left icon sidebar (Home/Dashboard, Calendar, Tasks, Photos,
+  Settings) plus a top bar (family name, clock/date, weather chip,
+  per-family-member chips showing their todo completion ratio) sitting above
+  whichever page is active.
+- **Calendar page**: switchable between the four standard calendar views —
+  **Month** (grid, one dot per event, today highlighted), **Week** and
+  **Day** (hourly time-axis grid, touch-scrollable, events positioned/sized
+  by actual start/end time), and **Agenda** (flat chronological list) — via a
+  small segmented control. One color per family calendar/person throughout.
+  Date *navigation* (prev/next week, jumping to an arbitrary day) isn't
+  built yet: Month always shows the current month, Week/Day always show the
+  current week/today, Agenda always shows upcoming events from today.
+- **Tasks page**: todo/chore lists organized **per family member**, not one
+  flat list — each person gets a column/tab (name, avatar/color) backed by
+  their own `todo.*` entity (HA supports multiple todo lists, e.g.
+  `todo.chores_alice`, `todo.chores_bob`), with checkable items that push
+  updates back to HA. Interactive, not just a readout, since it's a family
+  workflow tool.
+- **Dashboard and Photos pages**: exist as nav entries now but are inert
+  placeholders. Dashboard is meant to become a customizable view of HA
+  entities (lights, fans, ...) — `dashboard-config`'s `Card::EntityTile` /
+  `Card::Weather` variants already anticipate this, just not wired to a page
+  yet. Photos is meant to eventually show an Immich library.
+- Secondary HA-entity views beyond Dashboard (media, energy — tunet-style
+  tiles) are architected for via the card/view system but **not built in
+  v1**.
 
 ## Phased build order
 

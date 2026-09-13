@@ -35,8 +35,10 @@ impl RestClient {
         start: OffsetDateTime,
         end: OffsetDateTime,
     ) -> Result<Vec<CalendarEvent>, Error> {
+        // Plural "calendars" -- confirmed against a real HA instance; the
+        // singular "/api/calendar/{id}" (what this used to say) 404s.
         let url = format!(
-            "{}/api/calendar/{entity_id}",
+            "{}/api/calendars/{entity_id}",
             self.base_url.trim_end_matches('/')
         );
         let response = self

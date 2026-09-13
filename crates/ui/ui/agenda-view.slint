@@ -1,0 +1,112 @@
+import { Theme } from "theme.slint";
+import { WeekDayColumnData, WeekEventData, AllDayBannerData } from "time-grid-view.slint";
+
+component AgendaRow inherits Rectangle {
+    in property <WeekEventData> event;
+    in property <[bool]> member-visible;
+    visible: root.event.member-index < 0 || root.member-visible.length == 0
+        || root.event.member-index >= root.member-visible.length
+        || root.member-visible[root.event.member-index];
+
+    height: 44px;
+
+    HorizontalLayout {
+        padding-left: 4px;
+        padding-right: 4px;
+        spacing: 10px;
+
+        Rectangle {
+            width: 10px;
+            height: 10px;
+            border-radius: 5px;
+            background: event.member-color;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: event.time-label;
+            font-size: 12px;
+            color: Theme.text-muted;
+            width: 110px;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: event.summary;
+            font-size: 14px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+}
+
+component AgendaBanner inherits Text {
+    in property <AllDayBannerData> banner;
+    in property <[bool]> member-visible;
+    visible: root.banner.member-index < 0 || root.member-visible.length == 0
+        || root.banner.member-index >= root.member-visible.length
+        || root.member-visible[root.banner.member-index];
+
+    text: banner.text;
+    font-size: 11px;
+    color: Theme.text-muted;
+}
+
+component AgendaDay inherits Rectangle {
+    in property <WeekDayColumnData> day;
+    in property <[bool]> member-visible;
+
+    VerticalLayout {
+        alignment: start;
+        spacing: 2px;
+
+        Text {
+            text: day.day-name + " " + day.day-number;
+            font-size: 13px;
+            font-weight: 700;
+            color: day.is-today ? Theme.accent : Theme.text-primary;
+        }
+        for banner in day.all-day-banners: AgendaBanner {
+            banner: banner;
+            member-visible: root.member-visible;
+        }
+        for event in day.events: AgendaRow {
+            event: event;
+            member-visible: root.member-visible;
+        }
+    }
+}
+
+// Flat chronological list of upcoming events, grouped under day headers.
+// Rust hands in only days that have something to show (today onward,
+// within the fetched window), already sorted.
+export component AgendaView inherits Rectangle {
+    in property <[WeekDayColumnData]> days;
+    in property <[bool]> member-visible;
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    Flickable {
+        VerticalLayout {
+            padding: 18px;
+            spacing: 14px;
+            alignment: start;
+
+            if days.length == 0: Text {
+                text: "No upcoming events";
+                font-size: 14px;
+                color: Theme.text-muted;
+            }
+
+            for day in days: AgendaDay {
+                day: day;
+                member-visible: root.member-visible;
+            }
+        }
+    }
+}

@@ -1,71 +1,218 @@
 import { Theme } from "theme.slint";
-import { CalendarCard, CalendarDayData } from "calendar-card.slint";
+import { Sidebar, Page } from "sidebar.slint";
+import { TopBar, MemberChipData } from "top-bar.slint";
+import { CalendarCard, CalendarDayData, CalendarEventDot } from "calendar-card.slint";
+import { CalendarViewSwitcher, CalendarViewMode } from "calendar-view-switcher.slint";
+import { TimeGridView, WeekDayColumnData, WeekEventData, AllDayBannerData } from "time-grid-view.slint";
+import { AgendaView } from "agenda-view.slint";
 import { TodoCard, TodoColumnData } from "todo-card.slint";
+import { PlaceholderView } from "placeholder-view.slint";
+import { EventCreateForm, EventFormMember } from "event-create-form.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
 import "../assets/fonts/Inter-Regular.ttf";
 
-export { CalendarDayData, TodoColumnData }
+export {
+    CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
+    AllDayBannerData, MemberChipData, EventFormMember,
+}
+
+component NewEventButton inherits Rectangle {
+    callback tapped();
+
+    width: 56px;
+    height: 56px;
+    border-radius: 28px;
+    background: touch.pressed ? Theme.accent.darker(0.15) : Theme.accent;
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+        Text {
+            text: "+";
+            font-size: 28px;
+            font-weight: 700;
+            color: white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
 
 export component AppWindow inherits Window {
     title: "Family Dashboard";
     background: Theme.background;
-    preferred-width: 1100px;
-    preferred-height: 600px;
+    preferred-width: 1280px;
+    preferred-height: 800px;
     default-font-family: "Inter";
 
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
     in property <string> month-label: "";
-    in property <[[CalendarDayData]]> calendar-weeks;
+    in property <string> weather-text: "--°";
+    in property <[MemberChipData]> members;
+    // Kept out of layout entirely (not just dimmed) for whichever member a
+    // top-bar chip tap has toggled off -- indexed the same as `members`.
+    // Rust initializes this once (all `true`, matching `members`' length)
+    // and never touches it again; toggling is pure `.slint` state from then
+    // on, same as page/calendar-mode switching.
+    in-out property <[bool]> member-visible;
+
+    in property <[[CalendarDayData]]> calendar-month;
+    in property <[WeekDayColumnData]> calendar-week;
+    in property <[WeekDayColumnData]> calendar-day;
+    in property <[WeekDayColumnData]> calendar-agenda;
+    in property <[string]> hour-labels;
+
     in property <[TodoColumnData]> todo-columns;
-
     callback todo-item-toggled(int, int);
-    callback calendar-day-selected(int /* week */, int /* day */);
 
-    VerticalLayout {
-        alignment: start;
-        padding: 20px;
-        spacing: Theme.gap;
+    // Rust resolves these back to an actual date (Week/Day/Month only ever
+    // show the current week/today/this month -- no date navigation yet --
+    // so "column 3" or "grid cell (2,4)" is always unambiguous).
+    callback month-slot-tapped(int /* week */, int /* day */);
+    callback week-slot-tapped(int /* column */, int /* hour */);
+    callback day-slot-tapped(int /* hour */);
+    callback new-event-requested();
 
-        // Plain packed layout, deliberately not using `alignment:
-        // space-between` or a `horizontal-stretch` spacer to push clock-text
-        // to the right -- both reliably made it fail to paint at all under
-        // this renderer/backend combo (i-slint-renderer-software +
-        // backend-winit, tested on Windows without a real GPU). Revisit in
-        // the polish pass; for now this trades "clock pinned to the right
-        // edge" for "clock reliably visible."
-        HorizontalLayout {
-            Text {
-                text: date-text;
-                color: Theme.text-muted;
-                font-size: 16px;
-                vertical-alignment: center;
-            }
-            Text {
-                text: clock-text;
-                color: Theme.text-primary;
-                font-size: 22px;
-                font-weight: 700;
-            }
+    // The event-creation form's open/prefill state is Rust-driven (it has
+    // to compute the date/time labels from whichever slot was tapped);
+    // which member/duration is selected is the form's own internal state,
+    // read back via `event_form.*` when it's confirmed.
+    in-out property <bool> event-form-open: false;
+    in property <string> event-form-date-label;
+    in property <string> event-form-time-label;
+    in property <[EventFormMember]> event-form-members;
+    callback event-create-confirmed(int /* member index */, int /* duration minutes */);
+
+    // Page/view-mode switching is pure `.slint` state -- Rust never needs to
+    // know which page or calendar mode is active.
+    property <Page> current-page: Page.Calendar;
+    property <CalendarViewMode> current-calendar-mode: CalendarViewMode.Month;
+
+    HorizontalLayout {
+        Sidebar {
+            active-page: root.current-page;
+            page-selected(p) => { root.current-page = p; }
         }
 
-        HorizontalLayout {
-            spacing: Theme.gap;
+        Rectangle {
+            background: Theme.background;
+            horizontal-stretch: 1;
 
-            CalendarCard {
-                weeks: calendar-weeks;
-                month-label: month-label;
-                horizontal-stretch: 2;
-                day-selected(week, day) => { calendar-day-selected(week, day); }
-            }
+            VerticalLayout {
+                padding: 20px;
+                spacing: Theme.gap;
 
-            TodoCard {
-                columns: todo-columns;
-                horizontal-stretch: 1;
-                item-toggled(col, item) => { todo-item-toggled(col, item); }
+                TopBar {
+                    clock-text: root.clock-text;
+                    date-text: root.date-text;
+                    weather-text: root.weather-text;
+                    members: root.members;
+                    member-visible: root.member-visible;
+                    member-toggled(idx) => {
+                        if idx >= 0 && idx < root.member-visible.length {
+                            root.member-visible[idx] = !root.member-visible[idx];
+                        }
+                    }
+                }
+
+                if root.current-page == Page.Calendar: VerticalLayout {
+                    spacing: Theme.gap;
+                    vertical-stretch: 1;
+
+                    HorizontalLayout {
+                        Text {
+                            text: root.month-label;
+                            font-size: 20px;
+                            font-weight: 700;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        CalendarViewSwitcher {
+                            mode: root.current-calendar-mode;
+                            mode-selected(m) => { root.current-calendar-mode = m; }
+                        }
+                    }
+
+                    calendar-body := Rectangle {
+                        vertical-stretch: 1;
+
+                        if root.current-calendar-mode == CalendarViewMode.Month: CalendarCard {
+                            width: 100%;
+                            height: 100%;
+                            weeks: root.calendar-month;
+                            member-visible: root.member-visible;
+                            day-selected(week, day) => { root.month-slot-tapped(week, day); }
+                        }
+                        if root.current-calendar-mode == CalendarViewMode.Week: TimeGridView {
+                            width: 100%;
+                            height: 100%;
+                            days: root.calendar-week;
+                            member-visible: root.member-visible;
+                            hour-labels: root.hour-labels;
+                            slot-tapped(col, hour) => { root.week-slot-tapped(col, hour); }
+                        }
+                        if root.current-calendar-mode == CalendarViewMode.Day: TimeGridView {
+                            width: 100%;
+                            height: 100%;
+                            days: root.calendar-day;
+                            member-visible: root.member-visible;
+                            hour-labels: root.hour-labels;
+                            slot-tapped(col, hour) => { root.day-slot-tapped(hour); }
+                        }
+                        if root.current-calendar-mode == CalendarViewMode.Agenda: AgendaView {
+                            width: 100%;
+                            height: 100%;
+                            days: root.calendar-agenda;
+                            member-visible: root.member-visible;
+                        }
+
+                        NewEventButton {
+                            x: calendar-body.width - self.width - 16px;
+                            y: calendar-body.height - self.height - 16px;
+                            tapped => { root.new-event-requested(); }
+                        }
+                    }
+                }
+
+                if root.current-page == Page.Tasks: TodoCard {
+                    columns: root.todo-columns;
+                    vertical-stretch: 1;
+                    item-toggled(col, item) => { root.todo-item-toggled(col, item); }
+                }
+
+                if root.current-page == Page.Dashboard: PlaceholderView {
+                    title: "Dashboard";
+                    subtitle: "Customizable Home Assistant controls (lights, fans, and more) are coming soon.";
+                    vertical-stretch: 1;
+                }
+
+                if root.current-page == Page.Photos: PlaceholderView {
+                    title: "Photos";
+                    subtitle: "Will show your Immich library here.";
+                    vertical-stretch: 1;
+                }
+
+                if root.current-page == Page.Settings: PlaceholderView {
+                    title: "Settings";
+                    subtitle: "Coming soon.";
+                    vertical-stretch: 1;
+                }
             }
+        }
+    }
+
+    event_form := EventCreateForm {
+        open: root.event-form-open;
+        date-label: root.event-form-date-label;
+        time-label: root.event-form-time-label;
+        members: root.event-form-members;
+        cancelled => { root.event-form-open = false; }
+        confirmed => {
+            root.event-form-open = false;
+            root.event-create-confirmed(event_form.selected-member, event_form.duration-minutes);
         }
     }
 }

@@ -1,0 +1,69 @@
+import { Theme } from "theme.slint";
+
+export enum CalendarViewMode {
+    Month,
+    Week,
+    Day,
+    Agenda,
+}
+
+component ModeTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback tapped();
+
+    border-radius: 8px;
+    background: active ? Theme.accent : (touch.pressed ? Theme.border : transparent);
+
+    touch := TouchArea {
+        clicked => { tapped(); }
+
+        Text {
+            text: label;
+            font-size: 13px;
+            font-weight: active ? 700 : 400;
+            color: active ? white : Theme.text-muted;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Small segmented control for switching the calendar's view mode. Placed in
+// the reference image's "Schedule"/"Filter" button slot in the page header.
+export component CalendarViewSwitcher inherits Rectangle {
+    in property <CalendarViewMode> mode;
+    callback mode-selected(CalendarViewMode);
+
+    height: 36px;
+    border-radius: 10px;
+    background: Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 2px;
+
+        ModeTab {
+            label: "Agenda";
+            active: root.mode == CalendarViewMode.Agenda;
+            tapped => { root.mode-selected(CalendarViewMode.Agenda); }
+        }
+        ModeTab {
+            label: "Day";
+            active: root.mode == CalendarViewMode.Day;
+            tapped => { root.mode-selected(CalendarViewMode.Day); }
+        }
+        ModeTab {
+            label: "Week";
+            active: root.mode == CalendarViewMode.Week;
+            tapped => { root.mode-selected(CalendarViewMode.Week); }
+        }
+        ModeTab {
+            label: "Month";
+            active: root.mode == CalendarViewMode.Month;
+            tapped => { root.mode-selected(CalendarViewMode.Month); }
+        }
+    }
+}

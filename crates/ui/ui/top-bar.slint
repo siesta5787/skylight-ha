@@ -1,0 +1,129 @@
+import { Theme } from "theme.slint";
+
+// One family-member chip: color dot, name, and their todo completion ratio
+// (reuses data already fetched for the Tasks page -- no extra HA calls).
+export struct MemberChipData {
+    name: string,
+    color: color,
+    completed: int,
+    total: int,
+}
+
+component MemberChip inherits Rectangle {
+    in property <MemberChipData> member;
+    // Tapping the chip toggles this -- drives both the chip's own dimming
+    // and (via the same `member-visible` array on AppWindow) whether this
+    // member's events show on the calendar below.
+    in property <bool> visible-on-calendar;
+    callback tapped();
+
+    height: 30px;
+    border-radius: 15px;
+    background: Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+    opacity: visible-on-calendar ? 1.0 : 0.45;
+
+    TouchArea {
+        clicked => { tapped(); }
+
+        HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 12px;
+            spacing: 6px;
+
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: 5px;
+                background: member.color;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: member.name + " " + member.completed + "/" + member.total;
+                font-size: 12px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// Household name has no config field yet -- left as a plain default rather
+// than adding schema for a single cosmetic string this pass.
+export component TopBar inherits Rectangle {
+    in property <string> family-name: "Family";
+    in property <string> clock-text: "--:--";
+    in property <string> date-text: "";
+    in property <string> weather-text: "--°";
+    in property <[MemberChipData]> members;
+    in property <[bool]> member-visible;
+    // Tapping a member's name toggles them on/off the calendar below.
+    callback member-toggled(int);
+
+    height: 88px;
+    background: transparent;
+
+    VerticalLayout {
+        spacing: 10px;
+
+        HorizontalLayout {
+            spacing: Theme.gap;
+
+            Text {
+                text: family-name;
+                font-size: 22px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: "Weather";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: weather-text;
+                    font-size: 26px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    horizontal-alignment: right;
+                }
+            }
+
+            VerticalLayout {
+                alignment: center;
+                Text {
+                    text: date-text;
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: clock-text;
+                    font-size: 26px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            for member[idx] in members: MemberChip {
+                member: member;
+                visible-on-calendar: idx < root.member-visible.length && root.member-visible[idx];
+                tapped => { root.member-toggled(idx); }
+            }
+        }
+    }
+}

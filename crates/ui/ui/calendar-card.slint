@@ -1,7 +1,9 @@
 import { Theme } from "theme.slint";
 
 export struct CalendarEventDot {
+    summary: string,
     member-color: color,
+    member-index: int,
 }
 
 export struct CalendarDayData {
@@ -11,23 +13,51 @@ export struct CalendarDayData {
     events: [CalendarEventDot],
 }
 
+component EventLine inherits Rectangle {
+    in property <CalendarEventDot> dot;
+    // Indexes `member-visible` below -- kept out of layout entirely (not
+    // just dimmed) when its member is toggled off in the top bar.
+    visible: dot.member-index < 0 || root.member-visible.length == 0
+        || dot.member-index >= root.member-visible.length
+        || root.member-visible[dot.member-index];
+    in property <[bool]> member-visible;
+
+    height: 15px;
+    background: dot.member-color.with-alpha(0.20);
+    border-radius: 3px;
+
+    Text {
+        x: 4px;
+        width: parent.width - 6px;
+        text: dot.summary;
+        font-size: 9px;
+        font-weight: 600;
+        color: Theme.text-primary;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+}
+
 component WeekdayHeader inherits Text {
     color: Theme.text-muted;
-    font-size: 13px;
+    font-size: 12px;
+    font-weight: 600;
     horizontal-alignment: center;
 }
 
 component DayCell inherits Rectangle {
     in property <CalendarDayData> day;
-    in property <bool> selected;
+    in property <[bool]> member-visible;
+    // Tapping an empty part of a day cell is how new events get created in
+    // Month view too (mirrors tapping an hour slot in Week/Day view).
     callback tapped();
 
-    border-radius: 10px;
-    border-width: selected ? 2px : 0px;
-    border-color: Theme.accent;
+    border-width: 1px;
+    border-color: Theme.border;
     background: touch.pressed
-        ? Theme.accent.with-alpha(0.30)
-        : (day.is-today ? Theme.accent.with-alpha(0.18) : transparent);
+        ? Theme.accent.with-alpha(0.25)
+        : (day.is-today ? Theme.accent.with-alpha(0.10) : Theme.surface);
+    clip: true;
 
     touch := TouchArea {
         clicked => { tapped(); }
@@ -35,74 +65,71 @@ component DayCell inherits Rectangle {
         VerticalLayout {
             alignment: start;
             padding: 6px;
-            spacing: 4px;
-
-            Text {
-                text: day.day-number;
-                color: day.in-current-month ? Theme.text-primary : Theme.text-muted;
-                font-weight: day.is-today ? 700 : 400;
-                font-size: 15px;
-            }
+            spacing: 3px;
 
             HorizontalLayout {
-                spacing: 3px;
-                for dot in day.events: Rectangle {
-                    width: 6px;
-                    height: 6px;
-                    border-radius: 3px;
-                    background: dot.member-color;
+                Rectangle {
+                    width: day.is-today ? 22px : 0px;
+                    height: 22px;
+                    border-radius: 11px;
+                    background: day.is-today ? Theme.accent : transparent;
+
+                    Text {
+                        text: day.day-number;
+                        color: day.is-today ? white : (day.in-current-month ? Theme.text-primary : Theme.text-muted);
+                        font-weight: day.is-today ? 700 : 400;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            for dot in day.events: EventLine {
+                dot: dot;
+                member-visible: root.member-visible;
             }
         }
     }
 }
 
+// The Month view: a full-bleed grid (grid lines between cells, day number
+// top-left, event titles listed directly in the cell) rather than a padded
+// card with abstract dots -- closer to a traditional paper wall calendar,
+// and stretches to fill the page like the other calendar views do.
 export component CalendarCard inherits Rectangle {
     in property <[[CalendarDayData]]> weeks;
-    in property <string> month-label;
-    // Which cell is currently selected, as (week, day) grid indices; -1 = none.
-    out property <int> selected-week: -1;
-    out property <int> selected-day: -1;
+    in property <[bool]> member-visible;
+    // (week, day) grid indices of the tapped cell -- used to open the
+    // event-creation form pre-filled to that date.
     callback day-selected(int /* week */, int /* day */);
 
     background: Theme.surface;
     border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    clip: true;
 
     VerticalLayout {
-        alignment: start;
-        padding: 18px;
-        spacing: 10px;
-
-        Text {
-            text: month-label;
-            color: Theme.text-primary;
-            font-size: 20px;
-            font-weight: 700;
-        }
-
         HorizontalLayout {
-            spacing: 4px;
-            WeekdayHeader { text: "Sun"; }
-            WeekdayHeader { text: "Mon"; }
-            WeekdayHeader { text: "Tue"; }
-            WeekdayHeader { text: "Wed"; }
-            WeekdayHeader { text: "Thu"; }
-            WeekdayHeader { text: "Fri"; }
-            WeekdayHeader { text: "Sat"; }
+            height: 28px;
+            WeekdayHeader { text: "Sun"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Mon"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Tue"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Wed"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Thu"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Fri"; horizontal-stretch: 1; }
+            WeekdayHeader { text: "Sat"; horizontal-stretch: 1; }
         }
 
         for week[week-idx] in weeks: HorizontalLayout {
-            spacing: 4px;
+            vertical-stretch: 1;
             for day[day-idx] in week: DayCell {
                 day: day;
-                selected: root.selected-week == week-idx && root.selected-day == day-idx;
+                member-visible: root.member-visible;
                 horizontal-stretch: 1;
-                height: 64px;
-                tapped => {
-                    root.selected-week = week-idx;
-                    root.selected-day = day-idx;
-                    root.day-selected(week-idx, day-idx);
-                }
+                tapped => { root.day-selected(week-idx, day-idx); }
             }
         }
     }

@@ -1,0 +1,29 @@
+import { Theme } from "theme.slint";
+
+// Generic "coming soon" page body, reused for nav sections that exist as
+// a button now but have no functionality yet (Dashboard, Photos, Settings).
+export component PlaceholderView inherits Rectangle {
+    in property <string> title;
+    in property <string> subtitle;
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+        Text {
+            text: title;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: subtitle;
+            font-size: 14px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+        }
+    }
+}
