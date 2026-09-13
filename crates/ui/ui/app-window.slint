@@ -331,13 +331,10 @@ export component AppWindow inherits Window {
                     spacing: Theme.gap;
                     vertical-stretch: 1;
 
-                    HorizontalLayout {
-                        Rectangle { horizontal-stretch: 1; }
-                        SyncButton {
-                            tapped => { root.manual-refresh-requested(); }
-                        }
-                    }
-
+                    // No Sync button here (unlike Calendar) -- todos push
+                    // near-instantly over HA's event stream (see
+                    // run_ha_sync's state_changed subscription), so there's
+                    // nothing a manual refresh would meaningfully speed up.
                     TodoCard {
                         columns: root.todo-columns;
                         vertical-stretch: 1;
