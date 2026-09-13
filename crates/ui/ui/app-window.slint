@@ -191,11 +191,9 @@ export component AppWindow inherits Window {
         event-detail-open = true;
     }
 
-    // Month view's dots carry no per-event time (day-level grouping only),
-    // so this variant just leaves that line blank.
     function show-calendar-event-detail(dot: CalendarEventDot) {
         event-detail-summary = dot.summary;
-        event-detail-time = "";
+        event-detail-time = dot.time-label;
         event-detail-member-color = dot.member-color;
         event-detail-member-name = (dot.member-index >= 0 && dot.member-index < members.length)
             ? members[dot.member-index].name : "";

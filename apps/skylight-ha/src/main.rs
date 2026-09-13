@@ -457,7 +457,8 @@ async fn create_calendar_event(
 /// One shared fetch (calendar events over the range around `reference_date`,
 /// plus todos) feeding all four calendar views + the Tasks page + top-bar
 /// chips. Used by the periodic refresh, right after creating an event, and
-/// by every nav callback.
+/// by every nav callback. Returns whether the WS connection still looks
+/// alive -- see `run_ha_sync`, which reconnects if not.
 async fn refresh_calendar_and_todos(
     rest: &RestClient,
     client: &Client,
@@ -466,7 +467,7 @@ async fn refresh_calendar_and_todos(
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
-) {
+) -> bool {
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let range_start = grid_start.midnight().assume_offset(local_offset);
     let range_end = grid_end.midnight().assume_offset(local_offset);
@@ -477,7 +478,7 @@ async fn refresh_calendar_and_todos(
     // `Rc`-based (not `Send`), so it can't be constructed on a tokio worker
     // thread and handed across into that closure.
     let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
-    let per_member_todos = fetch_todos(client, family).await;
+    let (per_member_todos, connection_alive) = fetch_todos(client, family).await;
     let family_owned = family.to_vec();
 
     let app_weak = app_weak.clone();
@@ -491,6 +492,8 @@ async fn refresh_calendar_and_todos(
         app.set_todo_columns(todo_columns);
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
     });
+
+    connection_alive
 }
 
 /// Connects to HA, resolves the family roster (config.toml's `[[family]]`
@@ -499,6 +502,11 @@ async fn refresh_calendar_and_todos(
 /// (`tokio::time::interval`'s first tick fires immediately, so this one loop
 /// covers both "on connect" and "periodically"). Nav taps and event
 /// creation refresh independently of this loop via `spawn_refresh`.
+///
+/// Reconnects (outer loop) whenever the WS connection is detected dead
+/// (see `fetch_todos`) rather than connecting exactly once for the life of
+/// the process -- `ha_client::Client` doesn't reconnect itself by design
+/// (its own doc comment says so explicitly), so something has to.
 #[allow(clippy::too_many_arguments)]
 async fn run_ha_sync(
     config: Config,
@@ -518,48 +526,71 @@ async fn run_ha_sync(
         }
     };
 
-    let client = ha_client::connect_with_backoff(
-        &config.ha.base_url,
-        &token,
-        std::time::Duration::from_secs(30),
-    )
-    .await;
-    tracing::info!("connected to Home Assistant");
-    *live_client.lock().unwrap() = Some(client.clone());
-    let rest = RestClient::new(&config.ha.base_url, &token);
-    *live_rest.lock().unwrap() = Some(rest.clone());
+    // The family roster only needs resolving once -- re-discovering on
+    // every reconnect would be harmless (same HA entities, same result)
+    // but would also reset `member_visible`/`event_form_members`, wiping
+    // out any chip the user had toggled off.
+    let mut family_resolved = false;
 
-    // `config.toml`'s `[[family]]` is a manual override for people who want
-    // custom colors/order/pairing; leaving it empty (the default going
-    // forward) means nobody has to hand-edit entity ids to get a working
-    // dashboard -- it's discovered from whatever todo/calendar entities
-    // actually exist in HA instead.
-    let family = if config.family.is_empty() {
-        let discovered = discover_family(&client).await;
-        tracing::info!(count = discovered.len(), "discovered family roster from HA");
-        discovered
-    } else {
-        config.family.clone()
-    };
-    *family_state.lock().unwrap() = family.clone();
-    {
-        let app_weak = app_weak.clone();
-        let family = family.clone();
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(app) = app_weak.upgrade() {
-                apply_family_roster(&app, &family);
-            }
-        });
-    }
-
-    // docs/plan.md's stated cadence for calendar polling (it isn't pushed
-    // over the HA websocket, unlike todos/entity states).
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     loop {
-        interval.tick().await;
-        let ref_date = *reference_date.lock().unwrap();
-        let family = family_state.lock().unwrap().clone();
-        refresh_calendar_and_todos(&rest, &client, &family, local_offset, ref_date, &app_weak, &todo_uids).await;
+        let client = ha_client::connect_with_backoff(
+            &config.ha.base_url,
+            &token,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        tracing::info!("connected to Home Assistant");
+        *live_client.lock().unwrap() = Some(client.clone());
+        let rest = RestClient::new(&config.ha.base_url, &token);
+        *live_rest.lock().unwrap() = Some(rest.clone());
+
+        if !family_resolved {
+            // `config.toml`'s `[[family]]` is a manual override for people
+            // who want custom colors/order/pairing; leaving it empty (the
+            // default going forward) means nobody has to hand-edit entity
+            // ids to get a working dashboard -- it's discovered from
+            // whatever todo/calendar entities actually exist in HA instead.
+            let family = if config.family.is_empty() {
+                let discovered = discover_family(&client).await;
+                tracing::info!(count = discovered.len(), "discovered family roster from HA");
+                discovered
+            } else {
+                config.family.clone()
+            };
+            *family_state.lock().unwrap() = family.clone();
+            let app_weak_for_roster = app_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak_for_roster.upgrade() {
+                    apply_family_roster(&app, &family);
+                }
+            });
+            family_resolved = true;
+        }
+
+        // docs/plan.md's stated cadence for calendar polling (it isn't
+        // pushed over the HA websocket, unlike todos/entity states).
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
+        loop {
+            interval.tick().await;
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
+            let alive = refresh_calendar_and_todos(
+                &rest,
+                &client,
+                &family,
+                local_offset,
+                ref_date,
+                &app_weak,
+                &todo_uids,
+            )
+            .await;
+            if !alive {
+                tracing::warn!("HA connection appears to have dropped, reconnecting");
+                *live_client.lock().unwrap() = None;
+                *live_rest.lock().unwrap() = None;
+                break; // back to the outer loop to reconnect
+            }
+        }
     }
 }
 
@@ -665,13 +696,26 @@ async fn fetch_calendar_events(
     out
 }
 
-async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> Vec<Vec<TodoItem>> {
+/// Also reports whether the connection still looks alive: `ha-client`
+/// deliberately doesn't hide reconnection behind `Client` itself (see its
+/// own doc comment) -- once the underlying WS actor dies, every call on
+/// this `Client` returns `Error::Closed` forever, which without this check
+/// looked identical to "no items" (logged, then silently swapped in an
+/// empty list) instead of "we need to reconnect". That's what was making
+/// the Tasks page's columns go empty after a few minutes: the fetch wasn't
+/// slow or wrong, the connection had quietly died and nothing ever asked
+/// for a fresh one.
+async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> (Vec<Vec<TodoItem>>, bool) {
     let mut out = Vec::with_capacity(family.len());
+    let mut connection_alive = true;
     for member in family {
         let items = match &member.todo_entity {
             Some(entity) => match client.todo_items(entity).await {
                 Ok(items) => items,
                 Err(err) => {
+                    if matches!(err, ha_client::connection::Error::Closed) {
+                        connection_alive = false;
+                    }
                     tracing::warn!(entity = %entity, %err, "failed to fetch todo items");
                     Vec::new()
                 }
@@ -680,7 +724,7 @@ async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> Vec<Vec<TodoIt
         };
         out.push(items);
     }
-    out
+    (out, connection_alive)
 }
 
 /// The four calendar projections built from one shared fetch -- see
@@ -769,9 +813,11 @@ fn build_calendar_grids(
                 // out to be a hard target to hit precisely on a touchscreen.
                 let duration_minutes = ((local_end - local_start).whole_minutes() as i32).max(30);
 
+                let time_label = format_time_range(local_start, local_end);
                 let bucket = buckets.entry(local_start.date()).or_default();
                 bucket.month_entries.push(CalendarEventDot {
                     summary: ev.summary.clone().into(),
+                    time_label: time_label.clone().into(),
                     member_color: *color,
                     member_index,
                 });
@@ -779,7 +825,7 @@ fn build_calendar_grids(
                     start_minutes,
                     WeekEventData {
                         summary: ev.summary.clone().into(),
-                        time_label: format_time_range(local_start, local_end).into(),
+                        time_label: time_label.into(),
                         start_minutes,
                         duration_minutes,
                         member_color: *color,
@@ -791,6 +837,7 @@ fn build_calendar_grids(
                     let bucket = buckets.entry(date).or_default();
                     bucket.month_entries.push(CalendarEventDot {
                         summary: ev.summary.clone().into(),
+                        time_label: "All day".into(),
                         member_color: *color,
                         member_index,
                     });

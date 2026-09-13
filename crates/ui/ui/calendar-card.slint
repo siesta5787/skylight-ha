@@ -2,6 +2,10 @@ import { Theme } from "theme.slint";
 
 export struct CalendarEventDot {
     summary: string,
+    // "10:00 - 11:30 AM" for timed events, "All day" for all-day ones --
+    // shown when the event's tapped (the month grid itself only shows the
+    // summary text; there's no room to also show a time per line).
+    time-label: string,
     member-color: color,
     member-index: int,
 }
