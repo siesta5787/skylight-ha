@@ -189,20 +189,23 @@ fn main() {
         app.on_event_create_confirmed(move |member_index, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
             // Falls back to whichever family member actually has a
-            // calendar_entity if the selected one doesn't (a household with
-            // one shared calendar and per-person todo lists -- not a
+            // calendar configured if the selected one doesn't (a household
+            // with one shared calendar and per-person todo lists -- not a
             // calendar per person -- has exactly one member configured with
-            // calendar_entity at all, so picking anyone else in the form
-            // used to silently create nothing).
+            // any calendar_entities at all, so picking anyone else in the
+            // form used to silently create nothing). A member can have more
+            // than one calendar linked (Skylight Family integration
+            // supports that); the creation form has no "which one" picker
+            // yet, so this always uses the first.
             let entity_id = {
                 let family = family_state.lock().unwrap();
                 family
                     .get(member_index as usize)
-                    .and_then(|m| m.calendar_entity.clone())
-                    .or_else(|| family.iter().find_map(|m| m.calendar_entity.clone()))
+                    .and_then(|m| m.calendar_entities.first().cloned())
+                    .or_else(|| family.iter().find_map(|m| m.calendar_entities.first().cloned()))
             };
             let Some(entity_id) = entity_id else {
-                tracing::warn!("no family member has a calendar_entity configured, can't create event");
+                tracing::warn!("no family member has a calendar configured, can't create event");
                 return;
             };
             let Some(client) = live_client.lock().unwrap().clone() else {
@@ -565,17 +568,29 @@ async fn run_ha_sync(
         *live_rest.lock().unwrap() = Some(rest.clone());
 
         if !family_resolved {
-            // `config.toml`'s `[[family]]` is a manual override for people
-            // who want custom colors/order/pairing; leaving it empty (the
-            // default going forward) means nobody has to hand-edit entity
-            // ids to get a working dashboard -- it's discovered from
-            // whatever todo/calendar entities actually exist in HA instead.
-            let family = if config.family.is_empty() {
-                let discovered = discover_family(&client).await;
-                tracing::info!(count = discovered.len(), "discovered family roster from HA");
-                discovered
-            } else {
+            // Priority: `[[family]]` in config.toml (manual override, for
+            // custom colors/order/pairing) > the Skylight Family
+            // integration's sensor.skylight_family_* entities (a
+            // controlled, purpose-built mapping set up once in HA's own
+            // Settings UI) > heuristic todo/calendar name-matching (the
+            // fallback for anyone who hasn't installed that integration).
+            let family = if !config.family.is_empty() {
                 config.family.clone()
+            } else if let Some(from_integration) =
+                discover_family_from_skylight_integration(&client).await
+            {
+                tracing::info!(
+                    count = from_integration.len(),
+                    "loaded family roster from the Skylight Family integration"
+                );
+                from_integration
+            } else {
+                let discovered = discover_family(&client).await;
+                tracing::info!(
+                    count = discovered.len(),
+                    "discovered family roster from HA todo/calendar entities (Skylight Family integration not found)"
+                );
+                discovered
             };
             *family_state.lock().unwrap() = family.clone();
             let app_weak_for_roster = app_weak.clone();
@@ -654,6 +669,65 @@ async fn run_ha_sync(
     }
 }
 
+/// Shared by both auto-discovery paths below, for members whose color isn't
+/// otherwise known.
+const PALETTE: &[&str] = &[
+    "#4f8ef7", "#e0607a", "#f2b705", "#8b5cf6", "#22c55e", "#f97316", "#64748b", "#06b6d4",
+    "#ec4899", "#84cc16",
+];
+
+/// Builds a family roster from the `siesta5787/skylight-family` HA
+/// integration (https://github.com/siesta5787/skylight-family), if it's
+/// installed and has at least one member configured. This is the
+/// purpose-built, controlled source -- explicit person/calendar/todo
+/// pairing done once through HA's own Settings UI -- so it takes priority
+/// over `discover_family`'s heuristic todo/calendar name-matching below,
+/// which exists as a fallback for anyone who hasn't installed it. `None`
+/// means "integration not present/configured", not "connection error" (a
+/// real fetch error is treated the same way -- if we can't tell, fall back).
+async fn discover_family_from_skylight_integration(client: &Client) -> Option<Vec<FamilyMember>> {
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to list HA entities while checking for the Skylight Family integration");
+            return None;
+        }
+    };
+
+    let mut members: Vec<(String, FamilyMember)> = Vec::new(); // (slug, member), sorted after
+    for state in &states {
+        let Some(slug) = state.entity_id.strip_prefix("sensor.skylight_family_") else { continue };
+
+        let name = state
+            .attributes
+            .get("friendly_name")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| titlecase_slug(slug));
+        let todo_entity =
+            state.attributes.get("todo_entity_id").and_then(|v| v.as_str()).map(str::to_string);
+        let calendar_entities: Vec<String> = state
+            .attributes
+            .get("calendar_entity_ids")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        let color = parse_ha_color_attribute(state.attributes.get("color"))
+            .unwrap_or_else(|| PALETTE[members.len() % PALETTE.len()].to_string());
+
+        members.push((
+            slug.to_string(),
+            FamilyMember { id: slug.to_string(), name, color, todo_entity, calendar_entities },
+        ));
+    }
+
+    if members.is_empty() {
+        return None; // integration not installed, or installed with nobody configured yet
+    }
+    members.sort_by(|a, b| a.0.cmp(&b.0)); // stable across runs
+    Some(members.into_iter().map(|(_, m)| m).collect())
+}
+
 /// Builds a family roster from whatever `todo.*`/`calendar.*` entities
 /// exist in HA, rather than requiring `[[family]]` to be hand-written in
 /// config.toml. A `todo.*` entity becomes a member (named from its
@@ -661,7 +735,9 @@ async fn run_ha_sync(
 /// `calendar.*` entity is attached to the member with the same slug (e.g.
 /// `todo.jesse` + `calendar.jesse`) if one exists, otherwise it becomes its
 /// own member with no todo list (e.g. a shared household calendar that
-/// isn't any one person's).
+/// isn't any one person's). Fallback for when the Skylight Family
+/// integration (see `discover_family_from_skylight_integration` above)
+/// isn't installed.
 async fn discover_family(client: &Client) -> Vec<FamilyMember> {
     let states = match client.get_states().await {
         Ok(states) => states,
@@ -689,21 +765,17 @@ async fn discover_family(client: &Client) -> Vec<FamilyMember> {
     }
     todos.sort_by(|a, b| a.0.cmp(&b.0)); // stable across runs
 
-    const PALETTE: &[&str] = &[
-        "#4f8ef7", "#e0607a", "#f2b705", "#8b5cf6", "#22c55e", "#f97316", "#64748b", "#06b6d4",
-        "#ec4899", "#84cc16",
-    ];
     let mut members = Vec::new();
 
     for (slug, todo_entity, name) in todos {
-        let calendar_entity = calendars.remove(&slug).map(|(id, _)| id);
+        let calendar_entities = calendars.remove(&slug).map(|(id, _)| vec![id]).unwrap_or_default();
         let color = PALETTE[members.len() % PALETTE.len()].to_string();
         members.push(FamilyMember {
             id: slug,
             name,
             color,
             todo_entity: Some(todo_entity),
-            calendar_entity,
+            calendar_entities,
         });
     }
 
@@ -713,7 +785,13 @@ async fn discover_family(client: &Client) -> Vec<FamilyMember> {
     leftover_calendars.sort_by(|a, b| a.0.cmp(&b.0));
     for (slug, (entity_id, name)) in leftover_calendars {
         let color = PALETTE[members.len() % PALETTE.len()].to_string();
-        members.push(FamilyMember { id: slug, name, color, todo_entity: None, calendar_entity: Some(entity_id) });
+        members.push(FamilyMember {
+            id: slug,
+            name,
+            color,
+            todo_entity: None,
+            calendar_entities: vec![entity_id],
+        });
     }
 
     members
@@ -743,14 +821,22 @@ async fn fetch_calendar_events(
 ) -> Vec<(usize, slint::Color, Vec<CalendarEvent>)> {
     let mut out = Vec::new();
     for (index, member) in family.iter().enumerate() {
-        let Some(entity) = &member.calendar_entity else { continue };
-        let events = match rest.calendar_events(entity, start, end).await {
-            Ok(events) => events,
-            Err(err) => {
-                tracing::warn!(entity = %entity, %err, "failed to fetch calendar events");
-                Vec::new()
+        if member.calendar_entities.is_empty() {
+            continue;
+        }
+        // A member can have more than one calendar linked; events from all
+        // of them are merged and shown in this member's single color --
+        // nothing downstream needs to know which specific calendar an
+        // event came from.
+        let mut events = Vec::new();
+        for entity in &member.calendar_entities {
+            match rest.calendar_events(entity, start, end).await {
+                Ok(fetched) => events.extend(fetched),
+                Err(err) => {
+                    tracing::warn!(entity = %entity, %err, "failed to fetch calendar events");
+                }
             }
-        };
+        }
         out.push((index, parse_hex_color(&member.color), events));
     }
     out
@@ -1060,4 +1146,51 @@ fn parse_hex_color(hex: &str) -> slint::Color {
     let value = u32::from_str_radix(hex, 16).unwrap_or(0x6c8dfa);
     let [_, r, g, b] = value.to_be_bytes();
     slint::Color::from_rgb_u8(r, g, b)
+}
+
+/// A family member's `color` attribute from the Skylight Family integration
+/// (or, in principle, anything else supplying one). HA's color selector --
+/// what the integration's config flow uses -- stores this as an `[r, g, b]`
+/// array of 0-255 ints, not a hex string; confirmed against a real
+/// configured member, where it was silently falling back to the palette
+/// default before this handled the array form. A plain hex string is also
+/// accepted, in case that ever changes.
+fn parse_ha_color_attribute(value: Option<&serde_json::Value>) -> Option<String> {
+    let value = value?;
+    if let Some(s) = value.as_str().filter(|s| !s.is_empty()) {
+        return Some(s.to_string());
+    }
+    let rgb = value.as_array()?;
+    let mut channels = rgb.iter().filter_map(|n| n.as_u64());
+    match (channels.next(), channels.next(), channels.next()) {
+        (Some(r), Some(g), Some(b)) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_rgb_array_color_attribute() {
+        // The exact shape HA's color selector actually sends, confirmed
+        // against a real Skylight Family member entity.
+        let value = serde_json::json!([0, 255, 0]);
+        assert_eq!(parse_ha_color_attribute(Some(&value)), Some("#00ff00".to_string()));
+    }
+
+    #[test]
+    fn parses_hex_string_color_attribute() {
+        let value = serde_json::json!("#4f8ef7");
+        assert_eq!(parse_ha_color_attribute(Some(&value)), Some("#4f8ef7".to_string()));
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_color_attribute() {
+        assert_eq!(parse_ha_color_attribute(None), None);
+        assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(""))), None);
+        assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!([255, 0]))), None);
+        assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(null))), None);
+    }
 }

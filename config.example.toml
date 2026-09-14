@@ -7,26 +7,36 @@ base_url = "http://homeassistant.local:8123"
 # permissions restricted (chmod 600 on the target device).
 token_path = "./ha-token.secret"
 
-# No [[family]] entries needed -- the dashboard auto-discovers the family
-# roster from whatever todo.*/calendar.* entities exist in HA once it
-# connects (see discover_family in apps/skylight-ha/src/main.rs): each
-# todo.* entity becomes a member, and a calendar.* entity attaches to the
-# member with the same slug (e.g. todo.alice + calendar.alice) if one
-# exists, or becomes its own member otherwise (e.g. a shared household
-# calendar that isn't any one person's). Names come from each entity's
-# friendly_name, colors are auto-assigned from a fixed palette.
+# No [[family]] entries needed -- the dashboard resolves the family roster
+# itself once it connects (see run_ha_sync in apps/skylight-ha/src/main.rs),
+# in priority order:
+#   1. [[family]] below, if you've filled any in (manual override).
+#   2. The siesta5787/skylight-family HA integration
+#      (https://github.com/siesta5787/skylight-family), if installed and
+#      configured with at least one member -- the controlled, purpose-built
+#      source: explicit person/calendar(s)/todo pairing set up once through
+#      HA's own Settings UI. A member can have more than one calendar linked.
+#   3. Otherwise, heuristic discovery from whatever todo.*/calendar.*
+#      entities exist in HA: each todo.* entity becomes a member, and a
+#      calendar.* entity attaches to the member with the same slug (e.g.
+#      todo.alice + calendar.alice) if one exists, or becomes its own member
+#      otherwise (e.g. a shared household calendar that isn't any one
+#      person's). Names come from each entity's friendly_name.
+# Whichever path is used, any member missing a color gets one auto-assigned
+# from a fixed palette.
 #
-# Add [[family]] blocks below only if you want to override that -- custom
-# colors, a specific display order, or pairing a todo list with a calendar
-# that doesn't share its entity-id slug. Non-empty [[family]] here is used
-# verbatim instead of discovery. Example:
+# Add [[family]] blocks below only if you want to override all of that --
+# custom colors, a specific display order, or pairing a todo list with a
+# calendar that doesn't share its entity-id slug and isn't set up in the
+# Skylight Family integration either. Non-empty [[family]] here is used
+# verbatim instead. Example:
 #
 # [[family]]
 # id = "alice"
 # name = "Alice"
 # color = "#e0607a"
 # todo_entity = "todo.chores_alice"
-# calendar_entity = "calendar.alice"
+# calendar_entities = ["calendar.alice"]
 
 [[views]]
 name = "Home"

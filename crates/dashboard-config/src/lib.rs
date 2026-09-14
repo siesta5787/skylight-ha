@@ -50,12 +50,15 @@ impl HaConnection {
 
 /// A family member the dashboard tracks. Todos are per-person: each member
 /// has their own HA `todo.*` entity rather than everyone sharing one list.
-/// Usually built by auto-discovering `todo.*`/`calendar.*` entities from HA
-/// at connect time (see `apps/skylight-ha`'s `discover_family`) rather than
-/// hand-written here -- `[[family]]` in config.toml is only consulted as a
-/// manual override when non-empty (custom colors/order/pairing). Either way
-/// isn't guaranteed to have both: a shared household calendar with no
-/// matching todo list becomes its own entry with `todo_entity: None`.
+/// Usually built at connect time from (in priority order, see
+/// `apps/skylight-ha`'s `run_ha_sync`): `[[family]]` below if non-empty (a
+/// manual override for custom colors/order/pairing), else the
+/// `siesta5787/skylight-family` HA integration's `sensor.skylight_family_*`
+/// entities if any exist (the controlled, purpose-built source), else
+/// heuristically auto-discovered from whatever `todo.*`/`calendar.*`
+/// entities exist in HA. None of these guarantee both fields present -- a
+/// shared household calendar with no matching todo list becomes its own
+/// entry with `todo_entity: None`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FamilyMember {
     pub id: String,
@@ -63,7 +66,11 @@ pub struct FamilyMember {
     /// Hex color, e.g. "#4f8ef7", used for their calendar events and todo tab.
     pub color: String,
     pub todo_entity: Option<String>,
-    pub calendar_entity: Option<String>,
+    /// A member can have more than one calendar (the Skylight Family
+    /// integration supports linking several) -- events from all of them are
+    /// shown in this member's color, undifferentiated.
+    #[serde(default)]
+    pub calendar_entities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
