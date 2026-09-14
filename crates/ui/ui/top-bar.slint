@@ -56,7 +56,7 @@ component WeatherStatLine inherits Rectangle {
     in property <string> value;
 
     HorizontalLayout {
-        spacing: 3px;
+        spacing: 1px;
 
         WeatherStatIcon {
             kind: root.kind;
@@ -95,7 +95,7 @@ export component WeatherWidget inherits Rectangle {
     background: transparent;
 
     HorizontalLayout {
-        spacing: 6px;
+        spacing: 1.5px;
 
         WeatherIcon {
             condition: root.icon-condition;
