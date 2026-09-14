@@ -62,14 +62,21 @@ export component EventDetailView inherits Rectangle {
 
             HorizontalLayout {
                 spacing: 8px;
-                HorizontalLayout {
-                    spacing: 4px;
-                    for c in root.member-colors: Rectangle {
-                        width: 12px;
-                        height: 12px;
-                        border-radius: 6px;
-                        background: c;
-                        y: (parent.height - self.height) / 2;
+                Rectangle {
+                    width: 22px;
+                    height: 14px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 4px;
+                    clip: true;
+
+                    HorizontalLayout {
+                        width: 100%;
+                        height: 100%;
+                        if root.member-colors.length == 0: Rectangle { background: Theme.border; }
+                        for c in root.member-colors: Rectangle {
+                            horizontal-stretch: 1;
+                            background: c;
+                        }
                     }
                 }
                 Text {

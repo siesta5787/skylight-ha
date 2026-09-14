@@ -107,13 +107,23 @@ component EventCard inherits Rectangle {
         || root.event.member-index >= root.member-visible.length
         || root.member-visible[root.event.member-index];
 
-    property <color> primary-color: event.member-colors.length > 0 ? event.member-colors[0] : Theme.border;
-
     border-radius: 6px;
-    background: touch.pressed ? primary-color.with-alpha(0.45) : primary-color.with-alpha(0.30);
     border-width: 1px;
-    border-color: primary-color;
+    border-color: event.member-colors.length > 0 ? event.member-colors[0] : Theme.border;
     clip: true;
+
+    // Same equal-width-band fill as the Month view's EventLine (see there
+    // for why) -- one band per participant instead of a single dominant
+    // color.
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        if event.member-colors.length == 0: Rectangle { background: Theme.border.with-alpha(0.30); }
+        for c in event.member-colors: Rectangle {
+            horizontal-stretch: 1;
+            background: c.with-alpha(touch.pressed ? 0.50 : 0.32);
+        }
+    }
 
     touch := TouchArea {
         clicked => { root.tapped(); }
@@ -135,15 +145,6 @@ component EventCard inherits Rectangle {
             font-size: 9px;
             color: Theme.text-muted;
             overflow: elide;
-        }
-        if event.member-colors.length > 1: HorizontalLayout {
-            spacing: 3px;
-            for c in event.member-colors: Rectangle {
-                width: 7px;
-                height: 7px;
-                border-radius: 3.5px;
-                background: c;
-            }
         }
     }
 }

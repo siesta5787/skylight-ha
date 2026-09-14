@@ -39,40 +39,35 @@ component EventLine inherits Rectangle {
     callback tapped();
 
     height: 15px;
-    background: (dot.member-colors.length > 0 ? dot.member-colors[0] : Theme.border)
-        .with-alpha(touch.pressed ? 0.40 : 0.20);
     border-radius: 3px;
+    clip: true;
+
+    // The fill is divided into one equal-width band per participant (a
+    // HorizontalLayout with equal horizontal-stretch does the dividing) so
+    // every person on a shared event is equally visible, rather than one
+    // dominant color plus small, easy-to-miss dots.
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        if dot.member-colors.length == 0: Rectangle { background: Theme.border.with-alpha(0.20); }
+        for c in dot.member-colors: Rectangle {
+            horizontal-stretch: 1;
+            background: c.with-alpha(touch.pressed ? 0.50 : 0.28);
+        }
+    }
 
     touch := TouchArea {
         clicked => { root.tapped(); }
 
-        HorizontalLayout {
-            padding-left: 4px;
-            padding-right: 4px;
-            spacing: 3px;
-
-            Text {
-                text: dot.summary;
-                font-size: 9px;
-                font-weight: 600;
-                color: Theme.text-primary;
-                overflow: elide;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
-
-            // Only shown once there's more than one participant -- a solo
-            // event already has its color as the card background.
-            if dot.member-colors.length > 1: HorizontalLayout {
-                spacing: 2px;
-                for c in dot.member-colors: Rectangle {
-                    width: 6px;
-                    height: 6px;
-                    border-radius: 3px;
-                    background: c;
-                    y: (parent.height - self.height) / 2;
-                }
-            }
+        Text {
+            x: 4px;
+            width: parent.width - 6px;
+            text: dot.summary;
+            font-size: 9px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            overflow: elide;
+            vertical-alignment: center;
         }
     }
 }
