@@ -116,6 +116,13 @@ pub struct Config {
     /// override-else-auto-discover pattern as the family roster.
     #[serde(default)]
     pub weather_entity: Option<String>,
+    /// A second `weather.*` entity to pull humidity/air-pressure from when
+    /// `weather_entity` doesn't expose them itself (some integrations only
+    /// report condition/temperature/wind). Optional: if unset, the
+    /// dashboard auto-discovers any other weather.* entity that does have
+    /// those attributes (see discover_weather_backfill_entity).
+    #[serde(default)]
+    pub weather_backfill_entity: Option<String>,
     pub views: Vec<View>,
 }
 

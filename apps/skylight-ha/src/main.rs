@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use dashboard_config::{Config, FamilyMember};
-use ha_client::entities::{CalendarEvent, EntityState, TodoItem, TodoStatus};
+use ha_client::entities::{CalendarEvent, DailyForecast, EntityState, TodoItem, TodoStatus};
 use ha_client::{Client, RestClient};
 use slint::{ComponentHandle, Model, SharedString};
 use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Weekday};
@@ -66,13 +66,19 @@ fn main() {
     // below reads this fresh at call time rather than capturing a snapshot,
     // since it isn't known for certain until after connecting.
     let family_state: Arc<Mutex<Vec<FamilyMember>>> = Arc::new(Mutex::new(config.family.clone()));
-    // Which `weather.*` entity feeds the top bar -- `config.weather_entity`
-    // if set, else auto-discovered once `run_ha_sync` connects (see
-    // `discover_weather_entity`). `None` until resolved (or if no weather
-    // entity exists at all), same shared-state shape as `family_state`
-    // since it's read from `refresh_calendar_and_todos`'s other call site
-    // too (after creating a calendar event).
-    let weather_entity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(config.weather_entity.clone()));
+    // Which `weather.*` entity(ies) feed the weather widget -- `primary`
+    // from `config.weather_entity` (condition/temperature/wind/forecast)
+    // and `backfill` from `config.weather_backfill_entity` (humidity/
+    // pressure, for integrations that don't expose them on the primary
+    // entity), else auto-discovered once `run_ha_sync` connects (see
+    // `discover_weather_entity`/`discover_weather_backfill_entity`). Same
+    // shared-state shape as `family_state` since it's read from
+    // `refresh_calendar_and_todos`'s other call site too (after creating a
+    // calendar event).
+    let weather_entities: Arc<Mutex<WeatherEntities>> = Arc::new(Mutex::new(WeatherEntities {
+        primary: config.weather_entity.clone(),
+        backfill: config.weather_backfill_entity.clone(),
+    }));
     // (column index into the Tasks page) -> (that column's todo entity id,
     // the uid of each item) -- only members with a todo_entity get a
     // column, so this is a *different*, potentially shorter, index space
@@ -331,7 +337,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         let app_weak = app.as_weak();
         app.on_event_create_confirmed(move |selected_members, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
@@ -370,7 +376,7 @@ fn main() {
             let app_weak = app_weak.clone();
             let live_rest = live_rest.clone();
             let todo_uids = todo_uids.clone();
-            let weather_entity = weather_entity.clone();
+            let weather_entities = weather_entities.clone();
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
@@ -397,7 +403,7 @@ fn main() {
                         ref_date,
                         &app_weak,
                         &todo_uids,
-                        &weather_entity,
+                        &weather_entities,
                     )
                     .await;
                 }
@@ -417,7 +423,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         app.on_nav_month(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -426,7 +432,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
         });
     }
     {
@@ -437,7 +443,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         app.on_nav_week(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -446,7 +452,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
         });
     }
     {
@@ -457,7 +463,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         app.on_nav_day(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -466,7 +472,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
         });
     }
     {
@@ -477,13 +483,13 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         app.on_nav_today(move || {
             let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
             *reference_date.lock().unwrap() = new_date;
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
         });
     }
     {
@@ -494,11 +500,11 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
-        let weather_entity = weather_entity.clone();
+        let weather_entities = weather_entities.clone();
         app.on_manual_refresh_requested(move || {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entity);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entities);
         });
     }
 
@@ -528,7 +534,7 @@ fn main() {
         todo_uids,
         reference_date,
         family_state,
-        weather_entity,
+        weather_entities,
     ));
 
     app.run().expect("event loop error");
@@ -570,7 +576,7 @@ fn spawn_refresh(
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
-    weather_entity: &Arc<Mutex<Option<String>>>,
+    weather_entities: &Arc<Mutex<WeatherEntities>>,
 ) {
     let (Some(rest), Some(client)) =
         (live_rest.lock().unwrap().clone(), live_client.lock().unwrap().clone())
@@ -580,7 +586,7 @@ fn spawn_refresh(
     let family = family.to_vec();
     let app_weak = app_weak.clone();
     let todo_uids = todo_uids.clone();
-    let weather_entity = weather_entity.clone();
+    let weather_entities = weather_entities.clone();
     rt_handle.spawn(async move {
         refresh_calendar_and_todos(
             &rest,
@@ -590,7 +596,7 @@ fn spawn_refresh(
             reference_date,
             &app_weak,
             &todo_uids,
-            &weather_entity,
+            &weather_entities,
         )
         .await;
     });
@@ -626,6 +632,14 @@ fn open_event_form(
 enum KeyboardTarget {
     NewTaskSummary { column: i32 },
     EventTitle,
+}
+
+/// Which `weather.*` entities feed the weather widget -- see
+/// `weather_entities` in `main`.
+#[derive(Default, Clone)]
+struct WeatherEntities {
+    primary: Option<String>,
+    backfill: Option<String>,
 }
 
 async fn add_todo_item(
@@ -688,7 +702,7 @@ async fn refresh_calendar_and_todos(
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
-    weather_entity: &Arc<Mutex<Option<String>>>,
+    weather_entities: &Arc<Mutex<WeatherEntities>>,
 ) -> bool {
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let range_start = grid_start.midnight().assume_offset(local_offset);
@@ -702,18 +716,45 @@ async fn refresh_calendar_and_todos(
     let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
     let (per_member_todos, connection_alive) = fetch_todos(client, family).await;
 
-    // A REST call, not WS -- there's no dedicated WS command for a single
+    // REST calls, not WS -- there's no dedicated WS query for a single
     // entity's state, and this only needs to happen on the same cadence as
     // the calendar poll above, not on every `state_changed` event. `None`
-    // (no weather entity resolved yet, or the fetch failed) means "leave
-    // whatever's already on screen alone" -- same don't-flash-to-placeholder
-    // reasoning as the connection-dead check below.
-    let weather_entity_id = weather_entity.lock().unwrap().clone();
-    let weather = match &weather_entity_id {
+    // (entity not resolved yet, or the fetch failed) means "leave whatever's
+    // already on screen alone" -- same don't-flash-to-placeholder reasoning
+    // as the connection-dead check below.
+    let (primary_entity, backfill_entity) = {
+        let entities = weather_entities.lock().unwrap();
+        (entities.primary.clone(), entities.backfill.clone())
+    };
+    let weather = match &primary_entity {
         Some(entity_id) => match rest.entity_state(entity_id).await {
             Ok(state) => Some(state),
             Err(err) => {
                 tracing::warn!(entity = %entity_id, %err, "failed to fetch weather entity state");
+                None
+            }
+        },
+        None => None,
+    };
+    // A day's high/low isn't a plain state attribute on modern HA weather
+    // entities -- it needs its own service call (see
+    // Client::weather_daily_forecast). WS, not REST: the forecast service
+    // isn't exposed over the REST API.
+    let forecast_today = match &primary_entity {
+        Some(entity_id) => match client.weather_daily_forecast(entity_id).await {
+            Ok(days) => days.into_iter().next(),
+            Err(err) => {
+                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather forecast");
+                None
+            }
+        },
+        None => None,
+    };
+    let backfill = match &backfill_entity {
+        Some(entity_id) => match rest.entity_state(entity_id).await {
+            Ok(state) => Some(state),
+            Err(err) => {
+                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather backfill entity state");
                 None
             }
         },
@@ -744,13 +785,55 @@ async fn refresh_calendar_and_todos(
         *todo_uids.lock().unwrap() = uid_map;
         app.set_todo_columns(todo_columns);
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
-        if let Some(state) = &weather {
-            app.set_weather_text(format_weather_temperature(state).into());
-            app.set_weather_condition(humanize_weather_condition(&state.state).into());
-        }
+        apply_weather(&app, weather.as_ref(), forecast_today.as_ref(), backfill.as_ref());
     });
 
     true
+}
+
+/// Pushes whatever weather data is actually available onto the widget's
+/// properties. Each piece is set independently and only when present --
+/// e.g. a forecast-fetch failure shouldn't blank out the current
+/// condition/temperature that did come back, and `backfill` only fills in
+/// humidity/pressure when `weather` itself doesn't already have them
+/// (checked first, so a primary entity that *does* expose them needs no
+/// backfill entity configured at all).
+fn apply_weather(
+    app: &AppWindow,
+    weather: Option<&EntityState>,
+    forecast_today: Option<&DailyForecast>,
+    backfill: Option<&EntityState>,
+) {
+    let Some(state) = weather else { return };
+    let unit = state.attributes.get("temperature_unit").and_then(|v| v.as_str()).unwrap_or("°");
+
+    app.set_weather_icon_condition(state.state.clone().into());
+    app.set_weather_condition_label(format_weather_condition_label(&state.state).into());
+    if let Some(last_updated) = state.last_updated {
+        let elapsed_label = format_relative_time(last_updated, OffsetDateTime::now_utc());
+        app.set_weather_updated_label(elapsed_label.into());
+    }
+    if let Some(temp) = state.attributes.get("temperature").and_then(|v| v.as_f64()) {
+        app.set_weather_temp_now(format_weather_temp(temp, unit).into());
+    }
+    let wind = format_wind(state);
+    if !wind.is_empty() {
+        app.set_weather_wind(wind.into());
+    }
+    if let Some(fc) = forecast_today {
+        if let (Some(high), Some(low)) = (fc.temperature, fc.templow) {
+            app.set_weather_temp_range(format_temp_range(high, low, unit).into());
+        }
+    }
+
+    let sources = [Some(state), backfill];
+    if let Some(humidity) = weather_numeric_attr(&sources, "humidity") {
+        app.set_weather_humidity(format_humidity(humidity).into());
+    }
+    if let Some(pressure) = weather_numeric_attr(&sources, "pressure") {
+        let pressure_unit = weather_string_attr(&sources, "pressure_unit").unwrap_or("");
+        app.set_weather_pressure(format_pressure(pressure, pressure_unit).into());
+    }
 }
 
 /// Connects to HA, resolves the family roster (config.toml's `[[family]]`
@@ -774,7 +857,7 @@ async fn run_ha_sync(
     todo_uids: Arc<Mutex<Vec<(String, Vec<String>)>>>,
     reference_date: Arc<Mutex<Date>>,
     family_state: Arc<Mutex<Vec<FamilyMember>>>,
-    weather_entity: Arc<Mutex<Option<String>>>,
+    weather_entities: Arc<Mutex<WeatherEntities>>,
 ) {
     let token = match config.ha.load_token() {
         Ok(token) => token,
@@ -844,10 +927,27 @@ async fn run_ha_sync(
         // reconnect if it wasn't found yet" -- harmless since a HA restart
         // could add the entity later, and there's no per-member state to
         // preserve the way `family_resolved` protects `member_visible`.
-        if weather_entity.lock().unwrap().is_none() {
+        // Locks aren't held across the `.await`s below (a `MutexGuard` kept
+        // alive that way isn't `Send` -- bit this exact function once
+        // already, see `fetch_calendar_events`'s call site history).
+        let current_primary = weather_entities.lock().unwrap().primary.clone();
+        if current_primary.is_none() {
             if let Some(discovered) = discover_weather_entity(&client).await {
                 tracing::info!(entity = %discovered, "discovered weather entity");
-                *weather_entity.lock().unwrap() = Some(discovered);
+                weather_entities.lock().unwrap().primary = Some(discovered);
+            }
+        }
+        let current_backfill = weather_entities.lock().unwrap().backfill.clone();
+        if current_backfill.is_none() {
+            let primary_now = weather_entities.lock().unwrap().primary.clone();
+            if let Some(discovered) =
+                discover_weather_backfill_entity(&client, primary_now.as_deref()).await
+            {
+                tracing::info!(
+                    entity = %discovered,
+                    "discovered weather backfill entity for humidity/pressure"
+                );
+                weather_entities.lock().unwrap().backfill = Some(discovered);
             }
         }
 
@@ -906,7 +1006,7 @@ async fn run_ha_sync(
                 ref_date,
                 &app_weak,
                 &todo_uids,
-                &weather_entity,
+                &weather_entities,
             )
             .await;
             if !alive {
@@ -1082,6 +1182,29 @@ async fn discover_weather_entity(client: &Client) -> Option<String> {
         }
     };
     states.into_iter().map(|s| s.entity_id).find(|id| id.starts_with("weather."))
+}
+
+/// Any other `weather.*` entity (besides `primary`) that has a `humidity`
+/// or `pressure` attribute -- used when `config.weather_backfill_entity`
+/// isn't set and `primary` itself doesn't expose those (some integrations,
+/// confirmed against a real instance, only report condition/temperature/
+/// wind, while HA's own default Met.no forecast entity has the rest).
+async fn discover_weather_backfill_entity(client: &Client, primary: Option<&str>) -> Option<String> {
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to list HA entities while looking for a weather backfill entity");
+            return None;
+        }
+    };
+    states
+        .into_iter()
+        .find(|s| {
+            s.entity_id.starts_with("weather.")
+                && Some(s.entity_id.as_str()) != primary
+                && (s.attributes.get("humidity").is_some() || s.attributes.get("pressure").is_some())
+        })
+        .map(|s| s.entity_id)
 }
 
 async fn fetch_calendar_events(
@@ -1513,24 +1636,98 @@ fn format_12h(hour: u8, minute: u8) -> String {
     format!("{label_hour}:{minute:02} {suffix}")
 }
 
-/// "72°F" from a `weather.*` entity's state -- HA's `temperature_unit`
-/// attribute already includes the degree sign ("°C"/"°F"), confirmed
-/// against a real instance, so this doesn't add its own.
-fn format_weather_temperature(state: &EntityState) -> String {
-    let unit = state.attributes.get("temperature_unit").and_then(|v| v.as_str()).unwrap_or("°");
-    match state.attributes.get("temperature").and_then(|v| v.as_f64()) {
-        Some(temp) => format!("{}{unit}", temp.round() as i64),
-        None => "--°".to_string(),
+/// "75 °F" -- HA's `temperature_unit` attribute already includes the
+/// degree sign ("°C"/"°F"), confirmed against a real instance, so this
+/// doesn't add its own; the space before it matches the weather widget's
+/// styling (see the reference screenshot this widget was built from).
+fn format_weather_temp(value: f64, unit: &str) -> String {
+    format!("{} {unit}", value.round() as i64)
+}
+
+/// "91 °F / 75 °F" -- today's forecast high/low, same unit both sides.
+fn format_temp_range(high: f64, low: f64, unit: &str) -> String {
+    format!("{} {unit} / {} {unit}", high.round() as i64, low.round() as i64)
+}
+
+/// "clear-night" -> "Clear, night", "sunny" -> "Sunny" -- HA's weather
+/// `state` is one of a fixed set of dash-separated lowercase condition
+/// slugs; this mirrors the wording HA's own more-info dialog uses (first
+/// word capitalized, dash becomes a comma) rather than a lookup table, so
+/// it has no translation and multi-word slugs without a dash ("partly-
+/// cloudy" doesn't exist, but e.g. "partlycloudy" does) stay one word.
+fn format_weather_condition_label(condition: &str) -> String {
+    match condition.split_once('-') {
+        Some((first, rest)) => format!("{}, {rest}", capitalize_first(first)),
+        None => capitalize_first(condition),
     }
 }
 
-/// "partlycloudy" -> "Partlycloudy", "clear-night" -> "Clear Night" -- HA's
-/// weather `state` is one of a fixed set of dash-separated lowercase
-/// condition slugs; this is a generic title-caser, not a lookup table, so
-/// single-word conditions without a dash (most of them) stay as one word
-/// rather than getting individually spaced out ("Partly Cloudy").
-fn humanize_weather_condition(condition: &str) -> String {
-    titlecase_words(condition, '-')
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// "17 minutes ago" / "2 hours ago" / "Just now" -- how long ago a weather
+/// entity's state last changed. Deliberately coarse (minutes, then hours --
+/// no days) since weather data this stale would be a fetch problem worth
+/// noticing on its own, not something to label precisely.
+fn format_relative_time(then: OffsetDateTime, now: OffsetDateTime) -> String {
+    let elapsed_minutes = (now - then).whole_minutes();
+    if elapsed_minutes < 1 {
+        "Just now".to_string()
+    } else if elapsed_minutes < 60 {
+        format!("{elapsed_minutes} minute{} ago", if elapsed_minutes == 1 { "" } else { "s" })
+    } else {
+        let hours = elapsed_minutes / 60;
+        format!("{hours} hour{} ago", if hours == 1 { "" } else { "s" })
+    }
+}
+
+/// 16-point compass label from a wind bearing in degrees (0 = north,
+/// clockwise) -- HA reports wind direction as a raw bearing, not a label.
+fn compass_direction(bearing_degrees: f64) -> &'static str {
+    const DIRECTIONS: [&str; 16] = [
+        "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW",
+        "NW", "NNW",
+    ];
+    let normalized = bearing_degrees.rem_euclid(360.0);
+    let index = ((normalized / 22.5) + 0.5) as usize % 16;
+    DIRECTIONS[index]
+}
+
+/// "2.92 mph (WNW)" -- wind speed alone (no bearing available) if that's
+/// all the entity has; empty if it has neither.
+fn format_wind(state: &EntityState) -> String {
+    let speed = state.attributes.get("wind_speed").and_then(|v| v.as_f64());
+    let unit = state.attributes.get("wind_speed_unit").and_then(|v| v.as_str()).unwrap_or("");
+    let bearing = state.attributes.get("wind_bearing").and_then(|v| v.as_f64());
+    match (speed, bearing) {
+        (Some(speed), Some(bearing)) => format!("{speed:.2} {unit} ({})", compass_direction(bearing)),
+        (Some(speed), None) => format!("{speed:.2} {unit}"),
+        (None, _) => String::new(),
+    }
+}
+
+fn format_pressure(value: f64, unit: &str) -> String {
+    format!("{value:.2} {unit}")
+}
+
+fn format_humidity(value: f64) -> String {
+    format!("{}%", value.round() as i64)
+}
+
+/// Reads `key` from the first of `sources` (in order) that has it -- used
+/// to check the primary weather entity before falling back to the backfill
+/// one for humidity/pressure (see `apply_weather`).
+fn weather_numeric_attr(sources: &[Option<&EntityState>], key: &str) -> Option<f64> {
+    sources.iter().flatten().find_map(|s| s.attributes.get(key).and_then(|v| v.as_f64()))
+}
+
+fn weather_string_attr<'a>(sources: &[Option<&'a EntityState>], key: &str) -> Option<&'a str> {
+    sources.iter().flatten().find_map(|s| s.attributes.get(key).and_then(|v| v.as_str()))
 }
 
 fn parse_hex_color(hex: &str) -> slint::Color {
@@ -1564,37 +1761,75 @@ fn parse_ha_color_attribute(value: Option<&serde_json::Value>) -> Option<String>
 mod tests {
     use super::*;
 
+    fn weather_state(state: &str, attributes: serde_json::Value) -> EntityState {
+        EntityState { entity_id: "weather.home".into(), state: state.into(), attributes, last_updated: None }
+    }
+
     #[test]
-    fn formats_weather_temperature_and_condition() {
+    fn formats_weather_temperature() {
+        assert_eq!(format_weather_temp(77.0, "°F"), "77 °F");
+    }
+
+    #[test]
+    fn formats_temp_range() {
+        assert_eq!(format_temp_range(91.4, 75.2, "°F"), "91 °F / 75 °F");
+    }
+
+    #[test]
+    fn formats_condition_labels_like_ha_more_info() {
+        assert_eq!(format_weather_condition_label("sunny"), "Sunny");
+        assert_eq!(format_weather_condition_label("clear-night"), "Clear, night");
+        assert_eq!(format_weather_condition_label("partlycloudy"), "Partlycloudy");
+    }
+
+    #[test]
+    fn formats_relative_time() {
+        let now = OffsetDateTime::now_utc();
+        assert_eq!(format_relative_time(now, now), "Just now");
+        assert_eq!(format_relative_time(now - TimeDuration::minutes(17), now), "17 minutes ago");
+        assert_eq!(format_relative_time(now - TimeDuration::minutes(1), now), "1 minute ago");
+        assert_eq!(format_relative_time(now - TimeDuration::hours(2), now), "2 hours ago");
+    }
+
+    #[test]
+    fn resolves_compass_directions() {
+        assert_eq!(compass_direction(0.0), "N");
+        assert_eq!(compass_direction(288.7), "WNW");
+        assert_eq!(compass_direction(359.9), "N");
+    }
+
+    #[test]
+    fn formats_wind_with_and_without_bearing() {
         // The exact shape returned by a real weather.* entity's
         // GET /api/states/{entity_id}, confirmed against a live instance.
-        let state = EntityState {
-            entity_id: "weather.home".into(),
-            state: "sunny".into(),
-            attributes: serde_json::json!({
-                "friendly_name": "Home",
-                "temperature": 77,
-                "temperature_unit": "°F",
-            }),
-        };
-        assert_eq!(format_weather_temperature(&state), "77°F");
-        assert_eq!(humanize_weather_condition(&state.state), "Sunny");
+        let state = weather_state(
+            "sunny",
+            serde_json::json!({ "wind_speed": 2.92, "wind_speed_unit": "mph", "wind_bearing": 288.7 }),
+        );
+        assert_eq!(format_wind(&state), "2.92 mph (WNW)");
+
+        let no_bearing = weather_state("sunny", serde_json::json!({ "wind_speed": 5.0, "wind_speed_unit": "mph" }));
+        assert_eq!(format_wind(&no_bearing), "5.00 mph");
+
+        let no_wind = weather_state("sunny", serde_json::json!({}));
+        assert_eq!(format_wind(&no_wind), "");
     }
 
     #[test]
-    fn humanizes_dashed_weather_conditions() {
-        assert_eq!(humanize_weather_condition("clear-night"), "Clear Night");
-        assert_eq!(humanize_weather_condition("partlycloudy"), "Partlycloudy");
-    }
+    fn backfills_humidity_and_pressure_from_a_second_entity_only_when_primary_lacks_them() {
+        let primary = weather_state("sunny", serde_json::json!({ "temperature": 77 }));
+        let backfill =
+            weather_state("clear-night", serde_json::json!({ "humidity": 95, "pressure": 30.01, "pressure_unit": "inHg" }));
+        let sources = [Some(&primary), Some(&backfill)];
+        assert_eq!(weather_numeric_attr(&sources, "humidity"), Some(95.0));
+        assert_eq!(weather_numeric_attr(&sources, "pressure"), Some(30.01));
+        assert_eq!(weather_string_attr(&sources, "pressure_unit"), Some("inHg"));
 
-    #[test]
-    fn falls_back_when_weather_attributes_are_missing() {
-        let state = EntityState {
-            entity_id: "weather.home".into(),
-            state: "sunny".into(),
-            attributes: serde_json::json!({}),
-        };
-        assert_eq!(format_weather_temperature(&state), "--°");
+        // Primary's own value wins when it has one -- no need to touch the
+        // backfill entity's data at all in that case.
+        let primary_with_humidity = weather_state("sunny", serde_json::json!({ "humidity": 40 }));
+        let sources = [Some(&primary_with_humidity), Some(&backfill)];
+        assert_eq!(weather_numeric_attr(&sources, "humidity"), Some(40.0));
     }
 
     #[test]

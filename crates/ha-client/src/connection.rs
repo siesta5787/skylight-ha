@@ -111,6 +111,36 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// Today's (and the next several days') forecast via the `weather.
+    /// get_forecasts` service. Needs `return_response: true` -- this is a
+    /// service call, not a plain query, so the result only carries HA's
+    /// generic `call_service` ack unless asked to also hand back the
+    /// service's own response payload, which is where the forecast lives.
+    pub async fn weather_daily_forecast(
+        &self,
+        entity_id: &str,
+    ) -> Result<Vec<crate::entities::DailyForecast>, Error> {
+        let result = self
+            .call(
+                "call_service",
+                json!({
+                    "domain": "weather",
+                    "service": "get_forecasts",
+                    "service_data": { "type": "daily" },
+                    "target": { "entity_id": entity_id },
+                    "return_response": true,
+                }),
+            )
+            .await?;
+        let forecast = result
+            .get("response")
+            .and_then(|r| r.get(entity_id))
+            .and_then(|e| e.get("forecast"))
+            .cloned()
+            .unwrap_or(Value::Array(vec![]));
+        Ok(serde_json::from_value(forecast)?)
+    }
+
     /// Live feed of `state_changed` events (the new state only). Lags drop
     /// old events rather than blocking the WS reader; the UI layer always
     /// wants the latest state, not a perfect history.

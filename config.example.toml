@@ -8,6 +8,11 @@
 # after [ha] silently becomes ha.weather_entity instead of the top-level
 # field.
 # weather_entity = "weather.home"
+# A second weather.* entity to pull humidity/air pressure from if
+# weather_entity above doesn't report them itself (some integrations only
+# expose condition/temperature/wind) -- if omitted, the dashboard
+# auto-discovers any other weather.* entity that does have them.
+# weather_backfill_entity = "weather.forecast_home"
 
 [ha]
 base_url = "http://homeassistant.local:8123"

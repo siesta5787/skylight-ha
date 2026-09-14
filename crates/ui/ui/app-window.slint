@@ -119,10 +119,19 @@ export component AppWindow inherits Window {
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
     in property <string> month-label: "";
-    in property <string> weather-text: "--°";
-    // Empty until a weather entity is resolved and its first fetch
-    // succeeds -- TopBar falls back to a plain "Weather" label until then.
-    in property <string> weather-condition: "";
+    // All empty/placeholder until a weather entity is resolved and its
+    // first fetch succeeds -- WeatherWidget falls back to plain "Weather"/
+    // "--°" text and hides rows it has no data for until then. Set from
+    // `apply_weather` in main.rs; see that function for how each is
+    // sourced (some optionally backfilled from a second entity).
+    in property <string> weather-icon-condition: "";
+    in property <string> weather-condition-label: "";
+    in property <string> weather-updated-label: "";
+    in property <string> weather-temp-now: "--°";
+    in property <string> weather-temp-range: "";
+    in property <string> weather-pressure: "";
+    in property <string> weather-humidity: "";
+    in property <string> weather-wind: "";
     in property <[MemberChipData]> members;
     // Kept out of layout entirely (not just dimmed) for whichever member a
     // top-bar chip tap has toggled off -- indexed the same as `members`.
@@ -244,8 +253,14 @@ export component AppWindow inherits Window {
                 TopBar {
                     clock-text: root.clock-text;
                     date-text: root.date-text;
-                    weather-text: root.weather-text;
-                    weather-condition: root.weather-condition;
+                    weather-icon-condition: root.weather-icon-condition;
+                    weather-condition-label: root.weather-condition-label;
+                    weather-updated-label: root.weather-updated-label;
+                    weather-temp-now: root.weather-temp-now;
+                    weather-temp-range: root.weather-temp-range;
+                    weather-pressure: root.weather-pressure;
+                    weather-humidity: root.weather-humidity;
+                    weather-wind: root.weather-wind;
                     members: root.members;
                     member-visible: root.member-visible;
                     member-toggled(idx) => {

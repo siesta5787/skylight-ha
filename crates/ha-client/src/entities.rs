@@ -14,6 +14,25 @@ pub struct EntityState {
     pub state: String,
     #[serde(default)]
     pub attributes: serde_json::Value,
+    /// When this state was last written (not just last confirmed
+    /// unchanged) -- used for the weather widget's "X minutes ago" label.
+    /// `get_states`/`state_changed` events always include it in practice,
+    /// but `#[serde(default)]` since nothing else here depends on it.
+    #[serde(default, with = "time::serde::iso8601::option")]
+    pub last_updated: Option<OffsetDateTime>,
+}
+
+/// One day's forecast from the `weather.get_forecasts` service (`type:
+/// "daily"`). Unlike current conditions, forecast data (including a day's
+/// high/low) isn't part of a weather entity's plain state attributes on
+/// modern HA -- it needs its own service call (see
+/// `Client::weather_daily_forecast`). Only the fields this dashboard
+/// actually uses; HA's response also includes `condition`, `datetime`,
+/// `precipitation`, `wind_speed`, `wind_bearing`, all ignored here.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DailyForecast {
+    pub temperature: Option<f64>,
+    pub templow: Option<f64>,
 }
 
 /// One event from a calendar entity's event range, as returned by

@@ -1,0 +1,201 @@
+import { Theme } from "theme.slint";
+
+// A condition-composited weather icon: sun/moon/cloud/rain/snow/bolt/fog/
+// wind primitives shown or hidden based on HA's fixed condition-slug set
+// (clear-night, cloudy, fog, hail, lightning, lightning-rainy,
+// partlycloudy, pouring, rainy, snowy, snowy-rainy, sunny, windy,
+// windy-variant, exceptional) -- composing from a handful of primitives
+// instead of drawing 15 separate icons. Sized against whatever `width`/
+// `height` the caller sets: `width`/`height` on children accept plain
+// percentages (Slint allows that), but `x`/`y`/`spacing` don't, so those
+// are computed as fractions of `root.width`/`root.height` instead.
+export component WeatherIcon inherits Rectangle {
+    in property <string> condition;
+
+    background: transparent;
+
+    property <bool> sun: condition == "sunny";
+    property <bool> partly: condition == "partlycloudy";
+    property <bool> cloud: condition == "cloudy" || partly || condition == "rainy"
+        || condition == "pouring" || condition == "lightning" || condition == "lightning-rainy"
+        || condition == "snowy" || condition == "snowy-rainy" || condition == "hail"
+        || condition == "fog" || condition == "exceptional" || condition == "";
+    property <bool> moon: condition == "clear-night";
+    property <bool> rain: condition == "rainy" || condition == "pouring"
+        || condition == "lightning-rainy" || condition == "snowy-rainy" || condition == "hail";
+    property <bool> snow: condition == "snowy" || condition == "snowy-rainy";
+    property <bool> bolt: condition == "lightning" || condition == "lightning-rainy";
+    property <bool> fog: condition == "fog";
+    property <bool> windy: condition == "windy" || condition == "windy-variant";
+
+    // Sun -- full-size for a plain "sunny" condition, smaller and tucked
+    // into the upper-right for "partlycloudy" (drawn before the cloud below
+    // so the cloud overlaps its lower-left edge).
+    if root.sun || root.partly: Rectangle {
+        x: root.partly ? root.width * 0.36 : root.width * 0.20;
+        y: root.partly ? root.height * 0.02 : root.height * 0.10;
+        width: root.partly ? 44% : 60%;
+        height: root.partly ? 44% : 60%;
+        border-radius: 999px;
+        background: #f5b942;
+    }
+
+    // Crescent moon -- a pale circle with a second, card-background-colored
+    // circle offset over it to punch out the crescent shape. Relies on
+    // sitting over WeatherWidget's own (opaque) background.
+    if root.moon: Rectangle {
+        x: root.width * 0.20;
+        y: root.height * 0.10;
+        width: 58%;
+        height: 58%;
+        border-radius: 999px;
+        background: #f6dd8c;
+
+        Rectangle {
+            x: parent.width * 0.24;
+            y: parent.height * -0.16;
+            width: 100%;
+            height: 100%;
+            border-radius: 999px;
+            background: Theme.surface-alt;
+        }
+    }
+
+    // Cloud -- three overlapping circles plus a base bar.
+    if root.cloud: Rectangle {
+        x: root.width * 0.08;
+        y: root.height * 0.40;
+        width: 84%;
+        height: 30%;
+        border-radius: 999px;
+        background: #9aa7b8;
+
+        Rectangle {
+            x: parent.width * -0.04;
+            y: parent.height * -0.60;
+            width: 46%;
+            height: 95%;
+            border-radius: 999px;
+            background: #9aa7b8;
+        }
+        Rectangle {
+            x: parent.width * 0.26;
+            y: parent.height * -0.85;
+            width: 56%;
+            height: 120%;
+            border-radius: 999px;
+            background: #9aa7b8;
+        }
+        Rectangle {
+            x: parent.width * 0.62;
+            y: parent.height * -0.55;
+            width: 42%;
+            height: 85%;
+            border-radius: 999px;
+            background: #9aa7b8;
+        }
+    }
+
+    // Rain drops.
+    if root.rain: HorizontalLayout {
+        x: root.width * 0.16;
+        y: root.height * 0.78;
+        width: 68%;
+        height: 14%;
+        spacing: root.width * 0.10;
+        Rectangle { border-radius: 999px; background: #4f8ef7; }
+        Rectangle { border-radius: 999px; background: #4f8ef7; }
+        Rectangle { border-radius: 999px; background: #4f8ef7; }
+    }
+
+    // Snow dots.
+    if root.snow: HorizontalLayout {
+        x: root.width * 0.16;
+        y: root.height * 0.80;
+        width: 68%;
+        height: 10%;
+        spacing: root.width * 0.12;
+        Rectangle { border-radius: 999px; background: #cfe3f7; }
+        Rectangle { border-radius: 999px; background: #cfe3f7; }
+        Rectangle { border-radius: 999px; background: #cfe3f7; }
+    }
+
+    // Lightning bolt.
+    if root.bolt: Path {
+        x: root.width * 0.34;
+        y: root.height * 0.40;
+        width: 32%;
+        height: 48%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: #f2b705;
+        commands: "M14 2 L4 14 L11 14 L9 22 L20 9 L13 9 Z";
+    }
+
+    // Fog lines.
+    if root.fog: VerticalLayout {
+        x: root.width * 0.10;
+        y: root.height * 0.58;
+        width: 80%;
+        height: 32%;
+        spacing: root.height * 0.16;
+        Rectangle { height: 12%; border-radius: 999px; background: #9aa7b8.with-alpha(0.75); }
+        Rectangle { height: 12%; width: 70%; border-radius: 999px; background: #9aa7b8.with-alpha(0.75); }
+        Rectangle { height: 12%; border-radius: 999px; background: #9aa7b8.with-alpha(0.75); }
+    }
+
+    // Wind lines.
+    if root.windy: VerticalLayout {
+        x: root.width * 0.08;
+        y: root.height * 0.26;
+        width: 84%;
+        height: 44%;
+        spacing: root.height * 0.20;
+        Rectangle { height: 10%; border-radius: 999px; background: #7fa7d6; }
+        Rectangle { height: 10%; width: 70%; border-radius: 999px; background: #7fa7d6; }
+        Rectangle { height: 10%; width: 85%; border-radius: 999px; background: #7fa7d6; }
+    }
+}
+
+// Small icon for the weather widget's stat rows (pressure/humidity/wind).
+// `kind` is one of "pressure", "humidity", "wind" -- a plain string rather
+// than an enum since it's only ever set as a literal at each call site.
+export component WeatherStatIcon inherits Rectangle {
+    in property <string> kind;
+    background: transparent;
+
+    if root.kind == "pressure": Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 999px;
+        border-width: 2px;
+        border-color: #4f8ef7;
+
+        Rectangle {
+            x: parent.width * 0.38;
+            y: parent.height * 0.38;
+            width: 24%;
+            height: 24%;
+            border-radius: 999px;
+            background: #4f8ef7;
+        }
+    }
+
+    if root.kind == "humidity": Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        fill: #4f8ef7;
+        commands: "M12 2 L19 13 L19 17 L15 21 L9 21 L5 17 L5 13 Z";
+    }
+
+    if root.kind == "wind": VerticalLayout {
+        width: 100%;
+        height: 100%;
+        spacing: root.height * 0.22;
+        Rectangle { height: 14%; border-radius: 999px; background: #4f8ef7; }
+        Rectangle { height: 14%; width: 65%; border-radius: 999px; background: #4f8ef7; }
+        Rectangle { height: 14%; width: 82%; border-radius: 999px; background: #4f8ef7; }
+    }
+}

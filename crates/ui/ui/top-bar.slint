@@ -1,4 +1,5 @@
 import { Theme } from "theme.slint";
+import { WeatherIcon, WeatherStatIcon } from "weather-icon.slint";
 
 // One family-member chip: color dot, name, and their todo completion ratio
 // (reuses data already fetched for the Tasks page -- no extra HA calls).
@@ -50,24 +51,144 @@ component MemberChip inherits Rectangle {
     }
 }
 
+component WeatherStatRow inherits Rectangle {
+    in property <string> kind;
+    in property <string> label;
+    in property <string> value;
+
+    height: 30px;
+
+    HorizontalLayout {
+        spacing: 12px;
+
+        WeatherStatIcon {
+            kind: root.kind;
+            width: 22px;
+            height: 22px;
+            y: (parent.height - self.height) / 2;
+        }
+        Text {
+            text: root.label;
+            font-size: 14px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.value;
+            font-size: 14px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+        }
+    }
+}
+
+// The full weather widget -- condition icon, condition label + "X minutes
+// ago", current temperature + today's high/low, and pressure/humidity/wind
+// stat rows below. Every string is pre-formatted in Rust (see
+// apply_weather in main.rs); rows with no data (empty string) are hidden
+// rather than shown blank.
+export component WeatherWidget inherits Rectangle {
+    in property <string> icon-condition;
+    in property <string> condition-label;
+    in property <string> updated-label;
+    in property <string> temp-now: "--°";
+    in property <string> temp-range;
+    in property <string> pressure;
+    in property <string> humidity;
+    in property <string> wind;
+
+    background: Theme.surface-alt;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            spacing: 16px;
+
+            WeatherIcon {
+                condition: root.icon-condition;
+                width: 56px;
+                height: 56px;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: root.condition-label == "" ? "Weather" : root.condition-label;
+                    font-size: 22px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: root.updated-label;
+                    font-size: 13px;
+                    color: Theme.text-muted;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: root.temp-now;
+                    font-size: 30px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                    horizontal-alignment: right;
+                }
+                Text {
+                    text: root.temp-range;
+                    font-size: 13px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+
+        if root.pressure != "" || root.humidity != "" || root.wind != "": Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+
+        if root.pressure != "": WeatherStatRow { kind: "pressure"; label: "Air pressure"; value: root.pressure; }
+        if root.humidity != "": WeatherStatRow { kind: "humidity"; label: "Humidity"; value: root.humidity; }
+        if root.wind != "": WeatherStatRow { kind: "wind"; label: "Wind speed"; value: root.wind; }
+    }
+}
+
 // Household name has no config field yet -- left as a plain default rather
 // than adding schema for a single cosmetic string this pass.
 export component TopBar inherits Rectangle {
     in property <string> family-name: "Family";
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
-    in property <string> weather-text: "--°";
-    in property <string> weather-condition: "";
+    in property <string> weather-icon-condition: "";
+    in property <string> weather-condition-label: "";
+    in property <string> weather-updated-label: "";
+    in property <string> weather-temp-now: "--°";
+    in property <string> weather-temp-range: "";
+    in property <string> weather-pressure: "";
+    in property <string> weather-humidity: "";
+    in property <string> weather-wind: "";
     in property <[MemberChipData]> members;
     in property <[bool]> member-visible;
     // Tapping a member's name toggles them on/off the calendar below.
     callback member-toggled(int);
 
-    height: 88px;
     background: transparent;
 
     VerticalLayout {
-        spacing: 10px;
+        spacing: 14px;
 
         HorizontalLayout {
             spacing: Theme.gap;
@@ -85,26 +206,6 @@ export component TopBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Text {
-                    // Condition (e.g. "Partly Cloudy") once a fetch has
-                    // succeeded; plain "Weather" placeholder until then.
-                    text: weather-condition == "" ? "Weather" : weather-condition;
-                    font-size: 11px;
-                    color: Theme.text-muted;
-                    horizontal-alignment: right;
-                    overflow: elide;
-                }
-                Text {
-                    text: weather-text;
-                    font-size: 26px;
-                    font-weight: 600;
-                    color: Theme.text-primary;
-                    horizontal-alignment: right;
-                }
-            }
-
-            VerticalLayout {
-                alignment: center;
-                Text {
                     text: date-text;
                     font-size: 11px;
                     color: Theme.text-muted;
@@ -118,6 +219,17 @@ export component TopBar inherits Rectangle {
                     horizontal-alignment: right;
                 }
             }
+        }
+
+        WeatherWidget {
+            icon-condition: root.weather-icon-condition;
+            condition-label: root.weather-condition-label;
+            updated-label: root.weather-updated-label;
+            temp-now: root.weather-temp-now;
+            temp-range: root.weather-temp-range;
+            pressure: root.weather-pressure;
+            humidity: root.weather-humidity;
+            wind: root.weather-wind;
         }
 
         // Scrollable rather than a plain HorizontalLayout: with a large or
