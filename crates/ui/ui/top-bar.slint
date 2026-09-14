@@ -73,14 +73,13 @@ component WeatherStatLine inherits Rectangle {
     }
 }
 
-// The corner weather widget -- a single compact line (icon, current
-// temperature, rain amount, wind speed) sized to sit next to the clock,
-// not a detail card. `condition-label`/`updated-label`/`temp-range`/
-// `pressure`/`humidity` are still accepted (and still set from Rust --
-// see apply_weather in main.rs) but not shown here; there wasn't room for
-// all of it on one line, and this is the at-a-glance subset. Kept as
-// properties rather than dropped so a future tap-to-expand detail view
-// can reuse them without re-plumbing the data path.
+// The corner weather widget -- a single horizontal line (icon, current
+// temperature + today's high/low, then precip/humidity/pressure/wind)
+// sized to sit next to the clock, not a detail card. `condition-label`/
+// `updated-label` are still accepted (and still set from Rust -- see
+// apply_weather in main.rs) but not shown here; kept as properties so a
+// future tap-to-expand detail view can reuse them without re-plumbing the
+// data path.
 export component WeatherWidget inherits Rectangle {
     in property <string> icon-condition;
     in property <string> condition-label;
@@ -104,14 +103,23 @@ export component WeatherWidget inherits Rectangle {
             height: 22px;
             y: (parent.height - self.height) / 2;
         }
-        Text {
-            text: root.temp-now;
-            font-size: 16px;
-            font-weight: 700;
-            color: Theme.text-primary;
-            vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.temp-now;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.text-primary;
+            }
+            if root.temp-range != "": Text {
+                text: root.temp-range;
+                font-size: 9px;
+                color: Theme.text-muted;
+            }
         }
         if root.precip != "": WeatherStatLine { kind: "precip"; value: root.precip; }
+        if root.humidity != "": WeatherStatLine { kind: "humidity"; value: root.humidity; }
+        if root.pressure != "": WeatherStatLine { kind: "pressure"; value: root.pressure; }
         if root.wind != "": WeatherStatLine { kind: "wind"; value: root.wind; }
     }
 }
@@ -150,9 +158,9 @@ export component TopBar inherits Rectangle {
                 font-weight: 700;
                 color: Theme.text-primary;
                 vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
             }
-
-            Rectangle { horizontal-stretch: 1; }
 
             WeatherWidget {
                 icon-condition: root.weather-icon-condition;

@@ -822,7 +822,7 @@ fn apply_weather(
     }
     if let Some(fc) = forecast_today {
         if let (Some(high), Some(low)) = (fc.temperature, fc.templow) {
-            app.set_weather_temp_range(format_temp_range(high, low, unit).into());
+            app.set_weather_temp_range(format_temp_range(high, low).into());
         }
         if let Some(precip) = fc.precipitation {
             let precip_unit = state.attributes.get("precipitation_unit").and_then(|v| v.as_str()).unwrap_or("");
@@ -1648,9 +1648,11 @@ fn format_weather_temp(value: f64, unit: &str) -> String {
     format!("{} {unit}", value.round() as i64)
 }
 
-/// "91 °F / 75 °F" -- today's forecast high/low, same unit both sides.
-fn format_temp_range(high: f64, low: f64, unit: &str) -> String {
-    format!("{} {unit} / {} {unit}", high.round() as i64, low.round() as i64)
+/// "91°/75°" -- today's forecast high/low. No unit letter on either side
+/// (unlike `format_weather_temp`) since this always sits directly under
+/// the primary temperature reading, which already has one.
+fn format_temp_range(high: f64, low: f64) -> String {
+    format!("{}°/{}°", high.round() as i64, low.round() as i64)
 }
 
 /// "clear-night" -> "Clear, night", "sunny" -> "Sunny" -- HA's weather
@@ -1783,7 +1785,7 @@ mod tests {
 
     #[test]
     fn formats_temp_range() {
-        assert_eq!(format_temp_range(91.4, 75.2, "°F"), "91 °F / 75 °F");
+        assert_eq!(format_temp_range(91.4, 75.2), "91°/75°");
     }
 
     #[test]

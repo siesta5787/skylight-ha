@@ -157,9 +157,9 @@ export component WeatherIcon inherits Rectangle {
     }
 }
 
-// Small icon for the weather widget's stat rows (pressure/humidity/wind).
-// `kind` is one of "pressure", "humidity", "wind" -- a plain string rather
-// than an enum since it's only ever set as a literal at each call site.
+// Small icon for the weather widget's stat rows (pressure/humidity/precip/
+// wind). `kind` is one of those four -- a plain string rather than an enum
+// since it's only ever set as a literal at each call site.
 export component WeatherStatIcon inherits Rectangle {
     in property <string> kind;
     background: transparent;
@@ -181,15 +181,53 @@ export component WeatherStatIcon inherits Rectangle {
         }
     }
 
-    // "precip" reuses the same droplet -- a raindrop is a fitting icon for
-    // a rain amount too, and the two are never shown side by side.
-    if root.kind == "humidity" || root.kind == "precip": Path {
+    if root.kind == "humidity": Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;
         viewbox-height: 24;
         fill: #4f8ef7;
         commands: "M12 2 L19 13 L19 17 L15 21 L9 21 L5 17 L5 13 Z";
+    }
+
+    // A small rain-cloud (distinct from humidity's plain droplet, since the
+    // two now sit side by side in the same row).
+    if root.kind == "precip": Rectangle {
+        width: 100%;
+        height: 100%;
+
+        Rectangle {
+            x: parent.width * 0.06;
+            y: parent.height * 0.06;
+            width: 88%;
+            height: 46%;
+            border-radius: 999px;
+            background: #9aa7b8;
+        }
+        Rectangle {
+            x: parent.width * 0.30;
+            y: parent.height * -0.14;
+            width: 46%;
+            height: 46%;
+            border-radius: 999px;
+            background: #9aa7b8;
+        }
+        Rectangle {
+            x: parent.width * 0.30;
+            y: parent.height * 0.62;
+            width: 16%;
+            height: 34%;
+            border-radius: 999px;
+            background: #4f8ef7;
+        }
+        Rectangle {
+            x: parent.width * 0.58;
+            y: parent.height * 0.62;
+            width: 16%;
+            height: 34%;
+            border-radius: 999px;
+            background: #4f8ef7;
+        }
     }
 
     if root.kind == "wind": VerticalLayout {
