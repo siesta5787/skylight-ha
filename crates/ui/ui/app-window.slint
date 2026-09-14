@@ -183,6 +183,10 @@ export component AppWindow inherits Window {
     in property <string> event-form-date-label;
     in property <string> event-form-time-label;
     in property <[EventFormMember]> event-form-members;
+    // Like keyboard-text: comes from the virtual keyboard (a separate modal
+    // on top of this one), pushed back down here after every keystroke.
+    in property <string> event-form-title;
+    callback event-form-title-tapped();
     callback event-create-confirmed(int /* member index */, int /* duration minutes */);
 
     // Viewing an existing event's details is handled entirely in `.slint`:
@@ -385,7 +389,9 @@ export component AppWindow inherits Window {
         open: root.event-form-open;
         date-label: root.event-form-date-label;
         time-label: root.event-form-time-label;
+        title: root.event-form-title;
         members: root.event-form-members;
+        title-tapped => { root.event-form-title-tapped(); }
         cancelled => { root.event-form-open = false; }
         confirmed => {
             root.event-form-open = false;

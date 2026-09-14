@@ -1,9 +1,5 @@
 import { Theme } from "theme.slint";
 
-// Touch-only v1: which family member's calendar + a duration, no free-text
-// title yet -- there's no on-screen keyboard component anywhere in this app
-// yet, and building one is a separate, sizable feature. New events get a
-// fixed default title for now; renaming afterward happens in HA directly.
 export struct EventFormMember {
     name: string,
     color: color,
@@ -61,6 +57,31 @@ component DurationButton inherits Rectangle {
     }
 }
 
+component TitleField inherits Rectangle {
+    in property <string> title;
+    callback tapped();
+
+    height: 40px;
+    border-radius: 8px;
+    background: touch.pressed ? Theme.accent.with-alpha(0.12) : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            x: 10px;
+            width: parent.width - 20px;
+            text: root.title == "" ? "Tap to set a title" : root.title;
+            font-size: 15px;
+            font-weight: root.title == "" ? 400 : 600;
+            color: root.title == "" ? Theme.text-muted : Theme.text-primary;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
+
 component ActionButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary;
@@ -92,9 +113,14 @@ export component EventCreateForm inherits Rectangle {
     in property <bool> open: false;
     in property <string> date-label;
     in property <string> time-label;
+    // Rust-driven (not in-out): it comes from the virtual keyboard, a
+    // separate modal on top of this one, not from anything this form
+    // itself could set.
+    in property <string> title;
     in property <[EventFormMember]> members;
     in-out property <int> selected-member: 0;
     in-out property <int> duration-minutes: 60;
+    callback title-tapped();
     callback confirmed();
     callback cancelled();
 
@@ -111,7 +137,7 @@ export component EventCreateForm inherits Rectangle {
 
     Rectangle {
         width: 620px;
-        height: 360px;
+        height: 420px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.surface;
@@ -134,6 +160,11 @@ export component EventCreateForm inherits Rectangle {
                 text: root.date-label + " · " + root.time-label;
                 font-size: 14px;
                 color: Theme.text-muted;
+            }
+
+            TitleField {
+                title: root.title;
+                tapped => { root.title-tapped(); }
             }
 
             Text {

@@ -92,6 +92,10 @@ fn main() {
     // component itself.
     let keyboard_buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let keyboard_target: Rc<RefCell<Option<KeyboardTarget>>> = Rc::new(RefCell::new(None));
+    // The event-creation form's title, edited via the keyboard (a separate
+    // modal on top of the form) -- reset to the default each time a new
+    // slot/day/"+" is tapped, in `open_event_form`.
+    let event_form_title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
     {
         let app_weak = app.as_weak();
@@ -197,6 +201,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let keyboard_buffer = keyboard_buffer.clone();
         let keyboard_target = keyboard_target.clone();
+        let event_form_title = event_form_title.clone();
         app.on_keyboard_done(move || {
             let Some(app) = app_weak.upgrade() else { return };
             app.set_keyboard_open(false);
@@ -230,6 +235,10 @@ fn main() {
                         }
                     });
                 }
+                KeyboardTarget::EventTitle => {
+                    *event_form_title.borrow_mut() = text.clone();
+                    app.set_event_form_title(text.into());
+                }
             }
         });
     }
@@ -240,18 +249,20 @@ fn main() {
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let event_form_title = event_form_title.clone();
         let reference_date = reference_date.clone();
         app.on_month_slot_tapped(move |week, day| {
             let Some(app) = app_weak.upgrade() else { return };
             let ref_date = *reference_date.lock().unwrap();
             let (grid_start, _) = month_grid_range(ref_date);
             let date = grid_start + TimeDuration::days(week as i64 * 7 + day as i64);
-            open_event_form(&app, &pending_slot, date, 9);
+            open_event_form(&app, &pending_slot, &event_form_title, date, 9);
         });
     }
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let event_form_title = event_form_title.clone();
         let reference_date = reference_date.clone();
         app.on_week_slot_tapped(move |col, hour| {
             let Some(app) = app_weak.upgrade() else { return };
@@ -259,27 +270,49 @@ fn main() {
             let week_start =
                 ref_date - TimeDuration::days(ref_date.weekday().number_days_from_sunday() as i64);
             let date = week_start + TimeDuration::days(col as i64);
-            open_event_form(&app, &pending_slot, date, hour as u8);
+            open_event_form(&app, &pending_slot, &event_form_title, date, hour as u8);
         });
     }
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let event_form_title = event_form_title.clone();
         let reference_date = reference_date.clone();
         app.on_day_slot_tapped(move |hour| {
             let Some(app) = app_weak.upgrade() else { return };
             let ref_date = *reference_date.lock().unwrap();
-            open_event_form(&app, &pending_slot, ref_date, hour as u8);
+            open_event_form(&app, &pending_slot, &event_form_title, ref_date, hour as u8);
         });
     }
     {
         let app_weak = app.as_weak();
         let pending_slot = pending_slot.clone();
+        let event_form_title = event_form_title.clone();
         app.on_new_event_requested(move || {
             let Some(app) = app_weak.upgrade() else { return };
             let now = OffsetDateTime::now_utc().to_offset(local_offset);
             let next_hour = (now.hour() as u16 + 1).min(23) as u8;
-            open_event_form(&app, &pending_slot, now.date(), next_hour);
+            open_event_form(&app, &pending_slot, &event_form_title, now.date(), next_hour);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let event_form_title = event_form_title.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let keyboard_target = keyboard_target.clone();
+        app.on_event_form_title_tapped(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            // Starts from empty if the title is still the untouched
+            // default ("New Event") -- no reason to make the user backspace
+            // through it first -- but continues from whatever's there if
+            // they're going back to fix something they already typed.
+            let current = event_form_title.borrow().clone();
+            let start_from = if current == DEFAULT_EVENT_TITLE { String::new() } else { current };
+            *keyboard_buffer.borrow_mut() = start_from.clone();
+            *keyboard_target.borrow_mut() = Some(KeyboardTarget::EventTitle);
+            app.set_keyboard_text(start_from.into());
+            app.set_keyboard_prompt("Event title".into());
+            app.set_keyboard_open(true);
         });
     }
     {
@@ -287,12 +320,14 @@ fn main() {
         let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let pending_slot = pending_slot.clone();
+        let event_form_title = event_form_title.clone();
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let app_weak = app.as_weak();
         app.on_event_create_confirmed(move |member_index, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
+            let title = event_form_title.borrow().clone();
             // Falls back to whichever family member actually has a
             // calendar configured if the selected one doesn't (a household
             // with one shared calendar and per-person todo lists -- not a
@@ -327,11 +362,7 @@ fn main() {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
-                // Fixed placeholder title -- no on-screen keyboard exists
-                // yet in this app, so free-text entry isn't wired up here.
-                if let Err(err) =
-                    create_calendar_event(&client, &entity_id, "New Event", start, end).await
-                {
+                if let Err(err) = create_calendar_event(&client, &entity_id, &title, start, end).await {
                     tracing::warn!(%err, "failed to create HA calendar event");
                     return;
                 }
@@ -531,13 +562,18 @@ fn spawn_refresh(
     });
 }
 
+const DEFAULT_EVENT_TITLE: &str = "New Event";
+
 fn open_event_form(
     app: &AppWindow,
     pending_slot: &Rc<RefCell<Option<(Date, u8)>>>,
+    event_form_title: &Rc<RefCell<String>>,
     date: Date,
     hour: u8,
 ) {
     *pending_slot.borrow_mut() = Some((date, hour));
+    *event_form_title.borrow_mut() = DEFAULT_EVENT_TITLE.to_string();
+    app.set_event_form_title(DEFAULT_EVENT_TITLE.into());
     app.set_event_form_date_label(format!("{} {}", weekday_short(date.weekday()), date.day()).into());
     app.set_event_form_time_label(format_hour_label(hour).into());
     app.set_event_form_open(true);
@@ -547,6 +583,7 @@ fn open_event_form(
 /// see `keyboard_target` in `main`.
 enum KeyboardTarget {
     NewTaskSummary { column: i32 },
+    EventTitle,
 }
 
 async fn add_todo_item(
