@@ -55,11 +55,8 @@ component WeatherStatLine inherits Rectangle {
     in property <string> kind;
     in property <string> value;
 
-    height: 14px;
-
     HorizontalLayout {
-        alignment: end;
-        spacing: 5px;
+        spacing: 3px;
 
         WeatherStatIcon {
             kind: root.kind;
@@ -69,81 +66,52 @@ component WeatherStatLine inherits Rectangle {
         }
         Text {
             text: root.value;
-            font-size: 10px;
+            font-size: 11px;
             color: Theme.text-muted;
             vertical-alignment: center;
         }
     }
 }
 
-// The corner weather widget -- condition icon + label + "X minutes ago",
-// current temperature + today's high/low, and compact pressure/humidity/
-// wind lines below (icon + value only, no spelled-out labels -- there
-// isn't room for both in a corner-sized box). Every string is
-// pre-formatted in Rust (see apply_weather in main.rs); rows with no data
-// (empty string) are hidden rather than shown blank.
+// The corner weather widget -- a single compact line (icon, current
+// temperature, rain amount, wind speed) sized to sit next to the clock,
+// not a detail card. `condition-label`/`updated-label`/`temp-range`/
+// `pressure`/`humidity` are still accepted (and still set from Rust --
+// see apply_weather in main.rs) but not shown here; there wasn't room for
+// all of it on one line, and this is the at-a-glance subset. Kept as
+// properties rather than dropped so a future tap-to-expand detail view
+// can reuse them without re-plumbing the data path.
 export component WeatherWidget inherits Rectangle {
     in property <string> icon-condition;
     in property <string> condition-label;
     in property <string> updated-label;
     in property <string> temp-now: "--°";
     in property <string> temp-range;
+    in property <string> precip;
     in property <string> pressure;
     in property <string> humidity;
     in property <string> wind;
 
+    height: 26px;
     background: transparent;
 
-    VerticalLayout {
-        spacing: 3px;
+    HorizontalLayout {
+        spacing: 6px;
 
-        HorizontalLayout {
-            spacing: 8px;
-
-            WeatherIcon {
-                condition: root.icon-condition;
-                width: 30px;
-                height: 30px;
-                y: (parent.height - self.height) / 2;
-            }
-
-            VerticalLayout {
-                alignment: center;
-                Text {
-                    text: root.condition-label == "" ? "Weather" : root.condition-label;
-                    font-size: 12px;
-                    font-weight: 700;
-                    color: Theme.text-primary;
-                    overflow: elide;
-                }
-                Text {
-                    text: root.updated-label;
-                    font-size: 9px;
-                    color: Theme.text-muted;
-                    overflow: elide;
-                }
-            }
-
-            VerticalLayout {
-                alignment: center;
-                Text {
-                    text: root.temp-now;
-                    font-size: 20px;
-                    font-weight: 700;
-                    color: Theme.text-primary;
-                    horizontal-alignment: right;
-                }
-                Text {
-                    text: root.temp-range;
-                    font-size: 9px;
-                    color: Theme.text-muted;
-                    horizontal-alignment: right;
-                }
-            }
+        WeatherIcon {
+            condition: root.icon-condition;
+            width: 22px;
+            height: 22px;
+            y: (parent.height - self.height) / 2;
         }
-
-        if root.pressure != "": WeatherStatLine { kind: "pressure"; value: root.pressure; }
-        if root.humidity != "": WeatherStatLine { kind: "humidity"; value: root.humidity; }
+        Text {
+            text: root.temp-now;
+            font-size: 16px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+        }
+        if root.precip != "": WeatherStatLine { kind: "precip"; value: root.precip; }
         if root.wind != "": WeatherStatLine { kind: "wind"; value: root.wind; }
     }
 }
@@ -159,6 +127,7 @@ export component TopBar inherits Rectangle {
     in property <string> weather-updated-label: "";
     in property <string> weather-temp-now: "--°";
     in property <string> weather-temp-range: "";
+    in property <string> weather-precip: "";
     in property <string> weather-pressure: "";
     in property <string> weather-humidity: "";
     in property <string> weather-wind: "";
@@ -191,6 +160,7 @@ export component TopBar inherits Rectangle {
                 updated-label: root.weather-updated-label;
                 temp-now: root.weather-temp-now;
                 temp-range: root.weather-temp-range;
+                precip: root.weather-precip;
                 pressure: root.weather-pressure;
                 humidity: root.weather-humidity;
                 wind: root.weather-wind;

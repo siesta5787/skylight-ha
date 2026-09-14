@@ -181,7 +181,9 @@ export component WeatherStatIcon inherits Rectangle {
         }
     }
 
-    if root.kind == "humidity": Path {
+    // "precip" reuses the same droplet -- a raindrop is a fitting icon for
+    // a rain amount too, and the two are never shown side by side.
+    if root.kind == "humidity" || root.kind == "precip": Path {
         width: 100%;
         height: 100%;
         viewbox-width: 24;

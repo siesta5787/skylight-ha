@@ -824,6 +824,10 @@ fn apply_weather(
         if let (Some(high), Some(low)) = (fc.temperature, fc.templow) {
             app.set_weather_temp_range(format_temp_range(high, low, unit).into());
         }
+        if let Some(precip) = fc.precipitation {
+            let precip_unit = state.attributes.get("precipitation_unit").and_then(|v| v.as_str()).unwrap_or("");
+            app.set_weather_precip(format_precip(precip, precip_unit).into());
+        }
     }
 
     let sources = [Some(state), backfill];
@@ -1719,6 +1723,13 @@ fn format_humidity(value: f64) -> String {
     format!("{}%", value.round() as i64)
 }
 
+/// "0.19 in" -- today's forecast rain amount, not a percentage (see the
+/// doc comment on `DailyForecast::precipitation` for why there's no
+/// percentage-chance field to show instead).
+fn format_precip(value: f64, unit: &str) -> String {
+    format!("{value:.2} {unit}")
+}
+
 /// Reads `key` from the first of `sources` (in order) that has it -- used
 /// to check the primary weather entity before falling back to the backfill
 /// one for humidity/pressure (see `apply_weather`).
@@ -1773,6 +1784,12 @@ mod tests {
     #[test]
     fn formats_temp_range() {
         assert_eq!(format_temp_range(91.4, 75.2, "°F"), "91 °F / 75 °F");
+    }
+
+    #[test]
+    fn formats_precip() {
+        assert_eq!(format_precip(0.19, "in"), "0.19 in");
+        assert_eq!(format_precip(0.0, "in"), "0.00 in");
     }
 
     #[test]

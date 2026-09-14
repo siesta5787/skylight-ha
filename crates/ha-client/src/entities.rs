@@ -28,11 +28,20 @@ pub struct EntityState {
 /// modern HA -- it needs its own service call (see
 /// `Client::weather_daily_forecast`). Only the fields this dashboard
 /// actually uses; HA's response also includes `condition`, `datetime`,
-/// `precipitation`, `wind_speed`, `wind_bearing`, all ignored here.
+/// `wind_speed`, `wind_bearing`, all ignored here.
+///
+/// Note there's no percentage-chance-of-rain field: checked both this
+/// instance's weather entities (state attributes, daily forecast, and
+/// hourly forecast) and neither exposes one -- only this `precipitation`
+/// amount (inches/mm, from `precipitation_unit` on the entity's state).
+/// That matches what HA's own more-info dialog shows too (a rain-drop icon
+/// next to an amount, not a percentage) -- Met.no/Open-Meteo, the
+/// integrations behind both entities here, don't report probability.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DailyForecast {
     pub temperature: Option<f64>,
     pub templow: Option<f64>,
+    pub precipitation: Option<f64>,
 }
 
 /// One event from a calendar entity's event range, as returned by
