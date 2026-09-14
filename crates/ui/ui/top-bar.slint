@@ -56,7 +56,7 @@ component WeatherStatLine inherits Rectangle {
     in property <string> value;
 
     HorizontalLayout {
-        spacing: 1px;
+        spacing: 2px;
 
         WeatherStatIcon {
             kind: root.kind;
@@ -93,9 +93,14 @@ export component WeatherWidget inherits Rectangle {
 
     height: 26px;
     background: transparent;
+    // Explicit 0 so this doesn't also pick up a share of the outer header
+    // row's leftover width (see TopBar below, which gives that space to
+    // family-name instead) -- same class of bug `alignment: start` below
+    // fixes one level down, just at the next layout up.
+    horizontal-stretch: 0;
 
     HorizontalLayout {
-        spacing: 1.5px;
+        spacing: 6px;
         // Without this, a plain HorizontalLayout distributes any leftover
         // width equally among children that have no explicit width (every
         // WeatherStatLine here) instead of packing them at their natural
@@ -183,6 +188,7 @@ export component TopBar inherits Rectangle {
 
             VerticalLayout {
                 alignment: center;
+                horizontal-stretch: 0;
                 Text {
                     text: date-text;
                     font-size: 11px;
