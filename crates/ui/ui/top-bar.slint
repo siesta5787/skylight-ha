@@ -57,6 +57,7 @@ export component TopBar inherits Rectangle {
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
     in property <string> weather-text: "--°";
+    in property <string> weather-condition: "";
     in property <[MemberChipData]> members;
     in property <[bool]> member-visible;
     // Tapping a member's name toggles them on/off the calendar below.
@@ -84,10 +85,13 @@ export component TopBar inherits Rectangle {
             VerticalLayout {
                 alignment: center;
                 Text {
-                    text: "Weather";
+                    // Condition (e.g. "Partly Cloudy") once a fetch has
+                    // succeeded; plain "Weather" placeholder until then.
+                    text: weather-condition == "" ? "Weather" : weather-condition;
                     font-size: 11px;
                     color: Theme.text-muted;
                     horizontal-alignment: right;
+                    overflow: elide;
                 }
                 Text {
                     text: weather-text;

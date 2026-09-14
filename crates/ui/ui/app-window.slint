@@ -120,6 +120,9 @@ export component AppWindow inherits Window {
     in property <string> date-text: "";
     in property <string> month-label: "";
     in property <string> weather-text: "--°";
+    // Empty until a weather entity is resolved and its first fetch
+    // succeeds -- TopBar falls back to a plain "Weather" label until then.
+    in property <string> weather-condition: "";
     in property <[MemberChipData]> members;
     // Kept out of layout entirely (not just dimmed) for whichever member a
     // top-bar chip tap has toggled off -- indexed the same as `members`.
@@ -242,6 +245,7 @@ export component AppWindow inherits Window {
                     clock-text: root.clock-text;
                     date-text: root.date-text;
                     weather-text: root.weather-text;
+                    weather-condition: root.weather-condition;
                     members: root.members;
                     member-visible: root.member-visible;
                     member-toggled(idx) => {

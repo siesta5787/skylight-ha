@@ -110,6 +110,12 @@ pub struct Config {
     pub ha: HaConnection,
     #[serde(default)]
     pub family: Vec<FamilyMember>,
+    /// Which `weather.*` entity feeds the top bar. Optional: if unset, the
+    /// dashboard auto-discovers the first `weather.*` entity it finds in HA
+    /// (see discover_weather_entity in apps/skylight-ha/src/main.rs), same
+    /// override-else-auto-discover pattern as the family roster.
+    #[serde(default)]
+    pub weather_entity: Option<String>,
     pub views: Vec<View>,
 }
 

@@ -1,5 +1,14 @@
 # Copy to config.toml and fill in. Never commit config.toml or the token file.
 
+# Which weather.* entity feeds the top bar. Optional -- if omitted, the
+# dashboard uses the first weather.* entity it finds in HA. Only needed if
+# you have more than one weather integration configured and want a
+# specific one. Must stay above the first [table] header below -- TOML has
+# no table-reset until the next header line, so a bare `key = value` placed
+# after [ha] silently becomes ha.weather_entity instead of the top-level
+# field.
+# weather_entity = "weather.home"
+
 [ha]
 base_url = "http://homeassistant.local:8123"
 # File containing a single Home Assistant long-lived access token

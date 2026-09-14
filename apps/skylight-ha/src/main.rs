@@ -66,6 +66,13 @@ fn main() {
     // below reads this fresh at call time rather than capturing a snapshot,
     // since it isn't known for certain until after connecting.
     let family_state: Arc<Mutex<Vec<FamilyMember>>> = Arc::new(Mutex::new(config.family.clone()));
+    // Which `weather.*` entity feeds the top bar -- `config.weather_entity`
+    // if set, else auto-discovered once `run_ha_sync` connects (see
+    // `discover_weather_entity`). `None` until resolved (or if no weather
+    // entity exists at all), same shared-state shape as `family_state`
+    // since it's read from `refresh_calendar_and_todos`'s other call site
+    // too (after creating a calendar event).
+    let weather_entity: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(config.weather_entity.clone()));
     // (column index into the Tasks page) -> (that column's todo entity id,
     // the uid of each item) -- only members with a todo_entity get a
     // column, so this is a *different*, potentially shorter, index space
@@ -324,6 +331,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         let app_weak = app.as_weak();
         app.on_event_create_confirmed(move |selected_members, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
@@ -362,6 +370,7 @@ fn main() {
             let app_weak = app_weak.clone();
             let live_rest = live_rest.clone();
             let todo_uids = todo_uids.clone();
+            let weather_entity = weather_entity.clone();
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
@@ -388,6 +397,7 @@ fn main() {
                         ref_date,
                         &app_weak,
                         &todo_uids,
+                        &weather_entity,
                     )
                     .await;
                 }
@@ -407,6 +417,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         app.on_nav_month(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -415,7 +426,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
         });
     }
     {
@@ -426,6 +437,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         app.on_nav_week(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -434,7 +446,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
         });
     }
     {
@@ -445,6 +457,7 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         app.on_nav_day(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -453,7 +466,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
         });
     }
     {
@@ -464,12 +477,13 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         app.on_nav_today(move || {
             let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
             *reference_date.lock().unwrap() = new_date;
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entity);
         });
     }
     {
@@ -480,10 +494,11 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
+        let weather_entity = weather_entity.clone();
         app.on_manual_refresh_requested(move || {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entity);
         });
     }
 
@@ -513,6 +528,7 @@ fn main() {
         todo_uids,
         reference_date,
         family_state,
+        weather_entity,
     ));
 
     app.run().expect("event loop error");
@@ -544,6 +560,7 @@ fn apply_family_roster(app: &AppWindow, family: &[FamilyMember]) {
 /// Fetches + rebuilds + pushes to the UI using whichever `Client`/`RestClient`
 /// are currently live; does nothing if HA isn't connected yet (the next nav
 /// tap or periodic refresh will pick it up once it is).
+#[allow(clippy::too_many_arguments)]
 fn spawn_refresh(
     rt_handle: &tokio::runtime::Handle,
     live_rest: &Arc<Mutex<Option<RestClient>>>,
@@ -553,6 +570,7 @@ fn spawn_refresh(
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    weather_entity: &Arc<Mutex<Option<String>>>,
 ) {
     let (Some(rest), Some(client)) =
         (live_rest.lock().unwrap().clone(), live_client.lock().unwrap().clone())
@@ -562,9 +580,19 @@ fn spawn_refresh(
     let family = family.to_vec();
     let app_weak = app_weak.clone();
     let todo_uids = todo_uids.clone();
+    let weather_entity = weather_entity.clone();
     rt_handle.spawn(async move {
-        refresh_calendar_and_todos(&rest, &client, &family, local_offset, reference_date, &app_weak, &todo_uids)
-            .await;
+        refresh_calendar_and_todos(
+            &rest,
+            &client,
+            &family,
+            local_offset,
+            reference_date,
+            &app_weak,
+            &todo_uids,
+            &weather_entity,
+        )
+        .await;
     });
 }
 
@@ -646,10 +674,12 @@ async fn create_calendar_event(
 }
 
 /// One shared fetch (calendar events over the range around `reference_date`,
-/// plus todos) feeding all four calendar views + the Tasks page + top-bar
-/// chips. Used by the periodic refresh, right after creating an event, and
-/// by every nav callback. Returns whether the WS connection still looks
-/// alive -- see `run_ha_sync`, which reconnects if not.
+/// plus todos, plus weather) feeding all four calendar views + the Tasks
+/// page + top-bar chips/weather. Used by the periodic refresh, right after
+/// creating an event, and by every nav callback. Returns whether the WS
+/// connection still looks alive -- see `run_ha_sync`, which reconnects if
+/// not.
+#[allow(clippy::too_many_arguments)]
 async fn refresh_calendar_and_todos(
     rest: &RestClient,
     client: &Client,
@@ -658,6 +688,7 @@ async fn refresh_calendar_and_todos(
     reference_date: Date,
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    weather_entity: &Arc<Mutex<Option<String>>>,
 ) -> bool {
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let range_start = grid_start.midnight().assume_offset(local_offset);
@@ -670,6 +701,24 @@ async fn refresh_calendar_and_todos(
     // thread and handed across into that closure.
     let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
     let (per_member_todos, connection_alive) = fetch_todos(client, family).await;
+
+    // A REST call, not WS -- there's no dedicated WS command for a single
+    // entity's state, and this only needs to happen on the same cadence as
+    // the calendar poll above, not on every `state_changed` event. `None`
+    // (no weather entity resolved yet, or the fetch failed) means "leave
+    // whatever's already on screen alone" -- same don't-flash-to-placeholder
+    // reasoning as the connection-dead check below.
+    let weather_entity_id = weather_entity.lock().unwrap().clone();
+    let weather = match &weather_entity_id {
+        Some(entity_id) => match rest.entity_state(entity_id).await {
+            Ok(state) => Some(state),
+            Err(err) => {
+                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather entity state");
+                None
+            }
+        },
+        None => None,
+    };
 
     if !connection_alive {
         // Don't push this over what's already correctly on screen -- a
@@ -695,6 +744,10 @@ async fn refresh_calendar_and_todos(
         *todo_uids.lock().unwrap() = uid_map;
         app.set_todo_columns(todo_columns);
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
+        if let Some(state) = &weather {
+            app.set_weather_text(format_weather_temperature(state).into());
+            app.set_weather_condition(humanize_weather_condition(&state.state).into());
+        }
     });
 
     true
@@ -721,6 +774,7 @@ async fn run_ha_sync(
     todo_uids: Arc<Mutex<Vec<(String, Vec<String>)>>>,
     reference_date: Arc<Mutex<Date>>,
     family_state: Arc<Mutex<Vec<FamilyMember>>>,
+    weather_entity: Arc<Mutex<Option<String>>>,
 ) {
     let token = match config.ha.load_token() {
         Ok(token) => token,
@@ -783,6 +837,20 @@ async fn run_ha_sync(
             family_resolved = true;
         }
 
+        // Same override-else-auto-discover shape as the family roster, but
+        // resolved independently -- a `[[family]]` override says nothing
+        // about which `weather.*` entity to use. `is_none()` (not a
+        // separate "resolved" flag) doubles as "keep trying on the next
+        // reconnect if it wasn't found yet" -- harmless since a HA restart
+        // could add the entity later, and there's no per-member state to
+        // preserve the way `family_resolved` protects `member_visible`.
+        if weather_entity.lock().unwrap().is_none() {
+            if let Some(discovered) = discover_weather_entity(&client).await {
+                tracing::info!(entity = %discovered, "discovered weather entity");
+                *weather_entity.lock().unwrap() = Some(discovered);
+            }
+        }
+
         // Calendar event ranges aren't pushed over the WS event bus (per
         // docs/plan.md), only polled -- but a todo entity's own `state` is
         // its needs-action count, which *does* change (and gets pushed as
@@ -838,6 +906,7 @@ async fn run_ha_sync(
                 ref_date,
                 &app_weak,
                 &todo_uids,
+                &weather_entity,
             )
             .await;
             if !alive {
@@ -981,7 +1050,12 @@ async fn discover_family(client: &Client) -> Vec<FamilyMember> {
 /// "brielle_todo" -> "Brielle Todo" -- used when an entity has no
 /// `friendly_name` attribute to fall back on.
 fn titlecase_slug(slug: &str) -> String {
-    slug.split('_')
+    titlecase_words(slug, '_')
+}
+
+/// Splits `s` on `sep` and capitalizes each word's first letter.
+fn titlecase_words(s: &str, sep: char) -> String {
+    s.split(sep)
         .filter(|word| !word.is_empty())
         .map(|word| {
             let mut chars = word.chars();
@@ -992,6 +1066,22 @@ fn titlecase_slug(slug: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// The first `weather.*` entity found in HA, if any -- used when
+/// `config.weather_entity` isn't set. Most setups only ever have one
+/// weather integration configured, so "first one found" needs no further
+/// disambiguation; anyone who wants a specific one among several can set
+/// `weather_entity` explicitly.
+async fn discover_weather_entity(client: &Client) -> Option<String> {
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to list HA entities while looking for a weather entity");
+            return None;
+        }
+    };
+    states.into_iter().map(|s| s.entity_id).find(|id| id.starts_with("weather."))
 }
 
 async fn fetch_calendar_events(
@@ -1423,6 +1513,26 @@ fn format_12h(hour: u8, minute: u8) -> String {
     format!("{label_hour}:{minute:02} {suffix}")
 }
 
+/// "72°F" from a `weather.*` entity's state -- HA's `temperature_unit`
+/// attribute already includes the degree sign ("°C"/"°F"), confirmed
+/// against a real instance, so this doesn't add its own.
+fn format_weather_temperature(state: &EntityState) -> String {
+    let unit = state.attributes.get("temperature_unit").and_then(|v| v.as_str()).unwrap_or("°");
+    match state.attributes.get("temperature").and_then(|v| v.as_f64()) {
+        Some(temp) => format!("{}{unit}", temp.round() as i64),
+        None => "--°".to_string(),
+    }
+}
+
+/// "partlycloudy" -> "Partlycloudy", "clear-night" -> "Clear Night" -- HA's
+/// weather `state` is one of a fixed set of dash-separated lowercase
+/// condition slugs; this is a generic title-caser, not a lookup table, so
+/// single-word conditions without a dash (most of them) stay as one word
+/// rather than getting individually spaced out ("Partly Cloudy").
+fn humanize_weather_condition(condition: &str) -> String {
+    titlecase_words(condition, '-')
+}
+
 fn parse_hex_color(hex: &str) -> slint::Color {
     let hex = hex.trim_start_matches('#');
     let value = u32::from_str_radix(hex, 16).unwrap_or(0x6c8dfa);
@@ -1453,6 +1563,39 @@ fn parse_ha_color_attribute(value: Option<&serde_json::Value>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_weather_temperature_and_condition() {
+        // The exact shape returned by a real weather.* entity's
+        // GET /api/states/{entity_id}, confirmed against a live instance.
+        let state = EntityState {
+            entity_id: "weather.home".into(),
+            state: "sunny".into(),
+            attributes: serde_json::json!({
+                "friendly_name": "Home",
+                "temperature": 77,
+                "temperature_unit": "°F",
+            }),
+        };
+        assert_eq!(format_weather_temperature(&state), "77°F");
+        assert_eq!(humanize_weather_condition(&state.state), "Sunny");
+    }
+
+    #[test]
+    fn humanizes_dashed_weather_conditions() {
+        assert_eq!(humanize_weather_condition("clear-night"), "Clear Night");
+        assert_eq!(humanize_weather_condition("partlycloudy"), "Partlycloudy");
+    }
+
+    #[test]
+    fn falls_back_when_weather_attributes_are_missing() {
+        let state = EntityState {
+            entity_id: "weather.home".into(),
+            state: "sunny".into(),
+            attributes: serde_json::json!({}),
+        };
+        assert_eq!(format_weather_temperature(&state), "--°");
+    }
 
     #[test]
     fn parses_rgb_array_color_attribute() {

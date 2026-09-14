@@ -1,10 +1,12 @@
-//! HA REST calls. Only used for the Calendar API — event ranges aren't
-//! available over the WebSocket API, so this needs to be polled (on view
-//! load/navigation and periodically) rather than pushed.
+//! HA REST calls. Used for the Calendar API — event ranges aren't available
+//! over the WebSocket API, so this needs to be polled (on view load/
+//! navigation and periodically) rather than pushed — and for fetching a
+//! single entity's state (e.g. weather), which is simpler as one REST call
+//! than round-tripping the WS `get_states` command for every poll.
 
 use time::OffsetDateTime;
 
-use crate::entities::CalendarEvent;
+use crate::entities::{CalendarEvent, EntityState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -52,6 +54,13 @@ impl RestClient {
             .send()
             .await?
             .error_for_status()?;
+        Ok(response.json().await?)
+    }
+
+    /// Fetches one entity's current state (e.g. `weather.home`).
+    pub async fn entity_state(&self, entity_id: &str) -> Result<EntityState, Error> {
+        let url = format!("{}/api/states/{entity_id}", self.base_url.trim_end_matches('/'));
+        let response = self.http.get(url).bearer_auth(&self.token).send().await?.error_for_status()?;
         Ok(response.json().await?)
     }
 }
