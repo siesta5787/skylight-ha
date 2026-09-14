@@ -325,29 +325,32 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let app_weak = app.as_weak();
-        app.on_event_create_confirmed(move |member_index, duration_minutes| {
+        app.on_event_create_confirmed(move |selected_members, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
             let title = event_form_title.borrow().clone();
-            // Falls back to whichever family member actually has a
-            // calendar configured if the selected one doesn't (a household
-            // with one shared calendar and per-person todo lists -- not a
-            // calendar per person -- has exactly one member configured with
-            // any calendar_entities at all, so picking anyone else in the
-            // form used to silently create nothing). A member can have more
-            // than one calendar linked (Skylight Family integration
-            // supports that); the creation form has no "which one" picker
-            // yet, so this always uses the first.
-            let entity_id = {
+            // Every calendar belonging to any selected member, deduped --
+            // multiple people can be picked (e.g. an event for both kids),
+            // and any one of them can have more than one calendar linked
+            // (the Skylight Family integration supports that). No fallback
+            // to "whoever has a calendar" if the selection resolves to
+            // nothing: with multi-select there's no single implicit
+            // default left that wouldn't risk silently creating the event
+            // somewhere other than what was actually picked.
+            let entity_ids: Vec<String> = {
                 let family = family_state.lock().unwrap();
-                family
-                    .get(member_index as usize)
-                    .and_then(|m| m.calendar_entities.first().cloned())
-                    .or_else(|| family.iter().find_map(|m| m.calendar_entities.first().cloned()))
+                let mut ids: Vec<String> = (0..selected_members.row_count())
+                    .filter(|&i| selected_members.row_data(i).unwrap_or(false))
+                    .filter_map(|i| family.get(i))
+                    .flat_map(|m| m.calendar_entities.iter().cloned())
+                    .collect();
+                ids.sort();
+                ids.dedup();
+                ids
             };
-            let Some(entity_id) = entity_id else {
-                tracing::warn!("no family member has a calendar configured, can't create event");
+            if entity_ids.is_empty() {
+                tracing::warn!("no calendar configured for the selected member(s), can't create event");
                 return;
-            };
+            }
             let Some(client) = live_client.lock().unwrap().clone() else {
                 tracing::warn!("not connected to HA yet, can't create event");
                 return;
@@ -362,9 +365,12 @@ fn main() {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
-                if let Err(err) = create_calendar_event(&client, &entity_id, &title, start, end).await {
-                    tracing::warn!(%err, "failed to create HA calendar event");
-                    return;
+                for entity_id in &entity_ids {
+                    if let Err(err) =
+                        create_calendar_event(&client, entity_id, &title, start, end).await
+                    {
+                        tracing::warn!(%err, entity = %entity_id, "failed to create HA calendar event");
+                    }
                 }
                 // The whole point of tapping "Create" is to see it show up
                 // -- don't make the user wait up to 5 minutes for the next
@@ -576,6 +582,14 @@ fn open_event_form(
     app.set_event_form_title(DEFAULT_EVENT_TITLE.into());
     app.set_event_form_date_label(format!("{} {}", weekday_short(date.weekday()), date.day()).into());
     app.set_event_form_time_label(format_hour_label(hour).into());
+    // Starts nobody selected each time, forcing a deliberate pick rather
+    // than defaulting to whoever was selected last (which risked silently
+    // double-booking the wrong person).
+    let member_count = app.get_event_form_members().row_count();
+    app.set_event_form_selected_members(slint::ModelRc::new(slint::VecModel::from(vec![
+        false;
+        member_count
+    ])));
     app.set_event_form_open(true);
 }
 

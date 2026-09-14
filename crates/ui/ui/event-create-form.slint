@@ -118,7 +118,10 @@ export component EventCreateForm inherits Rectangle {
     // itself could set.
     in property <string> title;
     in property <[EventFormMember]> members;
-    in-out property <int> selected-member: 0;
+    // Parallel to `members` -- which ones are picked, toggled independently
+    // rather than a single radio-style selection. Rust resets this to
+    // all-false each time the form opens (see open_event_form).
+    in-out property <[bool]> selected-members;
     in-out property <int> duration-minutes: 60;
     callback title-tapped();
     callback confirmed();
@@ -168,7 +171,7 @@ export component EventCreateForm inherits Rectangle {
             }
 
             Text {
-                text: "Whose calendar?";
+                text: "Who's this for? (tap all that apply)";
                 font-size: 12px;
                 font-weight: 600;
                 color: Theme.text-muted;
@@ -186,8 +189,8 @@ export component EventCreateForm inherits Rectangle {
                     alignment: start;
                     for member[idx] in root.members: MemberButton {
                         member: member;
-                        selected: idx == root.selected-member;
-                        tapped => { root.selected-member = idx; }
+                        selected: idx < root.selected-members.length && root.selected-members[idx];
+                        tapped => { root.selected-members[idx] = !root.selected-members[idx]; }
                     }
                 }
             }
