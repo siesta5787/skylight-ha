@@ -201,7 +201,7 @@ export component AppWindow inherits Window {
     property <string> event-detail-summary;
     property <string> event-detail-time;
     property <string> event-detail-member-name;
-    property <color> event-detail-member-color;
+    property <[color]> event-detail-member-colors;
 
     // Page/view-mode switching is pure `.slint` state -- Rust never needs to
     // know which page or calendar mode is active.
@@ -211,18 +211,16 @@ export component AppWindow inherits Window {
     function show-event-detail(ev: WeekEventData) {
         event-detail-summary = ev.summary;
         event-detail-time = ev.time-label;
-        event-detail-member-color = ev.member-color;
-        event-detail-member-name = (ev.member-index >= 0 && ev.member-index < members.length)
-            ? members[ev.member-index].name : "";
+        event-detail-member-colors = ev.member-colors;
+        event-detail-member-name = ev.member-label;
         event-detail-open = true;
     }
 
     function show-calendar-event-detail(dot: CalendarEventDot) {
         event-detail-summary = dot.summary;
         event-detail-time = dot.time-label;
-        event-detail-member-color = dot.member-color;
-        event-detail-member-name = (dot.member-index >= 0 && dot.member-index < members.length)
-            ? members[dot.member-index].name : "";
+        event-detail-member-colors = dot.member-colors;
+        event-detail-member-name = dot.member-label;
         event-detail-open = true;
     }
 
@@ -410,7 +408,7 @@ export component AppWindow inherits Window {
         summary: root.event-detail-summary;
         time-label: root.event-detail-time;
         member-name: root.event-detail-member-name;
-        member-color: root.event-detail-member-color;
+        member-colors: root.event-detail-member-colors;
         closed => { root.event-detail-open = false; }
     }
 

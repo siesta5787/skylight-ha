@@ -6,7 +6,18 @@ export struct CalendarEventDot {
     // shown when the event's tapped (the month grid itself only shows the
     // summary text; there's no room to also show a time per line).
     time-label: string,
-    member-color: color,
+    // One color per family member this event is on -- e.g. an event created
+    // for 3 people (see on_event_create_confirmed in main.rs, which creates
+    // one HA calendar event per selected member) carries all 3 colors here
+    // instead of showing up as 3 separate, fully-overlapping cards.
+    member-colors: [color],
+    // Comma-joined member name(s), precomputed in Rust (Slint's expression
+    // language has no string-join) -- used by the event-detail popup.
+    member-label: string,
+    // -1 when member-colors has more than one entry (a shared event always
+    // stays visible regardless of per-member toggling in the top bar --
+    // partial-hide for shared events isn't supported); otherwise the single
+    // member's index, same as before.
     member-index: int,
 }
 
@@ -28,21 +39,40 @@ component EventLine inherits Rectangle {
     callback tapped();
 
     height: 15px;
-    background: dot.member-color.with-alpha(touch.pressed ? 0.40 : 0.20);
+    background: (dot.member-colors.length > 0 ? dot.member-colors[0] : Theme.border)
+        .with-alpha(touch.pressed ? 0.40 : 0.20);
     border-radius: 3px;
 
     touch := TouchArea {
         clicked => { root.tapped(); }
 
-        Text {
-            x: 4px;
-            width: parent.width - 6px;
-            text: dot.summary;
-            font-size: 9px;
-            font-weight: 600;
-            color: Theme.text-primary;
-            overflow: elide;
-            vertical-alignment: center;
+        HorizontalLayout {
+            padding-left: 4px;
+            padding-right: 4px;
+            spacing: 3px;
+
+            Text {
+                text: dot.summary;
+                font-size: 9px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                overflow: elide;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            // Only shown once there's more than one participant -- a solo
+            // event already has its color as the card background.
+            if dot.member-colors.length > 1: HorizontalLayout {
+                spacing: 2px;
+                for c in dot.member-colors: Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: c;
+                    y: (parent.height - self.height) / 2;
+                }
+            }
         }
     }
 }

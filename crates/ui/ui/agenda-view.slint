@@ -20,12 +20,15 @@ component AgendaRow inherits Rectangle {
             padding-right: 4px;
             spacing: 10px;
 
-            Rectangle {
-                width: 10px;
-                height: 10px;
-                border-radius: 5px;
-                background: event.member-color;
-                y: (parent.height - self.height) / 2;
+            HorizontalLayout {
+                spacing: 3px;
+                for c in event.member-colors: Rectangle {
+                    width: 10px;
+                    height: 10px;
+                    border-radius: 5px;
+                    background: c;
+                    y: (parent.height - self.height) / 2;
+                }
             }
 
             Text {

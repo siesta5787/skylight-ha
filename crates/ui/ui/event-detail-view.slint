@@ -30,8 +30,9 @@ export component EventDetailView inherits Rectangle {
     in property <bool> open: false;
     in property <string> summary;
     in property <string> time-label;
+    // Comma-joined name(s) -- precomputed in Rust for shared events.
     in property <string> member-name;
-    in property <color> member-color;
+    in property <[color]> member-colors;
     callback closed();
 
     visible: open;
@@ -61,12 +62,15 @@ export component EventDetailView inherits Rectangle {
 
             HorizontalLayout {
                 spacing: 8px;
-                Rectangle {
-                    width: 12px;
-                    height: 12px;
-                    border-radius: 6px;
-                    background: root.member-color;
-                    y: (parent.height - self.height) / 2;
+                HorizontalLayout {
+                    spacing: 4px;
+                    for c in root.member-colors: Rectangle {
+                        width: 12px;
+                        height: 12px;
+                        border-radius: 6px;
+                        background: c;
+                        y: (parent.height - self.height) / 2;
+                    }
                 }
                 Text {
                     text: root.member-name;

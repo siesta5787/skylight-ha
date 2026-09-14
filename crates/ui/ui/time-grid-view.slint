@@ -8,15 +8,22 @@ export struct WeekEventData {
     // Rust clamps this to a sane minimum (e.g. 20min) so short events still
     // render as a visible block.
     duration-minutes: int,
-    member-color: color,
+    // One color per family member this event is on -- see the same field on
+    // CalendarEventDot (calendar-card.slint) for why this is a list rather
+    // than a single color.
+    member-colors: [color],
+    // Comma-joined member name(s), precomputed in Rust.
+    member-label: string,
     // Indexes `member-visible` (see TimeGridView) -- lets a tapped top-bar
-    // chip hide/show this event without a Rust round-trip.
+    // chip hide/show this event without a Rust round-trip. -1 when
+    // member-colors has more than one entry (shared events always stay
+    // visible; see CalendarEventDot).
     member-index: int,
 }
 
 export struct AllDayBannerData {
     text: string,
-    member-color: color,
+    member-colors: [color],
     member-index: int,
 }
 
@@ -39,16 +46,33 @@ component AllDayBanner inherits Rectangle {
 
     height: 18px;
     border-radius: 5px;
-    background: banner.member-color.with-alpha(0.22);
-    Text {
-        text: banner.text;
-        font-size: 10px;
-        font-weight: 600;
-        color: Theme.text-primary;
-        overflow: elide;
-        x: 6px;
-        vertical-alignment: center;
-        width: parent.width - 12px;
+    background: (banner.member-colors.length > 0 ? banner.member-colors[0] : Theme.border).with-alpha(0.22);
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 4px;
+
+        Text {
+            text: banner.text;
+            font-size: 10px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            overflow: elide;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        if banner.member-colors.length > 1: HorizontalLayout {
+            spacing: 2px;
+            for c in banner.member-colors: Rectangle {
+                width: 6px;
+                height: 6px;
+                border-radius: 3px;
+                background: c;
+                y: (parent.height - self.height) / 2;
+            }
+        }
     }
 }
 
@@ -83,10 +107,12 @@ component EventCard inherits Rectangle {
         || root.event.member-index >= root.member-visible.length
         || root.member-visible[root.event.member-index];
 
+    property <color> primary-color: event.member-colors.length > 0 ? event.member-colors[0] : Theme.border;
+
     border-radius: 6px;
-    background: touch.pressed ? event.member-color.with-alpha(0.45) : event.member-color.with-alpha(0.30);
+    background: touch.pressed ? primary-color.with-alpha(0.45) : primary-color.with-alpha(0.30);
     border-width: 1px;
-    border-color: event.member-color;
+    border-color: primary-color;
     clip: true;
 
     touch := TouchArea {
@@ -95,6 +121,7 @@ component EventCard inherits Rectangle {
 
     VerticalLayout {
         padding: 4px;
+        spacing: 2px;
         alignment: start;
         Text {
             text: event.summary;
@@ -108,6 +135,15 @@ component EventCard inherits Rectangle {
             font-size: 9px;
             color: Theme.text-muted;
             overflow: elide;
+        }
+        if event.member-colors.length > 1: HorizontalLayout {
+            spacing: 3px;
+            for c in event.member-colors: Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: c;
+            }
         }
     }
 }

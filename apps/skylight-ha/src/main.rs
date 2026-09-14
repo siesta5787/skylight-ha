@@ -41,7 +41,7 @@ fn main() {
     // empty until `run_ha_sync` resolves it below -- `config.family` is
     // usually empty too (see `discover_family`), so there's nothing
     // meaningful to seed it with yet anyway.
-    let empty_grids = build_calendar_grids(local_offset, today, &[]);
+    let empty_grids = build_calendar_grids(local_offset, today, &[], &[]);
     apply_calendar_grids(&app, empty_grids);
     let (empty_todos, _, empty_chips) =
         build_todo_model(&config.family, &vec![Vec::new(); config.family.len()]);
@@ -689,7 +689,7 @@ async fn refresh_calendar_and_todos(
     let todo_uids = todo_uids.clone();
     let _ = slint::invoke_from_event_loop(move || {
         let Some(app) = app_weak.upgrade() else { return };
-        let grids = build_calendar_grids(local_offset, reference_date, &per_member_events);
+        let grids = build_calendar_grids(local_offset, reference_date, &family_owned, &per_member_events);
         apply_calendar_grids(&app, grids);
         let (todo_columns, uid_map, chips) = build_todo_model(&family_owned, &per_member_todos);
         *todo_uids.lock().unwrap() = uid_map;
@@ -1095,6 +1095,32 @@ fn month_label_for(date: Date) -> String {
     format!("{} {}", date.month(), date.year())
 }
 
+/// A single family member's contribution to a not-yet-merged event, before
+/// events created for multiple people (one HA calendar event per selected
+/// member -- see on_event_create_confirmed) are collapsed into one card.
+#[derive(Clone)]
+struct RawTimed {
+    summary: String,
+    time_label: String,
+    start_minutes: i32,
+    duration_minutes: i32,
+    member_index: i32,
+    color: slint::Color,
+}
+
+#[derive(Clone)]
+struct RawAllDay {
+    summary: String,
+    member_index: i32,
+    color: slint::Color,
+}
+
+#[derive(Default, Clone)]
+struct RawDayBucket {
+    timed: Vec<RawTimed>,
+    all_day: Vec<RawAllDay>,
+}
+
 #[derive(Default, Clone)]
 struct DayBucket {
     /// Both all-day and timed events, for the Month view's cell listing.
@@ -1107,6 +1133,21 @@ struct DayBucket {
     events: Vec<(i32, WeekEventData)>,
 }
 
+/// Comma-joined display name(s) for a merged event's participants, and the
+/// `member-index` sentinel that goes with it (-1 once there's more than
+/// one, so a shared event isn't hidden by toggling just one participant off
+/// in the top bar -- see the field doc on CalendarEventDot).
+fn member_label_and_index(family: &[FamilyMember], indexes: &[i32]) -> (String, i32) {
+    let label = indexes
+        .iter()
+        .filter_map(|&i| family.get(i as usize))
+        .map(|m| m.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let index = if indexes.len() == 1 { indexes[0] } else { -1 };
+    (label, index)
+}
+
 /// Builds the Month/Week/Day/Agenda projections from each member's fetched
 /// events (`per_member_events` is empty on first paint, before HA has
 /// responded -- still produces correctly-shaped, just event-less, grids).
@@ -1116,13 +1157,15 @@ struct DayBucket {
 fn build_calendar_grids(
     local_offset: UtcOffset,
     reference_date: Date,
+    family: &[FamilyMember],
     per_member_events: &[(usize, slint::Color, Vec<CalendarEvent>)],
 ) -> CalendarGrids {
     let real_today = OffsetDateTime::now_utc().to_offset(local_offset).date();
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let date_fmt = time::macros::format_description!("[year]-[month]-[day]");
 
-    let mut buckets: BTreeMap<Date, DayBucket> = BTreeMap::new();
+    // Pass 1: collect every member's events per day, unmerged.
+    let mut raw_buckets: BTreeMap<Date, RawDayBucket> = BTreeMap::new();
 
     for (member_index, color, events) in per_member_events {
         let member_index = *member_index as i32;
@@ -1139,42 +1182,100 @@ fn build_calendar_grids(
                 // block -- 20min (~21px at the default row height) turned
                 // out to be a hard target to hit precisely on a touchscreen.
                 let duration_minutes = ((local_end - local_start).whole_minutes() as i32).max(30);
-
                 let time_label = format_time_range(local_start, local_end);
-                let bucket = buckets.entry(local_start.date()).or_default();
-                bucket.month_entries.push(CalendarEventDot {
-                    summary: ev.summary.clone().into(),
-                    time_label: time_label.clone().into(),
-                    member_color: *color,
-                    member_index,
-                });
-                bucket.events.push((
+
+                raw_buckets.entry(local_start.date()).or_default().timed.push(RawTimed {
+                    summary: ev.summary.clone(),
+                    time_label,
                     start_minutes,
-                    WeekEventData {
-                        summary: ev.summary.clone().into(),
-                        time_label: time_label.into(),
-                        start_minutes,
-                        duration_minutes,
-                        member_color: *color,
-                        member_index,
-                    },
-                ));
+                    duration_minutes,
+                    member_index,
+                    color: *color,
+                });
             } else if let Some(date_str) = ev.start.date.as_deref() {
                 if let Ok(date) = Date::parse(date_str, &date_fmt) {
-                    let bucket = buckets.entry(date).or_default();
-                    bucket.month_entries.push(CalendarEventDot {
-                        summary: ev.summary.clone().into(),
-                        time_label: "All day".into(),
-                        member_color: *color,
+                    raw_buckets.entry(date).or_default().all_day.push(RawAllDay {
+                        summary: ev.summary.clone(),
                         member_index,
-                    });
-                    bucket.banners.push(AllDayBannerData {
-                        text: ev.summary.clone().into(),
-                        member_color: *color,
-                        member_index,
+                        color: *color,
                     });
                 }
             }
+        }
+    }
+
+    // Pass 2: merge events that were created for multiple family members at
+    // once -- one HA calendar event per selected member (see
+    // on_event_create_confirmed), so they arrive back from HA as separate
+    // events sharing the same summary/start/duration. Matched on those three
+    // fields per day; O(n^2) but both n (events/day) and family size are
+    // small. `per_member_events`'s outer loop above is already in family
+    // order, so each group's colors/names come out in that order too.
+    let mut buckets: BTreeMap<Date, DayBucket> = BTreeMap::new();
+    for (date, raw) in raw_buckets {
+        let bucket = buckets.entry(date).or_default();
+
+        let mut timed_groups: Vec<(RawTimed, Vec<i32>, Vec<slint::Color>)> = Vec::new();
+        for t in raw.timed {
+            if let Some(group) = timed_groups.iter_mut().find(|(g, _, _)| {
+                g.summary == t.summary
+                    && g.start_minutes == t.start_minutes
+                    && g.duration_minutes == t.duration_minutes
+            }) {
+                group.1.push(t.member_index);
+                group.2.push(t.color);
+            } else {
+                let indexes = vec![t.member_index];
+                let colors = vec![t.color];
+                timed_groups.push((t, indexes, colors));
+            }
+        }
+        for (t, indexes, colors) in timed_groups {
+            let (member_label, member_index) = member_label_and_index(family, &indexes);
+            bucket.month_entries.push(CalendarEventDot {
+                summary: t.summary.clone().into(),
+                time_label: t.time_label.clone().into(),
+                member_colors: slint::ModelRc::new(slint::VecModel::from(colors.clone())),
+                member_label: member_label.clone().into(),
+                member_index,
+            });
+            bucket.events.push((
+                t.start_minutes,
+                WeekEventData {
+                    summary: t.summary.into(),
+                    time_label: t.time_label.into(),
+                    start_minutes: t.start_minutes,
+                    duration_minutes: t.duration_minutes,
+                    member_colors: slint::ModelRc::new(slint::VecModel::from(colors)),
+                    member_label: member_label.into(),
+                    member_index,
+                },
+            ));
+        }
+
+        let mut all_day_groups: Vec<(String, Vec<i32>, Vec<slint::Color>)> = Vec::new();
+        for a in raw.all_day {
+            if let Some(group) = all_day_groups.iter_mut().find(|(s, _, _)| *s == a.summary) {
+                group.1.push(a.member_index);
+                group.2.push(a.color);
+            } else {
+                all_day_groups.push((a.summary, vec![a.member_index], vec![a.color]));
+            }
+        }
+        for (summary, indexes, colors) in all_day_groups {
+            let (member_label, member_index) = member_label_and_index(family, &indexes);
+            bucket.month_entries.push(CalendarEventDot {
+                summary: summary.clone().into(),
+                time_label: "All day".into(),
+                member_colors: slint::ModelRc::new(slint::VecModel::from(colors.clone())),
+                member_label: member_label.clone().into(),
+                member_index,
+            });
+            bucket.banners.push(AllDayBannerData {
+                text: summary.into(),
+                member_colors: slint::ModelRc::new(slint::VecModel::from(colors)),
+                member_index,
+            });
         }
     }
 
@@ -1373,5 +1474,88 @@ mod tests {
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(""))), None);
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!([255, 0]))), None);
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(null))), None);
+    }
+
+    fn member(id: &str, name: &str) -> FamilyMember {
+        FamilyMember {
+            id: id.into(),
+            name: name.into(),
+            color: "#4f8ef7".into(),
+            todo_entity: None,
+            calendar_entities: vec![format!("calendar.{id}")],
+        }
+    }
+
+    fn timed_event(summary: &str, start: &str, end: &str) -> CalendarEvent {
+        let dt = |s: &str| OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT).unwrap();
+        CalendarEvent {
+            summary: summary.into(),
+            start: ha_client::entities::CalendarDateTime { date_time: Some(dt(start)), date: None },
+            end: ha_client::entities::CalendarDateTime { date_time: Some(dt(end)), date: None },
+            description: None,
+            location: None,
+        }
+    }
+
+    // The bug this guards against: creating one event for multiple family
+    // members makes one real HA calendar event per person (see
+    // on_event_create_confirmed), so they come back from HA as separate
+    // same-summary/same-time events -- these must collapse into a single
+    // card with every participant's color, not render as fully-overlapping
+    // duplicates (which is invisible in the time-grid views, since they
+    // position events absolutely by time).
+    #[test]
+    fn merges_events_created_for_multiple_members() {
+        let family = vec![member("mom", "Mom"), member("dad", "Dad")];
+        let per_member_events = vec![
+            (
+                0,
+                slint::Color::from_rgb_u8(255, 0, 0),
+                vec![timed_event("Dog's Bath", "2026-09-17T11:00:00+00:00", "2026-09-17T12:00:00+00:00")],
+            ),
+            (
+                1,
+                slint::Color::from_rgb_u8(0, 0, 255),
+                vec![timed_event("Dog's Bath", "2026-09-17T11:00:00+00:00", "2026-09-17T12:00:00+00:00")],
+            ),
+        ];
+        let reference_date = Date::from_calendar_date(2026, Month::September, 17).unwrap();
+
+        let grids = build_calendar_grids(UtcOffset::UTC, reference_date, &family, &per_member_events);
+
+        let day = grids.day.row_data(0).unwrap();
+        assert_eq!(day.events.row_count(), 1, "expected one merged event, not two overlapping ones");
+        let merged = day.events.row_data(0).unwrap();
+        assert_eq!(merged.member_colors.row_count(), 2);
+        assert_eq!(merged.member_label, "Mom, Dad");
+        assert_eq!(merged.member_index, -1, "shared events must stay visible regardless of per-member toggling");
+    }
+
+    #[test]
+    fn keeps_solo_events_separate_and_indexed() {
+        let family = vec![member("mom", "Mom"), member("dad", "Dad")];
+        let per_member_events = vec![
+            (
+                0,
+                slint::Color::from_rgb_u8(255, 0, 0),
+                vec![timed_event("Mom's Coffee", "2026-09-17T09:00:00+00:00", "2026-09-17T10:00:00+00:00")],
+            ),
+            (
+                1,
+                slint::Color::from_rgb_u8(0, 0, 255),
+                vec![timed_event("Dad's Gym", "2026-09-17T09:00:00+00:00", "2026-09-17T10:00:00+00:00")],
+            ),
+        ];
+        let reference_date = Date::from_calendar_date(2026, Month::September, 17).unwrap();
+
+        let grids = build_calendar_grids(UtcOffset::UTC, reference_date, &family, &per_member_events);
+
+        let day = grids.day.row_data(0).unwrap();
+        assert_eq!(day.events.row_count(), 2, "different summaries must not merge");
+        for i in 0..2 {
+            let ev = day.events.row_data(i).unwrap();
+            assert_eq!(ev.member_colors.row_count(), 1);
+            assert_eq!(ev.member_index, i as i32);
+        }
     }
 }
