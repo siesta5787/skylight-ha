@@ -82,6 +82,16 @@ fn main() {
     // `Rc<RefCell<_>>` is fine -- unlike the `Arc<Mutex<_>>`s above, nothing
     // here ever crosses onto a tokio worker thread.
     let pending_slot: Rc<RefCell<Option<(Date, u8)>>> = Rc::new(RefCell::new(None));
+    // The virtual keyboard (see virtual-keyboard.slint) owns no text state
+    // itself -- Slint's expression language has no string slicing/case
+    // conversion to implement backspace/shift there, so every keystroke
+    // bubbles up here instead. UI-thread-only, same reasoning as
+    // `pending_slot`. `keyboard_target` records what "Done" should actually
+    // do with the typed text -- currently just adding a task, but built to
+    // grow (e.g. a free-text event title) without changing the keyboard
+    // component itself.
+    let keyboard_buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    let keyboard_target: Rc<RefCell<Option<KeyboardTarget>>> = Rc::new(RefCell::new(None));
 
     {
         let app_weak = app.as_weak();
@@ -125,6 +135,101 @@ fn main() {
                 // successful write that just hadn't landed yet, until the
                 // next refresh reverted it with no indication why.
                 None => tracing::warn!("not connected to HA, todo change won't be saved"),
+            }
+        });
+    }
+
+    // "Add task": opens the virtual keyboard targeted at this column.
+    {
+        let app_weak = app.as_weak();
+        let keyboard_target = keyboard_target.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        app.on_add_task_requested(move |col| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let member_name = app
+                .get_todo_columns()
+                .row_data(col as usize)
+                .map(|c| c.member_name.to_string())
+                .unwrap_or_default();
+            *keyboard_target.borrow_mut() = Some(KeyboardTarget::NewTaskSummary { column: col });
+            *keyboard_buffer.borrow_mut() = String::new();
+            app.set_keyboard_text("".into());
+            app.set_keyboard_prompt(format!("New task for {member_name}").into());
+            app.set_keyboard_open(true);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let keyboard_buffer = keyboard_buffer.clone();
+        app.on_keyboard_key_pressed(move |ch| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let mut buf = keyboard_buffer.borrow_mut();
+            buf.push_str(&ch);
+            app.set_keyboard_text(buf.clone().into());
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let keyboard_buffer = keyboard_buffer.clone();
+        app.on_keyboard_backspace_pressed(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            let mut buf = keyboard_buffer.borrow_mut();
+            buf.pop();
+            app.set_keyboard_text(buf.clone().into());
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let keyboard_target = keyboard_target.clone();
+        app.on_keyboard_cancelled(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_keyboard_open(false);
+            *keyboard_buffer.borrow_mut() = String::new();
+            keyboard_target.borrow_mut().take();
+            app.set_keyboard_text("".into());
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let todo_uids = todo_uids.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let keyboard_target = keyboard_target.clone();
+        app.on_keyboard_done(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_keyboard_open(false);
+            let text = keyboard_buffer.borrow().trim().to_string();
+            *keyboard_buffer.borrow_mut() = String::new();
+            app.set_keyboard_text("".into());
+            let Some(target) = keyboard_target.borrow_mut().take() else { return };
+            if text.is_empty() {
+                return;
+            }
+
+            match target {
+                KeyboardTarget::NewTaskSummary { column } => {
+                    let Some(entity_id) =
+                        todo_uids.lock().unwrap().get(column as usize).map(|(id, _)| id.clone())
+                    else {
+                        return;
+                    };
+                    let Some(client) = live_client.lock().unwrap().clone() else {
+                        tracing::warn!("not connected to HA, new task won't be saved");
+                        return;
+                    };
+                    rt_handle.spawn(async move {
+                        // No optimistic UI insert here (unlike the toggle
+                        // callback) -- adding a task doesn't have a
+                        // client-side uid to give it yet, and the new
+                        // item's own state_changed push (see run_ha_sync)
+                        // picks it up within moments regardless.
+                        if let Err(err) = add_todo_item(&client, &entity_id, &text).await {
+                            tracing::warn!(%err, "failed to add HA todo item");
+                        }
+                    });
+                }
             }
         });
     }
@@ -436,6 +541,31 @@ fn open_event_form(
     app.set_event_form_date_label(format!("{} {}", weekday_short(date.weekday()), date.day()).into());
     app.set_event_form_time_label(format_hour_label(hour).into());
     app.set_event_form_open(true);
+}
+
+/// What the virtual keyboard's "Done" should do with the typed text --
+/// see `keyboard_target` in `main`.
+enum KeyboardTarget {
+    NewTaskSummary { column: i32 },
+}
+
+async fn add_todo_item(
+    client: &Client,
+    entity_id: &str,
+    summary: &str,
+) -> Result<(), ha_client::connection::Error> {
+    client
+        .call(
+            "call_service",
+            serde_json::json!({
+                "domain": "todo",
+                "service": "add_item",
+                "target": { "entity_id": entity_id },
+                "service_data": { "item": summary },
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn create_calendar_event(

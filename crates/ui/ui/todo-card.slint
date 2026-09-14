@@ -47,9 +47,52 @@ component TodoRow inherits Rectangle {
     }
 }
 
+component AddTaskRow inherits Rectangle {
+    in property <color> member-color;
+    callback tapped();
+
+    height: 30px;
+
+    TouchArea {
+        clicked => { root.tapped(); }
+
+        HorizontalLayout {
+            spacing: 8px;
+            padding-left: 2px;
+            padding-right: 2px;
+
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 5px;
+                border-width: 2px;
+                border-color: member-color.with-alpha(0.5);
+
+                Text {
+                    text: "+";
+                    color: member-color;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: "Add task";
+                color: Theme.text-muted;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 component TodoColumn inherits Rectangle {
     in property <TodoColumnData> column;
     callback item-toggled(int);
+    callback add-item-requested();
 
     background: Theme.surface-alt;
     border-radius: 12px;
@@ -82,12 +125,18 @@ component TodoColumn inherits Rectangle {
             member-color: column.member-color;
             toggled => { item-toggled(idx); }
         }
+
+        AddTaskRow {
+            member-color: column.member-color;
+            tapped => { root.add-item-requested(); }
+        }
     }
 }
 
 export component TodoCard inherits Rectangle {
     in property <[TodoColumnData]> columns;
     callback item-toggled(int /* column */, int /* item */);
+    callback add-item-requested(int /* column */);
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -115,6 +164,7 @@ export component TodoCard inherits Rectangle {
                 column: column;
                 horizontal-stretch: 1;
                 item-toggled(item-idx) => { item-toggled(col-idx, item-idx); }
+                add-item-requested => { add-item-requested(col-idx); }
             }
         }
     }

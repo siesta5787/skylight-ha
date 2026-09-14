@@ -1,0 +1,188 @@
+import { Theme } from "theme.slint";
+
+component KeyButton inherits Rectangle {
+    in property <string> label;
+    callback tapped();
+
+    width: 46px;
+    height: 46px;
+    border-radius: 6px;
+    background: touch.pressed ? Theme.accent.with-alpha(0.30) : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            text: root.label;
+            font-size: 15px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component WideKeyButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback tapped();
+
+    height: 46px;
+    border-radius: 6px;
+    background: active ? Theme.accent : (touch.pressed ? Theme.border : Theme.surface-alt);
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            text: root.label;
+            font-size: 13px;
+            font-weight: 700;
+            color: active ? white : Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Full-window modal, docked to the bottom. Owns no text state itself --
+// every keystroke bubbles up to Rust (see apps/skylight-ha's
+// keyboard_buffer), since Slint's expression language has no string
+// slicing/case-conversion to implement backspace/shift locally. `text` is
+// purely for display (Rust pushes the current buffer back down after every
+// key). Doesn't dismiss on an outside tap, unlike the other modals --
+// accidentally losing what you just typed by tapping past the edge of the
+// keyboard would be a worse experience than a same-size overlay.
+export component VirtualKeyboard inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> prompt: "";
+    in property <string> text: "";
+    callback key-pressed(string);
+    callback backspace-pressed();
+    callback done();
+    callback cancelled();
+
+    property <bool> shift: false;
+    property <bool> numeric-mode: false;
+
+    visible: open;
+    width: 100%;
+    height: 100%;
+    background: #14161f99;
+    z: 2000;
+
+    Rectangle {
+        width: 660px;
+        height: 320px;
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 24px;
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            Text {
+                text: root.prompt;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-muted;
+            }
+
+            Rectangle {
+                height: 40px;
+                border-radius: 8px;
+                background: Theme.surface-alt;
+                border-width: 1px;
+                border-color: Theme.border;
+                Text {
+                    x: 10px;
+                    text: root.text;
+                    font-size: 16px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    width: parent.width - 20px;
+                }
+            }
+
+            if !root.numeric-mode: VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    for key in root.shift
+                        ? ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"]
+                        : ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    for key in root.shift
+                        ? ["A", "S", "D", "F", "G", "H", "J", "K", "L"]
+                        : ["a", "s", "d", "f", "g", "h", "j", "k", "l"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    WideKeyButton {
+                        label: "Shift";
+                        active: root.shift;
+                        tapped => { root.shift = !root.shift; }
+                    }
+                    for key in root.shift
+                        ? ["Z", "X", "C", "V", "B", "N", "M"]
+                        : ["z", "x", "c", "v", "b", "n", "m"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                    WideKeyButton { label: "Del"; tapped => { root.backspace-pressed(); } }
+                }
+            }
+
+            if root.numeric-mode: VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    for key in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    for key in ["-", "/", ":", ";", "(", ")", "$", "&", "@"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                }
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: center;
+                    for key in [".", ",", "?", "!", "'"]:
+                        KeyButton { label: key; tapped => { root.key-pressed(key); } }
+                    WideKeyButton { label: "Del"; tapped => { root.backspace-pressed(); } }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                WideKeyButton {
+                    label: root.numeric-mode ? "ABC" : "123";
+                    tapped => { root.numeric-mode = !root.numeric-mode; }
+                }
+                WideKeyButton {
+                    label: "Space";
+                    horizontal-stretch: 1;
+                    tapped => { root.key-pressed(" "); }
+                }
+                WideKeyButton { label: "Cancel"; tapped => { root.cancelled(); } }
+                WideKeyButton { label: "Done"; active: true; tapped => { root.done(); } }
+            }
+        }
+    }
+}
