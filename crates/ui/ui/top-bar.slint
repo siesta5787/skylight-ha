@@ -51,45 +51,37 @@ component MemberChip inherits Rectangle {
     }
 }
 
-component WeatherStatRow inherits Rectangle {
+component WeatherStatLine inherits Rectangle {
     in property <string> kind;
-    in property <string> label;
     in property <string> value;
 
-    height: 30px;
+    height: 14px;
 
     HorizontalLayout {
-        spacing: 12px;
+        alignment: end;
+        spacing: 5px;
 
         WeatherStatIcon {
             kind: root.kind;
-            width: 22px;
-            height: 22px;
+            width: 12px;
+            height: 12px;
             y: (parent.height - self.height) / 2;
         }
         Text {
-            text: root.label;
-            font-size: 14px;
-            color: Theme.text-primary;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        Text {
             text: root.value;
-            font-size: 14px;
-            font-weight: 600;
-            color: Theme.text-primary;
+            font-size: 10px;
+            color: Theme.text-muted;
             vertical-alignment: center;
-            horizontal-alignment: right;
         }
     }
 }
 
-// The full weather widget -- condition icon, condition label + "X minutes
-// ago", current temperature + today's high/low, and pressure/humidity/wind
-// stat rows below. Every string is pre-formatted in Rust (see
-// apply_weather in main.rs); rows with no data (empty string) are hidden
-// rather than shown blank.
+// The corner weather widget -- condition icon + label + "X minutes ago",
+// current temperature + today's high/low, and compact pressure/humidity/
+// wind lines below (icon + value only, no spelled-out labels -- there
+// isn't room for both in a corner-sized box). Every string is
+// pre-formatted in Rust (see apply_weather in main.rs); rows with no data
+// (empty string) are hidden rather than shown blank.
 export component WeatherWidget inherits Rectangle {
     in property <string> icon-condition;
     in property <string> condition-label;
@@ -100,69 +92,59 @@ export component WeatherWidget inherits Rectangle {
     in property <string> humidity;
     in property <string> wind;
 
-    background: Theme.surface-alt;
-    border-radius: Theme.radius;
-    border-width: 1px;
-    border-color: Theme.border;
+    background: transparent;
 
     VerticalLayout {
-        padding: 18px;
-        spacing: 14px;
+        spacing: 3px;
 
         HorizontalLayout {
-            spacing: 16px;
+            spacing: 8px;
 
             WeatherIcon {
                 condition: root.icon-condition;
-                width: 56px;
-                height: 56px;
+                width: 30px;
+                height: 30px;
+                y: (parent.height - self.height) / 2;
             }
 
             VerticalLayout {
                 alignment: center;
-                spacing: 2px;
                 Text {
                     text: root.condition-label == "" ? "Weather" : root.condition-label;
-                    font-size: 22px;
+                    font-size: 12px;
                     font-weight: 700;
                     color: Theme.text-primary;
+                    overflow: elide;
                 }
                 Text {
                     text: root.updated-label;
-                    font-size: 13px;
+                    font-size: 9px;
                     color: Theme.text-muted;
+                    overflow: elide;
                 }
             }
 
-            Rectangle { horizontal-stretch: 1; }
-
             VerticalLayout {
                 alignment: center;
-                spacing: 2px;
                 Text {
                     text: root.temp-now;
-                    font-size: 30px;
+                    font-size: 20px;
                     font-weight: 700;
                     color: Theme.text-primary;
                     horizontal-alignment: right;
                 }
                 Text {
                     text: root.temp-range;
-                    font-size: 13px;
+                    font-size: 9px;
                     color: Theme.text-muted;
                     horizontal-alignment: right;
                 }
             }
         }
 
-        if root.pressure != "" || root.humidity != "" || root.wind != "": Rectangle {
-            height: 1px;
-            background: Theme.border;
-        }
-
-        if root.pressure != "": WeatherStatRow { kind: "pressure"; label: "Air pressure"; value: root.pressure; }
-        if root.humidity != "": WeatherStatRow { kind: "humidity"; label: "Humidity"; value: root.humidity; }
-        if root.wind != "": WeatherStatRow { kind: "wind"; label: "Wind speed"; value: root.wind; }
+        if root.pressure != "": WeatherStatLine { kind: "pressure"; value: root.pressure; }
+        if root.humidity != "": WeatherStatLine { kind: "humidity"; value: root.humidity; }
+        if root.wind != "": WeatherStatLine { kind: "wind"; value: root.wind; }
     }
 }
 
@@ -188,7 +170,7 @@ export component TopBar inherits Rectangle {
     background: transparent;
 
     VerticalLayout {
-        spacing: 14px;
+        spacing: 10px;
 
         HorizontalLayout {
             spacing: Theme.gap;
@@ -202,6 +184,17 @@ export component TopBar inherits Rectangle {
             }
 
             Rectangle { horizontal-stretch: 1; }
+
+            WeatherWidget {
+                icon-condition: root.weather-icon-condition;
+                condition-label: root.weather-condition-label;
+                updated-label: root.weather-updated-label;
+                temp-now: root.weather-temp-now;
+                temp-range: root.weather-temp-range;
+                pressure: root.weather-pressure;
+                humidity: root.weather-humidity;
+                wind: root.weather-wind;
+            }
 
             VerticalLayout {
                 alignment: center;
@@ -219,17 +212,6 @@ export component TopBar inherits Rectangle {
                     horizontal-alignment: right;
                 }
             }
-        }
-
-        WeatherWidget {
-            icon-condition: root.weather-icon-condition;
-            condition-label: root.weather-condition-label;
-            updated-label: root.weather-updated-label;
-            temp-now: root.weather-temp-now;
-            temp-range: root.weather-temp-range;
-            pressure: root.weather-pressure;
-            humidity: root.weather-humidity;
-            wind: root.weather-wind;
         }
 
         // Scrollable rather than a plain HorizontalLayout: with a large or
