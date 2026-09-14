@@ -96,6 +96,13 @@ export component WeatherWidget inherits Rectangle {
 
     HorizontalLayout {
         spacing: 1.5px;
+        // Without this, a plain HorizontalLayout distributes any leftover
+        // width equally among children that have no explicit width (every
+        // WeatherStatLine here) instead of packing them at their natural
+        // size -- exactly the "big gaps between every item after the
+        // first" symptom this was added to fix. Same fix already used for
+        // the member-chip row below.
+        alignment: start;
 
         WeatherIcon {
             condition: root.icon-condition;
