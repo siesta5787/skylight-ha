@@ -524,23 +524,22 @@ fn main() {
         });
     }
 
-    // Dashboard controls: each fires its `call_service`, then reuses the
-    // same refresh_calendar_and_todos path event creation does, so the
-    // result shows up immediately rather than waiting for the next poll or
-    // state_changed push. No optimistic client-side model flip (unlike the
-    // todo checkbox) -- the entity's own state_changed event, which the
-    // relevant-state filter below also listens for, plus this immediate
-    // refresh, both land fast enough that one wasn't worth the extra
-    // bookkeeping of searching the nested card/entity model to mutate it.
+    // Dashboard controls: each fires its `call_service`, then refreshes --
+    // but only the dashboard page (see refresh_dashboard_only), not the
+    // full calendar+todos+weather refresh event creation uses. That full
+    // refresh is what made these feel slow (3-4s to reflect a toggle that
+    // HA itself applies almost instantly): it was doing a REST calendar
+    // fetch, a todo fetch, and 3 sequential weather calls before it ever
+    // got to the one get_states() the dashboard actually needed. No
+    // optimistic client-side model flip (unlike the todo checkbox) --
+    // this single WS round trip plus the entity's own state_changed event
+    // (which the relevant-state filter below also listens for) both land
+    // fast enough now that one wasn't worth the extra bookkeeping of
+    // searching the nested card/entity model to mutate it.
     {
         let live_client = live_client.clone();
-        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let app_weak = app.as_weak();
-        let todo_uids = todo_uids.clone();
-        let reference_date = reference_date.clone();
-        let family_state = family_state.clone();
-        let weather_entities = weather_entities.clone();
         let dashboard_sections = dashboard_sections.clone();
         app.on_dashboard_entity_toggled(move |entity_id, on| {
             let Some(client) = live_client.lock().unwrap().clone() else {
@@ -548,12 +547,7 @@ fn main() {
                 return;
             };
             let entity_id = entity_id.to_string();
-            let live_rest = live_rest.clone();
             let app_weak = app_weak.clone();
-            let todo_uids = todo_uids.clone();
-            let ref_date = *reference_date.lock().unwrap();
-            let family = family_state.lock().unwrap().clone();
-            let weather_entities = weather_entities.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
                 let domain = entity_domain(&entity_id).to_string();
@@ -562,33 +556,14 @@ fn main() {
                 {
                     tracing::warn!(%err, entity = %entity_id, "failed to toggle entity");
                 }
-                let rest = live_rest.lock().unwrap().clone();
-                if let Some(rest) = rest {
-                    refresh_calendar_and_todos(
-                        &rest,
-                        &client,
-                        &family,
-                        local_offset,
-                        ref_date,
-                        &app_weak,
-                        &todo_uids,
-                        &weather_entities,
-                        &dashboard_sections,
-                    )
-                    .await;
-                }
+                refresh_dashboard_only(&client, &dashboard_sections, &app_weak).await;
             });
         });
     }
     {
         let live_client = live_client.clone();
-        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let app_weak = app.as_weak();
-        let todo_uids = todo_uids.clone();
-        let reference_date = reference_date.clone();
-        let family_state = family_state.clone();
-        let weather_entities = weather_entities.clone();
         let dashboard_sections = dashboard_sections.clone();
         app.on_dashboard_group_toggled(move |entity_ids, on| {
             let Some(client) = live_client.lock().unwrap().clone() else {
@@ -597,12 +572,7 @@ fn main() {
             };
             let ids: Vec<String> =
                 (0..entity_ids.row_count()).filter_map(|i| entity_ids.row_data(i)).map(|s| s.to_string()).collect();
-            let live_rest = live_rest.clone();
             let app_weak = app_weak.clone();
-            let todo_uids = todo_uids.clone();
-            let ref_date = *reference_date.lock().unwrap();
-            let family = family_state.lock().unwrap().clone();
-            let weather_entities = weather_entities.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
                 // Grouped by domain rather than assumed-homogeneous -- a
@@ -620,33 +590,14 @@ fn main() {
                         tracing::warn!(%err, domain = %domain, "failed to toggle group");
                     }
                 }
-                let rest = live_rest.lock().unwrap().clone();
-                if let Some(rest) = rest {
-                    refresh_calendar_and_todos(
-                        &rest,
-                        &client,
-                        &family,
-                        local_offset,
-                        ref_date,
-                        &app_weak,
-                        &todo_uids,
-                        &weather_entities,
-                        &dashboard_sections,
-                    )
-                    .await;
-                }
+                refresh_dashboard_only(&client, &dashboard_sections, &app_weak).await;
             });
         });
     }
     {
         let live_client = live_client.clone();
-        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let app_weak = app.as_weak();
-        let todo_uids = todo_uids.clone();
-        let reference_date = reference_date.clone();
-        let family_state = family_state.clone();
-        let weather_entities = weather_entities.clone();
         let dashboard_sections = dashboard_sections.clone();
         app.on_dashboard_climate_mode_selected(move |entity_id, mode| {
             let Some(client) = live_client.lock().unwrap().clone() else {
@@ -655,12 +606,7 @@ fn main() {
             };
             let entity_id = entity_id.to_string();
             let mode = mode.to_string();
-            let live_rest = live_rest.clone();
             let app_weak = app_weak.clone();
-            let todo_uids = todo_uids.clone();
-            let ref_date = *reference_date.lock().unwrap();
-            let family = family_state.lock().unwrap().clone();
-            let weather_entities = weather_entities.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
                 if let Err(err) = client
@@ -674,21 +620,7 @@ fn main() {
                 {
                     tracing::warn!(%err, entity = %entity_id, "failed to set thermostat mode");
                 }
-                let rest = live_rest.lock().unwrap().clone();
-                if let Some(rest) = rest {
-                    refresh_calendar_and_todos(
-                        &rest,
-                        &client,
-                        &family,
-                        local_offset,
-                        ref_date,
-                        &app_weak,
-                        &todo_uids,
-                        &weather_entities,
-                        &dashboard_sections,
-                    )
-                    .await;
-                }
+                refresh_dashboard_only(&client, &dashboard_sections, &app_weak).await;
             });
         });
     }
@@ -697,10 +629,6 @@ fn main() {
         let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let app_weak = app.as_weak();
-        let todo_uids = todo_uids.clone();
-        let reference_date = reference_date.clone();
-        let family_state = family_state.clone();
-        let weather_entities = weather_entities.clone();
         let dashboard_sections = dashboard_sections.clone();
         app.on_dashboard_climate_temp_delta(move |entity_id, delta| {
             let (Some(client), Some(rest)) =
@@ -711,10 +639,6 @@ fn main() {
             };
             let entity_id = entity_id.to_string();
             let app_weak = app_weak.clone();
-            let todo_uids = todo_uids.clone();
-            let ref_date = *reference_date.lock().unwrap();
-            let family = family_state.lock().unwrap().clone();
-            let weather_entities = weather_entities.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
                 // Reads the entity's current setpoint fresh rather than
@@ -747,18 +671,7 @@ fn main() {
                 {
                     tracing::warn!(%err, entity = %entity_id, "failed to set thermostat temperature");
                 }
-                refresh_calendar_and_todos(
-                    &rest,
-                    &client,
-                    &family,
-                    local_offset,
-                    ref_date,
-                    &app_weak,
-                    &todo_uids,
-                    &weather_entities,
-                    &dashboard_sections,
-                )
-                .await;
+                refresh_dashboard_only(&client, &dashboard_sections, &app_weak).await;
             });
         });
     }
@@ -1081,6 +994,40 @@ async fn refresh_calendar_and_todos(
     });
 
     true
+}
+
+/// A lighter sibling of `refresh_calendar_and_todos` for the Dashboard
+/// page alone -- one `get_states()` round trip, no REST calendar fetch, no
+/// todo fetch, no weather calls. Used after a dashboard control (toggle/
+/// mode/temp) fires its `call_service`, where the calendar/todos/weather
+/// obviously haven't changed and waiting on them was the entire reason a
+/// toggle took 3-4 seconds to visibly react even though HA itself applied
+/// it almost immediately. Does nothing if no sections are configured.
+async fn refresh_dashboard_only(
+    client: &Client,
+    dashboard_sections: &Arc<Mutex<Vec<DashboardSection>>>,
+    app_weak: &slint::Weak<AppWindow>,
+) {
+    let sections = dashboard_sections.lock().unwrap().clone();
+    if sections.is_empty() {
+        return;
+    }
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to fetch entity states for the dashboard page");
+            return;
+        }
+    };
+    let app_weak = app_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = app_weak.upgrade() else { return };
+        let by_id: std::collections::HashMap<&str, &EntityState> =
+            states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+        let cards = build_dashboard_cards(&sections, &by_id);
+        let rows = group_dashboard_rows(cards);
+        app.set_dashboard_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+    });
 }
 
 /// Pushes whatever weather data is actually available onto the widget's
