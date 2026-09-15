@@ -56,6 +56,14 @@ export struct DashboardCardData {
     sensor-rows: [SensorRowData],
 }
 
+// One horizontal row of cards -- consecutive same-`kind` cards share a row
+// (e.g. Lights+Fans side by side, or all 3 climate cards side by side),
+// grouped in Rust (see group_dashboard_rows in main.rs) rather than here,
+// since Slint's expression language has no group-by.
+export struct DashboardRowData {
+    cards: [DashboardCardData],
+}
+
 component ToggleEntityRow inherits Rectangle {
     in property <ToggleEntityData> entity;
     callback toggled();
@@ -311,7 +319,7 @@ component SensorGroupCard inherits DashboardCard {
 }
 
 export component DashboardPage inherits Rectangle {
-    in property <[DashboardCardData]> cards;
+    in property <[DashboardRowData]> rows;
     callback entity-toggled(string, bool);
     callback group-toggled([string], bool);
     callback climate-mode-selected(string, string);
@@ -321,7 +329,7 @@ export component DashboardPage inherits Rectangle {
     border-radius: Theme.radius;
     clip: true;
 
-    if root.cards.length == 0: VerticalLayout {
+    if root.rows.length == 0: VerticalLayout {
         alignment: center;
         spacing: 6px;
         Text {
@@ -339,34 +347,41 @@ export component DashboardPage inherits Rectangle {
         }
     }
 
-    if root.cards.length > 0: Flickable {
+    if root.rows.length > 0: Flickable {
         VerticalLayout {
             padding: 18px;
             spacing: Theme.gap;
             alignment: start;
 
-            // A plain `Rectangle` wrapper here (the previous version)
-            // doesn't propagate a conditionally-shown child's size upward
-            // -- every card collapsed to zero height and they all stacked
-            // on top of each other at the same position. A `VerticalLayout`
-            // wrapper does correctly aggregate its (conditional) children's
-            // sizes, since that's a layout container's actual job.
-            for card in root.cards: VerticalLayout {
-                if card.kind == "toggle_group": ToggleGroupCard {
-                    width: 100%;
-                    card: card;
-                    entity-toggled(id, on) => { root.entity-toggled(id, on); }
-                    group-toggled(ids, on) => { root.group-toggled(ids, on); }
-                }
-                if card.kind == "climate": ClimateCard {
-                    width: 100%;
-                    card: card;
-                    mode-selected(id, mode) => { root.climate-mode-selected(id, mode); }
-                    temp-delta(id, delta) => { root.climate-temp-delta(id, delta); }
-                }
-                if card.kind == "sensor_group": SensorGroupCard {
-                    width: 100%;
-                    card: card;
+            for row in root.rows: HorizontalLayout {
+                spacing: Theme.gap;
+
+                // A plain `Rectangle` wrapper here (an earlier version)
+                // doesn't propagate a conditionally-shown child's size
+                // upward -- every card collapsed to zero size. A
+                // `VerticalLayout` wrapper does correctly aggregate its
+                // (conditional) children's sizes, since that's a layout
+                // container's actual job. `horizontal-stretch: 1` divides
+                // the row evenly across however many cards share it (1, 2,
+                // 3, ...).
+                for card in row.cards: VerticalLayout {
+                    horizontal-stretch: 1;
+                    if card.kind == "toggle_group": ToggleGroupCard {
+                        width: 100%;
+                        card: card;
+                        entity-toggled(id, on) => { root.entity-toggled(id, on); }
+                        group-toggled(ids, on) => { root.group-toggled(ids, on); }
+                    }
+                    if card.kind == "climate": ClimateCard {
+                        width: 100%;
+                        card: card;
+                        mode-selected(id, mode) => { root.climate-mode-selected(id, mode); }
+                        temp-delta(id, delta) => { root.climate-temp-delta(id, delta); }
+                    }
+                    if card.kind == "sensor_group": SensorGroupCard {
+                        width: 100%;
+                        card: card;
+                    }
                 }
             }
         }

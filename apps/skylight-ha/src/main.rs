@@ -10,8 +10,8 @@ use slint::{ComponentHandle, Model, SharedString};
 use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Weekday};
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
-    EventFormMember, MemberChipData, SensorRowData, TodoColumnData, TodoItemData,
-    ToggleEntityData, WeekDayColumnData, WeekEventData,
+    DashboardRowData, EventFormMember, MemberChipData, SensorRowData, TodoColumnData,
+    TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
 };
 
 fn main() {
@@ -1075,7 +1075,8 @@ async fn refresh_calendar_and_todos(
             let by_id: std::collections::HashMap<&str, &EntityState> =
                 states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
             let cards = build_dashboard_cards(&sections, &by_id);
-            app.set_dashboard_cards(slint::ModelRc::new(slint::VecModel::from(cards)));
+            let rows = group_dashboard_rows(cards);
+            app.set_dashboard_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
         }
     });
 
@@ -2088,6 +2089,34 @@ fn build_dashboard_cards(
         .collect()
 }
 
+/// Groups consecutive same-`kind` cards into a shared row -- e.g. a config
+/// with Lights, Downstairs, Upstairs, Fans, Sunroom AC, Garage Freezer (in
+/// that order) produces rows [Lights], [Downstairs, Upstairs], [Fans],
+/// [Sunroom AC], [Garage Freezer] rather than one card per row throughout.
+/// Reordering `config.dashboard` so same-kind sections sit next to each
+/// other is how a user controls which cards end up sharing a row -- e.g.
+/// Lights immediately followed by Fans puts them side by side.
+fn group_dashboard_rows(cards: Vec<DashboardCardData>) -> Vec<DashboardRowData> {
+    let mut rows: Vec<DashboardRowData> = Vec::new();
+    let mut current: Vec<DashboardCardData> = Vec::new();
+    let mut current_kind: Option<SharedString> = None;
+
+    for card in cards {
+        if current_kind.as_ref() != Some(&card.kind) && !current.is_empty() {
+            rows.push(DashboardRowData {
+                cards: slint::ModelRc::new(slint::VecModel::from(std::mem::take(&mut current))),
+            });
+        }
+        current_kind = Some(card.kind.clone());
+        current.push(card);
+    }
+    if !current.is_empty() {
+        rows.push(DashboardRowData { cards: slint::ModelRc::new(slint::VecModel::from(current)) });
+    }
+
+    rows
+}
+
 fn entity_domain(entity_id: &str) -> &str {
     entity_id.split('.').next().unwrap_or("")
 }
@@ -2645,6 +2674,50 @@ mod tests {
         let by_id: std::collections::HashMap<&str, &EntityState> = std::collections::HashMap::new();
         let sections = vec![DashboardSection::Climate { entity: "climate.gone".into() }];
         assert!(build_dashboard_cards(&sections, &by_id).is_empty());
+    }
+
+    fn dummy_card(kind: &str) -> DashboardCardData {
+        DashboardCardData {
+            kind: kind.into(),
+            title: kind.into(),
+            toggle_entities: slint::ModelRc::new(slint::VecModel::from(Vec::<ToggleEntityData>::new())),
+            group_is_on: false,
+            group_entity_ids: slint::ModelRc::new(slint::VecModel::from(Vec::<SharedString>::new())),
+            climate_entity_id: SharedString::default(),
+            climate_current: SharedString::default(),
+            climate_target: SharedString::default(),
+            climate_mode: SharedString::default(),
+            climate_modes: slint::ModelRc::new(slint::VecModel::from(Vec::<SharedString>::new())),
+            sensor_rows: slint::ModelRc::new(slint::VecModel::from(Vec::<SensorRowData>::new())),
+        }
+    }
+
+    #[test]
+    fn groups_consecutive_same_kind_cards_into_shared_rows() {
+        // Lights, Downstairs, Upstairs, Fans, Sunroom AC, Garage Freezer --
+        // matches the real config.toml ordering this was built for.
+        let cards = vec![
+            dummy_card("toggle_group"), // Lights
+            dummy_card("climate"),      // Downstairs
+            dummy_card("climate"),      // Upstairs
+            dummy_card("toggle_group"), // Fans
+            dummy_card("climate"),      // Sunroom AC
+            dummy_card("sensor_group"), // Garage Freezer
+        ];
+
+        let rows = group_dashboard_rows(cards);
+        let row_sizes: Vec<usize> = rows.iter().map(|r| r.cards.row_count()).collect();
+        assert_eq!(row_sizes, vec![1, 2, 1, 1, 1], "Lights alone, [Downstairs, Upstairs] together, Fans alone, Sunroom AC alone, Garage Freezer alone");
+    }
+
+    #[test]
+    fn groups_adjacent_toggle_groups_into_one_row() {
+        // The actual ask this was built for: reordering config so Lights
+        // and Fans are adjacent puts them side by side.
+        let cards = vec![dummy_card("toggle_group"), dummy_card("toggle_group")];
+        let rows = group_dashboard_rows(cards);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cards.row_count(), 2);
     }
 
     #[test]

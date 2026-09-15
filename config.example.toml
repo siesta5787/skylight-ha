@@ -56,7 +56,10 @@ token_path = "./ha-token.secret"
 # the skylight-family HA integration so it doesn't need to live in a file).
 # Each [[dashboard]] block is one card, in the order you want them shown --
 # they don't all have to be the same type, e.g. a "climate" card can sit
-# between two "toggle_group"s. Three types:
+# between two "toggle_group"s. Consecutive cards of the *same* type share a
+# row (e.g. two toggle_groups back to back render side by side instead of
+# stacked) -- reorder blocks to control what ends up next to what. Three
+# types:
 #
 #   toggle_group -- a titled group of on/off entities (lights, fans, ...)
 #   with a header switch that toggles all of them at once. Plain on/off
