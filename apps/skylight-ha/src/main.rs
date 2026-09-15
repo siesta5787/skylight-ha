@@ -232,7 +232,15 @@ fn main() {
                 app.set_pin_pad_error(error.into());
             };
 
-            match pin_flow.borrow_mut().take() {
+            // Bound to a `let` first, not `match pin_flow.borrow_mut().take() { ... }`
+            // directly -- a `RefMut` created in a `match` scrutinee stays
+            // borrowed for the entire match (same temporary-lifetime
+            // extension pitfall this codebase already hit once with a
+            // `MutexGuard` in an `if let` scrutinee), so every arm below
+            // that also does `pin_flow.borrow_mut()` would panic with
+            // "already borrowed" the instant it ran.
+            let flow = pin_flow.borrow_mut().take();
+            match flow {
                 Some(PinFlow::UnlockForNav(page)) => {
                     if is_correct(&entered) {
                         app.set_pin_unlocked(true);
