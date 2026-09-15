@@ -1,0 +1,98 @@
+import { Theme } from "theme.slint";
+
+component SettingsButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+    callback tapped();
+
+    height: 44px;
+    border-radius: 10px;
+    background: danger ? transparent : Theme.accent;
+    border-width: 1px;
+    border-color: danger ? #d9534f : Theme.accent;
+
+    TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            text: root.label;
+            font-size: 14px;
+            font-weight: 700;
+            color: danger ? #d9534f : white;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The Settings page. Just the parental PIN lock for now -- everything
+// else on this page is still to come.
+export component SettingsPage inherits Rectangle {
+    in property <bool> pin-configured;
+    callback pin-setup-requested();
+    callback pin-change-requested();
+    callback pin-disable-requested();
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: Theme.gap;
+        alignment: start;
+
+        Text {
+            text: "Settings";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+
+        Rectangle {
+            background: Theme.surface-alt;
+            border-radius: Theme.radius;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+
+                Text {
+                    text: "Parental PIN Lock";
+                    font-size: 16px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: root.pin-configured
+                        ? "PIN lock is on -- Dashboard and Settings ask for it before opening."
+                        : "PIN lock is off -- anyone can open Dashboard and Settings.";
+                    font-size: 13px;
+                    color: Theme.text-muted;
+                    wrap: word-wrap;
+                }
+
+                if !root.pin-configured: SettingsButton {
+                    label: "Set up PIN";
+                    tapped => { root.pin-setup-requested(); }
+                }
+
+                if root.pin-configured: HorizontalLayout {
+                    spacing: 10px;
+                    SettingsButton {
+                        label: "Change PIN";
+                        horizontal-stretch: 1;
+                        tapped => { root.pin-change-requested(); }
+                    }
+                    SettingsButton {
+                        label: "Turn Off PIN Lock";
+                        danger: true;
+                        horizontal-stretch: 1;
+                        tapped => { root.pin-disable-requested(); }
+                    }
+                }
+            }
+        }
+    }
+}

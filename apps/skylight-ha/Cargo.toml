@@ -23,3 +23,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # For building the `call_service` payload when creating a new HA calendar event.
 serde_json.workspace = true
+# Hashing the local 4-digit parental PIN before writing it to disk.
+sha2.workspace = true

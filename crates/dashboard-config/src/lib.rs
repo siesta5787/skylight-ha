@@ -127,6 +127,18 @@ pub struct Config {
     pub weather_backfill_entity: Option<String>,
     #[serde(default)]
     pub dashboard: Vec<DashboardSection>,
+    /// Where the (hashed) parental PIN lock lives, if one's been set up --
+    /// unlike `ha.token_path`, this file is written by the app itself
+    /// (Settings page), not user-supplied, so it's optional with a default
+    /// rather than required. Relative to the process's current working
+    /// directory, same caveat as `ha.token_path` -- keep it absolute in
+    /// the real device's `config.toml` for the same reason.
+    #[serde(default = "default_pin_hash_path")]
+    pub pin_hash_path: String,
+}
+
+fn default_pin_hash_path() -> String {
+    "pin.secret".to_string()
 }
 
 impl Config {

@@ -50,6 +50,14 @@ fn main() {
     app.set_members(slint::ModelRc::new(slint::VecModel::from(empty_chips)));
     apply_family_roster(&app, &config.family);
 
+    // Parental PIN lock -- fully local, no HA/network involved, so it's
+    // loaded synchronously right here rather than through run_ha_sync. "Is
+    // a PIN configured" is just "does the hash file exist", not a
+    // separately-tracked flag that could drift out of sync with it.
+    let pin_hash_path: Rc<String> = Rc::new(config.pin_hash_path.clone());
+    let pin_hash: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(load_pin_hash(&pin_hash_path)));
+    app.set_pin_configured(pin_hash.borrow().is_some());
+
     // Runtime is created up front (rather than just before `app.run()`, as
     // before) so its `Handle` can be captured by callbacks below that need
     // to spawn HA calls from synchronous UI callbacks.
@@ -117,6 +125,198 @@ fn main() {
     // modal on top of the form) -- reset to the default each time a new
     // slot/day/"+" is tapped, in `open_event_form`.
     let event_form_title: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // Which step of a PIN setup/change/disable/unlock flow is in progress
+    // (see PinFlow), and the digits typed so far for it -- same "Rust owns
+    // the buffer" reasoning as `keyboard_buffer` (backspace needs to
+    // remove the last character, which Slint's expression language can't
+    // do). Both UI-thread-only, like everything else in this group --
+    // hashing/file I/O for the PIN is synchronous and local, no tokio
+    // worker thread ever touches these.
+    let pin_flow: Rc<RefCell<Option<PinFlow>>> = Rc::new(RefCell::new(None));
+    let pin_buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+
+    // Parental PIN lock: every entry point just seeds `pin_flow` with the
+    // right starting step and opens the pad; `on_pin_digit_pressed` (the
+    // one handler that actually knows how to advance/finish every flow)
+    // does the rest. All synchronous, local file I/O -- no rt_handle
+    // anywhere in this feature, unlike almost everything else here.
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_nav_requested(move |page| {
+            let Some(app) = app_weak.upgrade() else { return };
+            *pin_flow.borrow_mut() = Some(PinFlow::UnlockForNav(page));
+            open_pin_pad(&app, &pin_buffer, "Enter PIN");
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_setup_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *pin_flow.borrow_mut() = Some(PinFlow::SetupFirst);
+            open_pin_pad(&app, &pin_buffer, "Set up a new PIN");
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_change_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *pin_flow.borrow_mut() = Some(PinFlow::ChangeVerifyCurrent);
+            open_pin_pad(&app, &pin_buffer, "Enter current PIN");
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_disable_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *pin_flow.borrow_mut() = Some(PinFlow::DisableVerify);
+            open_pin_pad(&app, &pin_buffer, "Enter current PIN to turn off lock");
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_pad_cancelled(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *pin_flow.borrow_mut() = None;
+            close_pin_pad(&app, &pin_buffer);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_buffer = pin_buffer.clone();
+        app.on_pin_backspace_pressed(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            pin_buffer.borrow_mut().pop();
+            app.set_pin_pad_digit_count(pin_buffer.borrow().len() as i32);
+            app.set_pin_pad_error("".into());
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        let pin_flow = pin_flow.clone();
+        let pin_buffer = pin_buffer.clone();
+        let pin_hash = pin_hash.clone();
+        let pin_hash_path = pin_hash_path.clone();
+        app.on_pin_digit_pressed(move |digit| {
+            let Some(app) = app_weak.upgrade() else { return };
+            {
+                let mut buf = pin_buffer.borrow_mut();
+                if buf.len() < 4 {
+                    buf.push_str(&digit);
+                }
+            }
+            let count = pin_buffer.borrow().len() as i32;
+            app.set_pin_pad_digit_count(count);
+            if count < 4 {
+                return;
+            }
+
+            let entered = pin_buffer.borrow().clone();
+            let is_correct = |candidate: &str| pin_hash.borrow().as_deref() == Some(hash_pin(candidate).as_str());
+            // Restart the same step on a wrong/mismatched entry rather
+            // than bouncing back to Settings -- clears the buffer/shows an
+            // error but keeps the pad open so retrying doesn't need
+            // another tap on Settings' button.
+            let retry = |app: &AppWindow, pin_buffer: &Rc<RefCell<String>>, error: &str| {
+                pin_buffer.borrow_mut().clear();
+                app.set_pin_pad_digit_count(0);
+                app.set_pin_pad_error(error.into());
+            };
+
+            match pin_flow.borrow_mut().take() {
+                Some(PinFlow::UnlockForNav(page)) => {
+                    if is_correct(&entered) {
+                        app.set_pin_unlocked(true);
+                        app.set_current_page(page);
+                        close_pin_pad(&app, &pin_buffer);
+                    } else {
+                        *pin_flow.borrow_mut() = Some(PinFlow::UnlockForNav(page));
+                        retry(&app, &pin_buffer, "Incorrect PIN");
+                    }
+                }
+                Some(PinFlow::SetupFirst) => {
+                    *pin_flow.borrow_mut() = Some(PinFlow::SetupConfirm(entered));
+                    retry(&app, &pin_buffer, "");
+                    app.set_pin_pad_prompt("Confirm new PIN".into());
+                }
+                Some(PinFlow::SetupConfirm(first)) => {
+                    if entered != first {
+                        *pin_flow.borrow_mut() = Some(PinFlow::SetupFirst);
+                        retry(&app, &pin_buffer, "PINs didn't match -- try again");
+                        app.set_pin_pad_prompt("Set up a new PIN".into());
+                    } else if let Err(err) = save_pin_hash(&pin_hash_path, &entered) {
+                        tracing::warn!(%err, "failed to save PIN");
+                        *pin_flow.borrow_mut() = Some(PinFlow::SetupFirst);
+                        retry(&app, &pin_buffer, "Couldn't save PIN, try again");
+                        app.set_pin_pad_prompt("Set up a new PIN".into());
+                    } else {
+                        *pin_hash.borrow_mut() = Some(hash_pin(&entered));
+                        app.set_pin_configured(true);
+                        close_pin_pad(&app, &pin_buffer);
+                    }
+                }
+                Some(PinFlow::ChangeVerifyCurrent) => {
+                    if is_correct(&entered) {
+                        *pin_flow.borrow_mut() = Some(PinFlow::ChangeNew);
+                        retry(&app, &pin_buffer, "");
+                        app.set_pin_pad_prompt("Enter new PIN".into());
+                    } else {
+                        *pin_flow.borrow_mut() = Some(PinFlow::ChangeVerifyCurrent);
+                        retry(&app, &pin_buffer, "Incorrect PIN");
+                    }
+                }
+                Some(PinFlow::ChangeNew) => {
+                    *pin_flow.borrow_mut() = Some(PinFlow::ChangeConfirm(entered));
+                    retry(&app, &pin_buffer, "");
+                    app.set_pin_pad_prompt("Confirm new PIN".into());
+                }
+                Some(PinFlow::ChangeConfirm(new_pin)) => {
+                    if entered != new_pin {
+                        *pin_flow.borrow_mut() = Some(PinFlow::ChangeNew);
+                        retry(&app, &pin_buffer, "PINs didn't match -- try again");
+                        app.set_pin_pad_prompt("Enter new PIN".into());
+                    } else if let Err(err) = save_pin_hash(&pin_hash_path, &entered) {
+                        tracing::warn!(%err, "failed to save PIN");
+                        *pin_flow.borrow_mut() = Some(PinFlow::ChangeNew);
+                        retry(&app, &pin_buffer, "Couldn't save PIN, try again");
+                        app.set_pin_pad_prompt("Enter new PIN".into());
+                    } else {
+                        *pin_hash.borrow_mut() = Some(hash_pin(&entered));
+                        close_pin_pad(&app, &pin_buffer);
+                    }
+                }
+                Some(PinFlow::DisableVerify) => {
+                    if is_correct(&entered) {
+                        if let Err(err) = remove_pin_hash(&pin_hash_path) {
+                            tracing::warn!(%err, "failed to remove PIN file");
+                        }
+                        *pin_hash.borrow_mut() = None;
+                        app.set_pin_configured(false);
+                        // Already legitimately in this area -- don't
+                        // immediately lock ourselves back out for having
+                        // just turned the lock off.
+                        app.set_pin_unlocked(true);
+                        close_pin_pad(&app, &pin_buffer);
+                    } else {
+                        *pin_flow.borrow_mut() = Some(PinFlow::DisableVerify);
+                        retry(&app, &pin_buffer, "Incorrect PIN");
+                    }
+                }
+                // Shouldn't happen (the pad shouldn't be open without a
+                // flow), but don't leave it stuck open if it does.
+                None => close_pin_pad(&app, &pin_buffer),
+            }
+        });
+    }
 
     {
         let app_weak = app.as_weak();
@@ -774,6 +974,21 @@ fn spawn_refresh(
     });
 }
 
+fn open_pin_pad(app: &AppWindow, pin_buffer: &Rc<RefCell<String>>, prompt: &str) {
+    pin_buffer.borrow_mut().clear();
+    app.set_pin_pad_digit_count(0);
+    app.set_pin_pad_error("".into());
+    app.set_pin_pad_prompt(prompt.into());
+    app.set_pin_pad_open(true);
+}
+
+fn close_pin_pad(app: &AppWindow, pin_buffer: &Rc<RefCell<String>>) {
+    pin_buffer.borrow_mut().clear();
+    app.set_pin_pad_open(false);
+    app.set_pin_pad_error("".into());
+    app.set_pin_pad_digit_count(0);
+}
+
 const DEFAULT_EVENT_TITLE: &str = "New Event";
 
 fn open_event_form(
@@ -804,6 +1019,54 @@ fn open_event_form(
 enum KeyboardTarget {
     NewTaskSummary { column: i32 },
     EventTitle,
+}
+
+/// Drives the parental PIN pad's multi-step flows -- see `pin_flow` in
+/// `main`. Every variant is handled by the same `on_pin_digit_pressed`,
+/// which matches on this to decide what a completed 4-digit entry means.
+enum PinFlow {
+    /// Entering the PIN to unlock Dashboard/Settings nav -- carries which
+    /// page was actually tapped, so a correct entry can switch straight to
+    /// it.
+    UnlockForNav(ui::Page),
+    /// First entry of a brand-new PIN (no existing one to check against --
+    /// any 4 digits are accepted and become the tentative PIN).
+    SetupFirst,
+    /// Re-entry to confirm a new PIN; holds the first attempt.
+    SetupConfirm(String),
+    /// Must prove the current PIN before changing it.
+    ChangeVerifyCurrent,
+    ChangeNew,
+    /// Re-entry to confirm the new PIN when changing; holds the new one.
+    ChangeConfirm(String),
+    /// Must prove the current PIN before turning the lock off entirely.
+    DisableVerify,
+}
+
+/// Hex SHA-256 of `pin`. Proportionate to the actual threat model here (a
+/// curious kid, not an attacker trying to brute-force a 4-digit code) --
+/// better than plaintext on disk without pretending this is real auth.
+fn hash_pin(pin: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pin.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn load_pin_hash(path: &str) -> Option<String> {
+    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn save_pin_hash(path: &str, pin: &str) -> std::io::Result<()> {
+    std::fs::write(path, hash_pin(pin))
+}
+
+fn remove_pin_hash(path: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 /// Which `weather.*` entities feed the weather widget -- see
@@ -2289,6 +2552,40 @@ mod tests {
 
     fn weather_state(state: &str, attributes: serde_json::Value) -> EntityState {
         EntityState { entity_id: "weather.home".into(), state: state.into(), attributes, last_updated: None }
+    }
+
+    /// A path under the OS temp dir, unique per test run via the PID plus a
+    /// caller-given tag -- avoids collisions between tests that both
+    /// exercise the pin-hash file without needing a test-only tempfile
+    /// crate dependency.
+    fn temp_pin_path(tag: &str) -> String {
+        std::env::temp_dir().join(format!("skylight-ha-test-pin-{}-{tag}.secret", std::process::id())).display().to_string()
+    }
+
+    #[test]
+    fn hashes_pin_deterministically_and_distinguishes_different_pins() {
+        assert_eq!(hash_pin("1234"), hash_pin("1234"));
+        assert_ne!(hash_pin("1234"), hash_pin("4321"));
+        // Not stored in plaintext -- the hash shouldn't just be the PIN.
+        assert_ne!(hash_pin("1234"), "1234");
+    }
+
+    #[test]
+    fn saves_loads_and_removes_pin_hash_file() {
+        let path = temp_pin_path("roundtrip");
+        let _ = std::fs::remove_file(&path); // in case a previous run left it behind
+
+        assert_eq!(load_pin_hash(&path), None, "no file yet -- no PIN configured");
+
+        save_pin_hash(&path, "1234").unwrap();
+        let loaded = load_pin_hash(&path).expect("hash should load after saving");
+        assert_eq!(loaded, hash_pin("1234"));
+
+        remove_pin_hash(&path).unwrap();
+        assert_eq!(load_pin_hash(&path), None, "removed -- no PIN configured again");
+        // Removing an already-absent file is not an error (Settings'
+        // "Turn Off" flow shouldn't fail if the file is somehow already gone).
+        assert!(remove_pin_hash(&path).is_ok());
     }
 
     #[test]

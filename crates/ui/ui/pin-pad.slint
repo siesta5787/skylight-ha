@@ -1,0 +1,163 @@
+import { Theme } from "theme.slint";
+
+component PinDigit inherits Rectangle {
+    in property <string> label;
+    callback tapped();
+
+    width: 64px;
+    height: 64px;
+    border-radius: 999px;
+    background: touch.pressed ? Theme.accent.with-alpha(0.30) : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            text: root.label;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component PinDot inherits Rectangle {
+    in property <bool> filled;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    background: filled ? Theme.accent : Theme.border;
+}
+
+// Full-window modal (numeric pad only, no letters/space/done -- Rust
+// auto-checks the instant the 4th digit lands, same as any normal PIN
+// entry screen). Owns no digit-buffer state itself, same reasoning as
+// VirtualKeyboard -- Rust needs to hash-compare and drive a multi-step
+// setup/change/disable flow anyway, so it already owns the buffer;
+// `digit-count` is Rust-computed rather than derived from a string's
+// length here (untested whether Slint's `string` even has `.length`).
+export component PinPad inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> prompt: "Enter PIN";
+    in property <string> error-text: "";
+    in property <int> digit-count: 0;
+    callback digit-pressed(string);
+    callback backspace-pressed();
+    callback cancelled();
+
+    visible: open;
+    width: 100%;
+    height: 100%;
+    background: #14161f99;
+    // Above VirtualKeyboard's 2000 -- nav-gating a page shouldn't ever be
+    // hidden behind another modal, even though in practice the two aren't
+    // expected to be open at once.
+    z: 3000;
+
+    Rectangle {
+        width: 340px;
+        height: 460px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: 24px;
+            spacing: 16px;
+            alignment: center;
+
+            Text {
+                text: root.prompt;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                height: 16px;
+                spacing: 14px;
+                alignment: center;
+                for i in 4: PinDot { filled: i < root.digit-count; }
+            }
+
+            Text {
+                text: root.error-text;
+                font-size: 12px;
+                color: #d9534f;
+                horizontal-alignment: center;
+                height: 16px;
+            }
+
+            // A single GridLayout (not independent HorizontalLayouts per
+            // row) for identical column widths -- same reasoning as the
+            // Month calendar grid in calendar-card.slint.
+            GridLayout {
+                spacing: 12px;
+                Row {
+                    PinDigit { label: "1"; tapped => { root.digit-pressed("1"); } }
+                    PinDigit { label: "2"; tapped => { root.digit-pressed("2"); } }
+                    PinDigit { label: "3"; tapped => { root.digit-pressed("3"); } }
+                }
+                Row {
+                    PinDigit { label: "4"; tapped => { root.digit-pressed("4"); } }
+                    PinDigit { label: "5"; tapped => { root.digit-pressed("5"); } }
+                    PinDigit { label: "6"; tapped => { root.digit-pressed("6"); } }
+                }
+                Row {
+                    PinDigit { label: "7"; tapped => { root.digit-pressed("7"); } }
+                    PinDigit { label: "8"; tapped => { root.digit-pressed("8"); } }
+                    PinDigit { label: "9"; tapped => { root.digit-pressed("9"); } }
+                }
+                Row {
+                    Rectangle { }
+                    PinDigit { label: "0"; tapped => { root.digit-pressed("0"); } }
+                    Rectangle {
+                        width: 64px;
+                        height: 64px;
+                        border-radius: 999px;
+                        background: touch.pressed ? Theme.border : Theme.surface-alt;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        touch := TouchArea {
+                            clicked => { root.backspace-pressed(); }
+                            Text {
+                                text: "⌫";
+                                font-size: 20px;
+                                color: Theme.text-primary;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 40px;
+                border-radius: 10px;
+                background: cancel-touch.pressed ? Theme.border : Theme.surface-alt;
+                border-width: 1px;
+                border-color: Theme.border;
+                cancel-touch := TouchArea {
+                    clicked => { root.cancelled(); }
+                    Text {
+                        text: "Cancel";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

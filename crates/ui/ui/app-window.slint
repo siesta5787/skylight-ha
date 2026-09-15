@@ -11,6 +11,8 @@ import { EventCreateForm, EventFormMember } from "event-create-form.slint";
 import { EventDetailView } from "event-detail-view.slint";
 import { VirtualKeyboard } from "virtual-keyboard.slint";
 import { DashboardPage, DashboardCardData, DashboardRowData, ToggleEntityData, SensorRowData } from "dashboard-view.slint";
+import { PinPad } from "pin-pad.slint";
+import { SettingsPage } from "settings-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -19,7 +21,7 @@ import "../assets/fonts/Inter-Regular.ttf";
 export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
     AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, DashboardRowData,
-    ToggleEntityData, SensorRowData,
+    ToggleEntityData, SensorRowData, Page,
 }
 
 component NavArrow inherits Rectangle {
@@ -141,6 +143,26 @@ export component AppWindow inherits Window {
     callback dashboard-group-toggled([string], bool);
     callback dashboard-climate-mode-selected(string, string);
     callback dashboard-climate-temp-delta(string, int);
+
+    // Parental PIN lock (Dashboard/Settings nav gating) -- see PinFlow in
+    // main.rs for the setup/change/disable state machine driving these.
+    in-out property <bool> pin-configured: false;
+    // Re-locks (see Sidebar wiring below) the moment you navigate away
+    // from Dashboard/Settings to Calendar/Tasks/Photos -- moving between
+    // Dashboard and Settings themselves does not re-lock.
+    in-out property <bool> pin-unlocked: false;
+    in property <bool> pin-pad-open: false;
+    in property <string> pin-pad-prompt: "Enter PIN";
+    in property <string> pin-pad-error: "";
+    in property <int> pin-pad-digit-count: 0;
+    callback pin-digit-pressed(string);
+    callback pin-backspace-pressed();
+    callback pin-pad-cancelled();
+    callback pin-nav-requested(Page);
+    callback pin-setup-requested();
+    callback pin-change-requested();
+    callback pin-disable-requested();
+
     // Kept out of layout entirely (not just dimmed) for whichever member a
     // top-bar chip tap has toggled off -- indexed the same as `members`.
     // Rust initializes this once (all `true`, matching `members`' length)
@@ -225,7 +247,10 @@ export component AppWindow inherits Window {
 
     // Page/view-mode switching is pure `.slint` state -- Rust never needs to
     // know which page or calendar mode is active.
-    property <Page> current-page: Page.Calendar;
+    // in-out (not the plain `property` this used to be) so Rust can also
+    // set it directly -- a correct PIN entry switches straight to
+    // whichever page was gated, from the pin_digit_pressed handler.
+    in-out property <Page> current-page: Page.Calendar;
     property <CalendarViewMode> current-calendar-mode: CalendarViewMode.Month;
 
     function show-event-detail(ev: WeekEventData) {
@@ -247,7 +272,16 @@ export component AppWindow inherits Window {
     HorizontalLayout {
         Sidebar {
             active-page: root.current-page;
-            page-selected(p) => { root.current-page = p; }
+            page-selected(p) => {
+                if (p == Page.Dashboard || p == Page.Settings) && root.pin-configured && !root.pin-unlocked {
+                    root.pin-nav-requested(p);
+                } else {
+                    root.current-page = p;
+                    if p != Page.Dashboard && p != Page.Settings {
+                        root.pin-unlocked = false;
+                    }
+                }
+            }
         }
 
         Rectangle {
@@ -410,10 +444,12 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                 }
 
-                if root.current-page == Page.Settings: PlaceholderView {
-                    title: "Settings";
-                    subtitle: "Coming soon.";
+                if root.current-page == Page.Settings: SettingsPage {
+                    pin-configured: root.pin-configured;
                     vertical-stretch: 1;
+                    pin-setup-requested => { root.pin-setup-requested(); }
+                    pin-change-requested => { root.pin-change-requested(); }
+                    pin-disable-requested => { root.pin-disable-requested(); }
                 }
             }
         }
@@ -451,5 +487,15 @@ export component AppWindow inherits Window {
         backspace-pressed => { root.keyboard-backspace-pressed(); }
         done => { root.keyboard-done(); }
         cancelled => { root.keyboard-cancelled(); }
+    }
+
+    PinPad {
+        open: root.pin-pad-open;
+        prompt: root.pin-pad-prompt;
+        error-text: root.pin-pad-error;
+        digit-count: root.pin-pad-digit-count;
+        digit-pressed(d) => { root.pin-digit-pressed(d); }
+        backspace-pressed => { root.pin-backspace-pressed(); }
+        cancelled => { root.pin-pad-cancelled(); }
     }
 }

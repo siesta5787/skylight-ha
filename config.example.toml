@@ -13,6 +13,12 @@
 # expose condition/temperature/wind) -- if omitted, the dashboard
 # auto-discovers any other weather.* entity that does have them.
 # weather_backfill_entity = "weather.forecast_home"
+# Where the (hashed, not plaintext) parental PIN lock lives once you set
+# one up from the Settings page -- the app writes this file itself, so
+# there's usually no reason to set it. Optional, defaults to "pin.secret"
+# (relative to the process's working directory, same caveat as
+# ha.token_path below -- keep it absolute on the real device).
+# pin_hash_path = "./pin.secret"
 
 [ha]
 base_url = "http://homeassistant.local:8123"
