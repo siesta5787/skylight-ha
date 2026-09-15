@@ -10,6 +10,7 @@ import { PlaceholderView } from "placeholder-view.slint";
 import { EventCreateForm, EventFormMember } from "event-create-form.slint";
 import { EventDetailView } from "event-detail-view.slint";
 import { VirtualKeyboard } from "virtual-keyboard.slint";
+import { DashboardPage, DashboardCardData, ToggleEntityData, SensorRowData } from "dashboard-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -17,7 +18,8 @@ import "../assets/fonts/Inter-Regular.ttf";
 
 export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
-    AllDayBannerData, MemberChipData, EventFormMember,
+    AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, ToggleEntityData,
+    SensorRowData,
 }
 
 component NavArrow inherits Rectangle {
@@ -134,6 +136,11 @@ export component AppWindow inherits Window {
     in property <string> weather-humidity: "";
     in property <string> weather-wind: "";
     in property <[MemberChipData]> members;
+    in property <[DashboardCardData]> dashboard-cards;
+    callback dashboard-entity-toggled(string, bool);
+    callback dashboard-group-toggled([string], bool);
+    callback dashboard-climate-mode-selected(string, string);
+    callback dashboard-climate-temp-delta(string, int);
     // Kept out of layout entirely (not just dimmed) for whichever member a
     // top-bar chip tap has toggled off -- indexed the same as `members`.
     // Rust initializes this once (all `true`, matching `members`' length)
@@ -388,10 +395,13 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.current-page == Page.Dashboard: PlaceholderView {
-                    title: "Dashboard";
-                    subtitle: "Customizable Home Assistant controls (lights, fans, and more) are coming soon.";
+                if root.current-page == Page.Dashboard: DashboardPage {
+                    cards: root.dashboard-cards;
                     vertical-stretch: 1;
+                    entity-toggled(id, on) => { root.dashboard-entity-toggled(id, on); }
+                    group-toggled(ids, on) => { root.dashboard-group-toggled(ids, on); }
+                    climate-mode-selected(id, mode) => { root.dashboard-climate-mode-selected(id, mode); }
+                    climate-temp-delta(id, delta) => { root.dashboard-climate-temp-delta(id, delta); }
                 }
 
                 if root.current-page == Page.Photos: PlaceholderView {

@@ -1,0 +1,368 @@
+import { Theme } from "theme.slint";
+import { LightBulbIcon, FanIcon, ClimateModeIcon, ThermometerIcon, BatteryIcon, SignalIcon, ToggleSwitch } from "dashboard-icon.slint";
+
+export struct ToggleEntityData {
+    entity-id: string,
+    name: string,
+    // "light" | "fan" -- the two domains this app's toggle groups actually
+    // use, derived from the entity_id's own prefix (see build_dashboard_
+    // cards in main.rs). Anything else falls back to a plain dot icon.
+    domain: string,
+    is-on: bool,
+}
+
+export struct SensorRowData {
+    label: string,
+    value: string,
+    // HA's `device_class` attribute ("temperature", "humidity", "battery",
+    // "signal_strength", ...) -- picks the row's icon. Unrecognized values
+    // fall back to a plain dot.
+    device-class: string,
+}
+
+// One Dashboard page card. Slint enums can't carry data, so this is one
+// struct with a `kind` tag and only the fields relevant to that kind
+// populated -- same pattern already used for CalendarEventDot/WeekEventData
+// (see calendar-card.slint/time-grid-view.slint) rather than three
+// separate list properties that would lose the config-file ordering
+// between different card kinds.
+export struct DashboardCardData {
+    kind: string, // "toggle_group" | "climate" | "sensor_group"
+    title: string,
+
+    // toggle_group
+    toggle-entities: [ToggleEntityData],
+    // Whether the header switch should show "on" -- computed in Rust
+    // (any entity in the group on) since Slint's expression language has
+    // no array-reduce to compute this from toggle-entities directly.
+    group-is-on: bool,
+    // Just the entity-ids from toggle-entities, parallel list -- handed
+    // straight to group-toggled on a header-switch tap. Precomputed in
+    // Rust rather than derived with a `.map()` in the callback handler
+    // below, since Slint's expression language doesn't have one.
+    group-entity-ids: [string],
+
+    // climate
+    climate-entity-id: string,
+    climate-current: string, // "75°F", already formatted
+    climate-target: string,
+    climate-mode: string,
+    // Only the hvac_modes this entity actually supports, so e.g. the
+    // Sunroom AC (off/cool only) doesn't show fan/heat buttons it would
+    // just reject.
+    climate-modes: [string],
+
+    // sensor_group
+    sensor-rows: [SensorRowData],
+}
+
+component ToggleEntityRow inherits Rectangle {
+    in property <ToggleEntityData> entity;
+    callback toggled();
+
+    height: 40px;
+    property <color> icon-color: entity.is-on ? #f5b942 : Theme.text-muted;
+
+    HorizontalLayout {
+        spacing: 10px;
+
+        Rectangle {
+            width: 22px;
+            height: 22px;
+            y: (parent.height - self.height) / 2;
+            if entity.domain == "light": LightBulbIcon { width: 100%; height: 100%; icon-color: root.icon-color; }
+            if entity.domain == "fan": FanIcon { width: 100%; height: 100%; icon-color: root.icon-color; }
+            if entity.domain != "light" && entity.domain != "fan": Rectangle {
+                width: 60%;
+                height: 60%;
+                x: parent.width * 0.20;
+                y: parent.height * 0.20;
+                border-radius: 999px;
+                background: root.icon-color;
+            }
+        }
+        Text {
+            text: entity.name;
+            font-size: 14px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        ToggleSwitch {
+            y: (parent.height - self.height) / 2;
+            is-on: entity.is-on;
+            toggled => { root.toggled(); }
+        }
+    }
+}
+
+component DashboardCard inherits Rectangle {
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+}
+
+component ToggleGroupCard inherits DashboardCard {
+    in property <DashboardCardData> card;
+    // The bool is the desired new state (not the current one) -- computed
+    // here from what's already on screen so Rust doesn't need to cache
+    // current on/off state just to know which way to flip it.
+    callback entity-toggled(string, bool);
+    callback group-toggled([string], bool);
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            Text {
+                text: root.card.title;
+                font-size: 18px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            ToggleSwitch {
+                is-on: root.card.group-is-on;
+                toggled => { root.group-toggled(root.card.group-entity-ids, !root.card.group-is-on); }
+            }
+        }
+
+        for entity in root.card.toggle-entities: ToggleEntityRow {
+            entity: entity;
+            toggled => { root.entity-toggled(entity.entity-id, !entity.is-on); }
+        }
+    }
+}
+
+component ClimateModeButton inherits Rectangle {
+    in property <string> mode;
+    in property <bool> active;
+    callback tapped();
+
+    width: 56px;
+    height: 40px;
+    border-radius: 10px;
+    background: active ? Theme.accent : Theme.surface-alt;
+    border-width: 1px;
+    border-color: active ? Theme.accent : Theme.border;
+
+    TouchArea {
+        clicked => { root.tapped(); }
+        ClimateModeIcon {
+            width: 20px;
+            height: 20px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            kind: root.mode;
+            icon-color: active ? white : Theme.text-primary;
+        }
+    }
+}
+
+component TempStepButton inherits Rectangle {
+    in property <string> glyph;
+    callback tapped();
+
+    width: 44px;
+    height: 44px;
+    border-radius: 999px;
+    background: touch.pressed ? Theme.border : Theme.surface-alt;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    touch := TouchArea {
+        clicked => { root.tapped(); }
+        Text {
+            text: root.glyph;
+            font-size: 20px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ClimateCard inherits DashboardCard {
+    in property <DashboardCardData> card;
+    callback mode-selected(string /* entity_id */, string /* mode */);
+    callback temp-delta(string /* entity_id */, int /* delta */);
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        VerticalLayout {
+            Text {
+                text: root.card.title;
+                font-size: 18px;
+                font-weight: 700;
+                color: Theme.text-primary;
+            }
+            Text {
+                text: root.card.climate-current;
+                font-size: 13px;
+                color: Theme.text-muted;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            for mode in root.card.climate-modes: ClimateModeButton {
+                mode: mode;
+                active: mode == root.card.climate-mode;
+                tapped => { root.mode-selected(root.card.climate-entity-id, mode); }
+            }
+        }
+
+        Rectangle {
+            height: 48px;
+            border-radius: 10px;
+            background: Theme.surface-alt;
+
+            HorizontalLayout {
+                padding: 2px;
+                TempStepButton {
+                    glyph: "-";
+                    tapped => { root.temp-delta(root.card.climate-entity-id, -1); }
+                }
+                Text {
+                    text: root.card.climate-target;
+                    font-size: 18px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                TempStepButton {
+                    glyph: "+";
+                    tapped => { root.temp-delta(root.card.climate-entity-id, 1); }
+                }
+            }
+        }
+    }
+}
+
+component SensorRow inherits Rectangle {
+    // Not named `row` -- that collides with a reserved Slint identifier
+    // (GridLayout's Row element).
+    in property <SensorRowData> data;
+    height: 34px;
+
+    HorizontalLayout {
+        spacing: 10px;
+
+        Rectangle {
+            width: 20px;
+            height: 20px;
+            y: (parent.height - self.height) / 2;
+            if data.device-class == "temperature": ThermometerIcon { width: 100%; height: 100%; icon-color: Theme.accent; }
+            if data.device-class == "battery": BatteryIcon { width: 100%; height: 100%; icon-color: #3fa94f; }
+            if data.device-class == "signal_strength": SignalIcon { width: 100%; height: 100%; icon-color: Theme.text-muted; }
+            if data.device-class != "temperature" && data.device-class != "battery" && data.device-class != "signal_strength": Rectangle {
+                width: 50%;
+                height: 50%;
+                x: parent.width * 0.25;
+                y: parent.height * 0.25;
+                border-radius: 999px;
+                background: Theme.text-muted;
+            }
+        }
+        Text {
+            text: data.label;
+            font-size: 14px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        Text {
+            text: data.value;
+            font-size: 14px;
+            font-weight: 600;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component SensorGroupCard inherits DashboardCard {
+    in property <DashboardCardData> card;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 10px;
+
+        Text {
+            text: root.card.title;
+            font-size: 18px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+
+        for row in root.card.sensor-rows: SensorRow { data: row; }
+    }
+}
+
+export component DashboardPage inherits Rectangle {
+    in property <[DashboardCardData]> cards;
+    callback entity-toggled(string, bool);
+    callback group-toggled([string], bool);
+    callback climate-mode-selected(string, string);
+    callback climate-temp-delta(string, int);
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    if root.cards.length == 0: VerticalLayout {
+        alignment: center;
+        spacing: 6px;
+        Text {
+            text: "Dashboard";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "No sections configured yet.";
+            font-size: 14px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+        }
+    }
+
+    if root.cards.length > 0: Flickable {
+        VerticalLayout {
+            padding: 18px;
+            spacing: Theme.gap;
+            alignment: start;
+
+            for card in root.cards: Rectangle {
+                if card.kind == "toggle_group": ToggleGroupCard {
+                    width: 100%;
+                    card: card;
+                    entity-toggled(id, on) => { root.entity-toggled(id, on); }
+                    group-toggled(ids, on) => { root.group-toggled(ids, on); }
+                }
+                if card.kind == "climate": ClimateCard {
+                    width: 100%;
+                    card: card;
+                    mode-selected(id, mode) => { root.climate-mode-selected(id, mode); }
+                    temp-delta(id, delta) => { root.climate-temp-delta(id, delta); }
+                }
+                if card.kind == "sensor_group": SensorGroupCard {
+                    width: 100%;
+                    card: card;
+                }
+            }
+        }
+    }
+}

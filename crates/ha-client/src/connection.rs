@@ -111,6 +111,34 @@ impl Client {
         Ok(serde_json::from_value(result)?)
     }
 
+    /// Calls any HA service against one or more entities in one request
+    /// (`target.entity_id` accepts an array) -- covers `light.turn_on/off`,
+    /// `fan.turn_on/off`, `climate.set_hvac_mode`, `climate.
+    /// set_temperature`, and the dashboard's group-toggle case (every
+    /// entity in a section at once), without a dedicated method per
+    /// domain. `todo_update_item`/`create_calendar_event` (apps/
+    /// skylight-ha) built this same `call_service` shape inline before
+    /// this existed; this is the generalized version.
+    pub async fn call_service(
+        &self,
+        domain: &str,
+        service: &str,
+        entity_ids: &[String],
+        service_data: Value,
+    ) -> Result<(), Error> {
+        self.call(
+            "call_service",
+            json!({
+                "domain": domain,
+                "service": service,
+                "target": { "entity_id": entity_ids },
+                "service_data": service_data,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Today's (and the next several days') forecast via the `weather.
     /// get_forecasts` service. Needs `return_response: true` -- this is a
     /// service call, not a plain query, so the result only carries HA's

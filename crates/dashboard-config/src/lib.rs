@@ -1,7 +1,5 @@
 //! Config schema for the dashboard: HA connection info, the family member
-//! roster, and the views/cards that make up the UI. Deliberately a small,
-//! typed echo of Lovelace's dashboard/view/card model rather than a general
-//! YAML-card engine.
+//! roster, weather entities, and the Dashboard page's sections.
 
 use std::path::Path;
 
@@ -73,36 +71,40 @@ pub struct FamilyMember {
     pub calendar_entities: Vec<String>,
 }
 
+/// One card on the Dashboard page. Order in `Config.dashboard` is render
+/// order, so e.g. a `Climate` card can sit between two `ToggleGroup`s.
+/// Usually built at connect time from (in priority order, see
+/// `apps/skylight-ha`'s `run_ha_sync`): `dashboard` below if non-empty (a
+/// manual override, same pattern as `family`/`weather_entity`), else the
+/// `siesta5787/skylight-family` HA integration's `sensor.skylight_
+/// dashboard_*` entities if any exist (not yet implemented on that
+/// integration's side -- `discover_dashboard_sections` in main.rs returns
+/// `None` until it is).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum Card {
-    Calendar {
-        /// Family member ids whose calendars should be shown; empty = all.
-        #[serde(default)]
-        members: Vec<String>,
+pub enum DashboardSection {
+    /// A titled group of on/off entities with a header switch that toggles
+    /// all of them at once -- e.g. "Lights" or "Fans". Brightness/speed
+    /// control is out of scope; this is plain on/off, matching what the
+    /// reference Lovelace dashboard this was modeled on actually shows.
+    ToggleGroup {
+        title: String,
+        entities: Vec<String>,
     },
-    TodoList {
-        /// Family member ids to show as columns/tabs; empty = all.
-        #[serde(default)]
-        members: Vec<String>,
-    },
-    Weather {
+    /// One `climate.*` entity: mode buttons (only for whichever of off/
+    /// fan_only/cool/heat the entity's own `hvac_modes` supports) plus a
+    /// +/- temperature stepper. No `title` -- the card header is the
+    /// entity's own `friendly_name`.
+    Climate {
         entity: String,
     },
-    Clock,
-    EntityTile {
-        entity: String,
-        label: Option<String>,
+    /// A titled group of read-only sensor rows (e.g. a device's
+    /// temperature/battery/signal-strength sensors, each its own HA
+    /// entity but shown together under one device name).
+    SensorGroup {
+        title: String,
+        entities: Vec<String>,
     },
-    Media {
-        entity: String,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct View {
-    pub name: String,
-    pub cards: Vec<Card>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -123,7 +125,8 @@ pub struct Config {
     /// those attributes (see discover_weather_backfill_entity).
     #[serde(default)]
     pub weather_backfill_entity: Option<String>,
-    pub views: Vec<View>,
+    #[serde(default)]
+    pub dashboard: Vec<DashboardSection>,
 }
 
 impl Config {
@@ -135,11 +138,6 @@ impl Config {
         })?;
         let config: Config = toml::from_str(&raw)?;
         Ok(config)
-    }
-
-    /// The default/home view is always the first one defined in config.
-    pub fn home_view(&self) -> Option<&View> {
-        self.views.first()
     }
 
     pub fn member(&self, id: &str) -> Option<&FamilyMember> {
@@ -166,17 +164,38 @@ mod tests {
             name = "Alice"
             color = "#4f8ef7"
             todo_entity = "todo.chores_alice"
-
-            [[views]]
-            name = "Home"
-            [[views.cards]]
-            type = "calendar"
-            [[views.cards]]
-            type = "todo_list"
         "##;
         let config: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(config.family.len(), 1);
-        assert_eq!(config.home_view().unwrap().cards.len(), 2);
         assert!(config.member("alice").is_some());
+        assert!(config.dashboard.is_empty());
+    }
+
+    #[test]
+    fn parses_dashboard_sections() {
+        let toml_src = r##"
+            [ha]
+            base_url = "http://homeassistant.local:8123"
+            token_path = "/etc/skylight-ha/token"
+
+            [[dashboard]]
+            type = "toggle_group"
+            title = "Lights"
+            entities = ["light.family_room", "light.kitchen"]
+
+            [[dashboard]]
+            type = "climate"
+            entity = "climate.upstairs"
+
+            [[dashboard]]
+            type = "sensor_group"
+            title = "Garage Freezer"
+            entities = ["sensor.garage_freezer_temperature"]
+        "##;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.dashboard.len(), 3);
+        assert!(matches!(config.dashboard[0], DashboardSection::ToggleGroup { .. }));
+        assert!(matches!(config.dashboard[1], DashboardSection::Climate { .. }));
+        assert!(matches!(config.dashboard[2], DashboardSection::SensorGroup { .. }));
     }
 }

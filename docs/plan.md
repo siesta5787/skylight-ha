@@ -77,12 +77,14 @@ skylight-ha/
 **`dashboard-config`**
 - TOML config: HA base URL, token (loaded from file with restricted permissions,
   never embedded in the binary), a roster of **family members** (name, color,
-  their `todo.*` entity id, optionally their calendar entity id), and a list of
-  *views*, each a grid of *cards* (`Calendar`, `TodoList`, `Weather`, `Clock`,
-  `EntityTile`, `Media`, ...) — deliberately a simplified, typed echo of
-  Lovelace's dashboard/view/card model rather than a full YAML-card engine. The
-  `TodoList` card renders one column/tab per roster member rather than a single
-  merged list.
+  their `todo.*` entity id, optionally their calendar entity id(s)), weather
+  entity overrides, and the Dashboard page's own cards (`dashboard`, a flat
+  ordered list of `DashboardSection`: `ToggleGroup` for lights/fans,
+  `Climate` for a thermostat/AC, `SensorGroup` for read-only sensor rows).
+  Calendar/Tasks are hardcoded pages, not config-driven cards -- the
+  Calendar/TodoList/Weather/Clock card types an earlier version of this
+  schema had were dead code (nothing ever read them) and were removed when
+  the Dashboard page's real schema replaced them.
 
 **`ui`**
 - `.slint` files per card type (`calendar-card.slint`, `todo-card.slint`,
@@ -113,11 +115,12 @@ skylight-ha/
   `todo.chores_alice`, `todo.chores_bob`), with checkable items that push
   updates back to HA. Interactive, not just a readout, since it's a family
   workflow tool.
-- **Dashboard and Photos pages**: exist as nav entries now but are inert
-  placeholders. Dashboard is meant to become a customizable view of HA
-  entities (lights, fans, ...) — `dashboard-config`'s `Card::EntityTile` /
-  `Card::Weather` variants already anticipate this, just not wired to a page
-  yet. Photos is meant to eventually show an Immich library.
+- **Dashboard page**: a customizable view of HA entities (lights, fans,
+  climate/AC, read-only sensors), config-driven via `dashboard-config`'s
+  `DashboardSection` (Phase 1; a later phase moves section/entity
+  management into the skylight-family HA integration instead of a config
+  file, same as the family roster). **Photos page**: still an inert
+  placeholder, meant to eventually show an Immich library.
 - Secondary HA-entity views beyond Dashboard (media, energy — tunet-style
   tiles) are architected for via the card/view system but **not built in
   v1**.

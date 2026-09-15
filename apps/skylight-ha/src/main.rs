@@ -3,14 +3,15 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use dashboard_config::{Config, FamilyMember};
+use dashboard_config::{Config, DashboardSection, FamilyMember};
 use ha_client::entities::{CalendarEvent, DailyForecast, EntityState, TodoItem, TodoStatus};
 use ha_client::{Client, RestClient};
 use slint::{ComponentHandle, Model, SharedString};
 use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Weekday};
 use ui::{
-    AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, EventFormMember,
-    MemberChipData, TodoColumnData, TodoItemData, WeekDayColumnData, WeekEventData,
+    AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
+    EventFormMember, MemberChipData, SensorRowData, TodoColumnData, TodoItemData,
+    ToggleEntityData, WeekDayColumnData, WeekEventData,
 };
 
 fn main() {
@@ -79,6 +80,13 @@ fn main() {
         primary: config.weather_entity.clone(),
         backfill: config.weather_backfill_entity.clone(),
     }));
+    // The Dashboard page's cards -- `config.dashboard` if non-empty, else
+    // auto-discovered from `sensor.skylight_dashboard_*` entities (Phase 2,
+    // not yet built on the skylight-family HA integration's side --
+    // `discover_dashboard_sections` returns `None` until it is). Same
+    // override-else-auto-discover shape as `family_state`/`weather_entities`.
+    let dashboard_sections: Arc<Mutex<Vec<DashboardSection>>> =
+        Arc::new(Mutex::new(config.dashboard.clone()));
     // (column index into the Tasks page) -> (that column's todo entity id,
     // the uid of each item) -- only members with a todo_entity get a
     // column, so this is a *different*, potentially shorter, index space
@@ -338,6 +346,7 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         let app_weak = app.as_weak();
         app.on_event_create_confirmed(move |selected_members, duration_minutes| {
             let Some((date, hour)) = pending_slot.borrow_mut().take() else { return };
@@ -377,6 +386,7 @@ fn main() {
             let live_rest = live_rest.clone();
             let todo_uids = todo_uids.clone();
             let weather_entities = weather_entities.clone();
+            let dashboard_sections = dashboard_sections.clone();
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
             rt_handle.spawn(async move {
@@ -404,6 +414,7 @@ fn main() {
                         &app_weak,
                         &todo_uids,
                         &weather_entities,
+                        &dashboard_sections,
                     )
                     .await;
                 }
@@ -424,6 +435,7 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_nav_month(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -432,7 +444,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -444,6 +456,7 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_nav_week(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -452,7 +465,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -464,6 +477,7 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_nav_day(move |delta| {
             let new_date = {
                 let mut guard = reference_date.lock().unwrap();
@@ -472,7 +486,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -484,12 +498,13 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_nav_today(move || {
             let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
             *reference_date.lock().unwrap() = new_date;
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -501,10 +516,250 @@ fn main() {
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
         let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_manual_refresh_requested(move || {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entities);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+        });
+    }
+
+    // Dashboard controls: each fires its `call_service`, then reuses the
+    // same refresh_calendar_and_todos path event creation does, so the
+    // result shows up immediately rather than waiting for the next poll or
+    // state_changed push. No optimistic client-side model flip (unlike the
+    // todo checkbox) -- the entity's own state_changed event, which the
+    // relevant-state filter below also listens for, plus this immediate
+    // refresh, both land fast enough that one wasn't worth the extra
+    // bookkeeping of searching the nested card/entity model to mutate it.
+    {
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family_state = family_state.clone();
+        let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
+        app.on_dashboard_entity_toggled(move |entity_id, on| {
+            let Some(client) = live_client.lock().unwrap().clone() else {
+                tracing::warn!("not connected to HA, can't toggle entity");
+                return;
+            };
+            let entity_id = entity_id.to_string();
+            let live_rest = live_rest.clone();
+            let app_weak = app_weak.clone();
+            let todo_uids = todo_uids.clone();
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
+            let weather_entities = weather_entities.clone();
+            let dashboard_sections = dashboard_sections.clone();
+            rt_handle.spawn(async move {
+                let domain = entity_domain(&entity_id).to_string();
+                let service = if on { "turn_on" } else { "turn_off" };
+                if let Err(err) = client.call_service(&domain, service, &[entity_id.clone()], serde_json::json!({})).await
+                {
+                    tracing::warn!(%err, entity = %entity_id, "failed to toggle entity");
+                }
+                let rest = live_rest.lock().unwrap().clone();
+                if let Some(rest) = rest {
+                    refresh_calendar_and_todos(
+                        &rest,
+                        &client,
+                        &family,
+                        local_offset,
+                        ref_date,
+                        &app_weak,
+                        &todo_uids,
+                        &weather_entities,
+                        &dashboard_sections,
+                    )
+                    .await;
+                }
+            });
+        });
+    }
+    {
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family_state = family_state.clone();
+        let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
+        app.on_dashboard_group_toggled(move |entity_ids, on| {
+            let Some(client) = live_client.lock().unwrap().clone() else {
+                tracing::warn!("not connected to HA, can't toggle group");
+                return;
+            };
+            let ids: Vec<String> =
+                (0..entity_ids.row_count()).filter_map(|i| entity_ids.row_data(i)).map(|s| s.to_string()).collect();
+            let live_rest = live_rest.clone();
+            let app_weak = app_weak.clone();
+            let todo_uids = todo_uids.clone();
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
+            let weather_entities = weather_entities.clone();
+            let dashboard_sections = dashboard_sections.clone();
+            rt_handle.spawn(async move {
+                // Grouped by domain rather than assumed-homogeneous -- a
+                // config section is expected to be all-light or all-fan,
+                // but this stays correct even if someone mixes domains in
+                // one section, since `light.turn_on`/`fan.turn_on` are
+                // different services.
+                let mut by_domain: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+                for id in ids {
+                    by_domain.entry(entity_domain(&id).to_string()).or_default().push(id);
+                }
+                let service = if on { "turn_on" } else { "turn_off" };
+                for (domain, ids) in by_domain {
+                    if let Err(err) = client.call_service(&domain, service, &ids, serde_json::json!({})).await {
+                        tracing::warn!(%err, domain = %domain, "failed to toggle group");
+                    }
+                }
+                let rest = live_rest.lock().unwrap().clone();
+                if let Some(rest) = rest {
+                    refresh_calendar_and_todos(
+                        &rest,
+                        &client,
+                        &family,
+                        local_offset,
+                        ref_date,
+                        &app_weak,
+                        &todo_uids,
+                        &weather_entities,
+                        &dashboard_sections,
+                    )
+                    .await;
+                }
+            });
+        });
+    }
+    {
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family_state = family_state.clone();
+        let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
+        app.on_dashboard_climate_mode_selected(move |entity_id, mode| {
+            let Some(client) = live_client.lock().unwrap().clone() else {
+                tracing::warn!("not connected to HA, can't set thermostat mode");
+                return;
+            };
+            let entity_id = entity_id.to_string();
+            let mode = mode.to_string();
+            let live_rest = live_rest.clone();
+            let app_weak = app_weak.clone();
+            let todo_uids = todo_uids.clone();
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
+            let weather_entities = weather_entities.clone();
+            let dashboard_sections = dashboard_sections.clone();
+            rt_handle.spawn(async move {
+                if let Err(err) = client
+                    .call_service(
+                        "climate",
+                        "set_hvac_mode",
+                        &[entity_id.clone()],
+                        serde_json::json!({ "hvac_mode": mode }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%err, entity = %entity_id, "failed to set thermostat mode");
+                }
+                let rest = live_rest.lock().unwrap().clone();
+                if let Some(rest) = rest {
+                    refresh_calendar_and_todos(
+                        &rest,
+                        &client,
+                        &family,
+                        local_offset,
+                        ref_date,
+                        &app_weak,
+                        &todo_uids,
+                        &weather_entities,
+                        &dashboard_sections,
+                    )
+                    .await;
+                }
+            });
+        });
+    }
+    {
+        let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        let todo_uids = todo_uids.clone();
+        let reference_date = reference_date.clone();
+        let family_state = family_state.clone();
+        let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
+        app.on_dashboard_climate_temp_delta(move |entity_id, delta| {
+            let (Some(client), Some(rest)) =
+                (live_client.lock().unwrap().clone(), live_rest.lock().unwrap().clone())
+            else {
+                tracing::warn!("not connected to HA, can't change thermostat temperature");
+                return;
+            };
+            let entity_id = entity_id.to_string();
+            let app_weak = app_weak.clone();
+            let todo_uids = todo_uids.clone();
+            let ref_date = *reference_date.lock().unwrap();
+            let family = family_state.lock().unwrap().clone();
+            let weather_entities = weather_entities.clone();
+            let dashboard_sections = dashboard_sections.clone();
+            rt_handle.spawn(async move {
+                // Reads the entity's current setpoint fresh rather than
+                // caching it client-side -- a +/- tap is infrequent enough
+                // that the extra round trip doesn't matter, and it avoids
+                // keeping a second copy of dashboard state in sync with
+                // what's actually on screen.
+                let state = match rest.entity_state(&entity_id).await {
+                    Ok(state) => state,
+                    Err(err) => {
+                        tracing::warn!(%err, entity = %entity_id, "failed to read current thermostat state");
+                        return;
+                    }
+                };
+                let Some(current) = state.attributes.get("temperature").and_then(|v| v.as_f64()) else {
+                    tracing::warn!(entity = %entity_id, "thermostat has no current setpoint to adjust");
+                    return;
+                };
+                let min = state.attributes.get("min_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let max = state.attributes.get("max_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+                let new_target = (current + delta as f64).clamp(min, max);
+                if let Err(err) = client
+                    .call_service(
+                        "climate",
+                        "set_temperature",
+                        &[entity_id.clone()],
+                        serde_json::json!({ "temperature": new_target }),
+                    )
+                    .await
+                {
+                    tracing::warn!(%err, entity = %entity_id, "failed to set thermostat temperature");
+                }
+                refresh_calendar_and_todos(
+                    &rest,
+                    &client,
+                    &family,
+                    local_offset,
+                    ref_date,
+                    &app_weak,
+                    &todo_uids,
+                    &weather_entities,
+                    &dashboard_sections,
+                )
+                .await;
+            });
         });
     }
 
@@ -535,6 +790,7 @@ fn main() {
         reference_date,
         family_state,
         weather_entities,
+        dashboard_sections,
     ));
 
     app.run().expect("event loop error");
@@ -577,6 +833,7 @@ fn spawn_refresh(
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
     weather_entities: &Arc<Mutex<WeatherEntities>>,
+    dashboard_sections: &Arc<Mutex<Vec<DashboardSection>>>,
 ) {
     let (Some(rest), Some(client)) =
         (live_rest.lock().unwrap().clone(), live_client.lock().unwrap().clone())
@@ -587,6 +844,7 @@ fn spawn_refresh(
     let app_weak = app_weak.clone();
     let todo_uids = todo_uids.clone();
     let weather_entities = weather_entities.clone();
+    let dashboard_sections = dashboard_sections.clone();
     rt_handle.spawn(async move {
         refresh_calendar_and_todos(
             &rest,
@@ -597,6 +855,7 @@ fn spawn_refresh(
             &app_weak,
             &todo_uids,
             &weather_entities,
+            &dashboard_sections,
         )
         .await;
     });
@@ -703,6 +962,7 @@ async fn refresh_calendar_and_todos(
     app_weak: &slint::Weak<AppWindow>,
     todo_uids: &Arc<Mutex<Vec<(String, Vec<String>)>>>,
     weather_entities: &Arc<Mutex<WeatherEntities>>,
+    dashboard_sections: &Arc<Mutex<Vec<DashboardSection>>>,
 ) -> bool {
     let (grid_start, grid_end) = month_grid_range(reference_date);
     let range_start = grid_start.midnight().assume_offset(local_offset);
@@ -761,6 +1021,31 @@ async fn refresh_calendar_and_todos(
         None => None,
     };
 
+    // One `get_states()` covers every configured dashboard entity in a
+    // single round trip, same as the family/weather discovery scans --
+    // cheap at a home instance's scale, and simpler than a REST call per
+    // entity. Only the raw states are fetched here -- `EntityState` is a
+    // plain (Send) serde struct, but `DashboardCardData` embeds `ModelRc`s
+    // internally (same as every other Slint-facing struct this function
+    // builds), so turning these into cards has to happen below, inside
+    // `invoke_from_event_loop`, same as `build_calendar_grids`/
+    // `build_todo_model`. `None` on failure means "leave the dashboard
+    // page as it was" (same don't-flash-to-placeholder reasoning as the
+    // weather fetches above) -- an empty `sections` list is different,
+    // that's a legitimate "nothing configured" state, not a failure.
+    let sections = dashboard_sections.lock().unwrap().clone();
+    let dashboard_states: Option<Vec<EntityState>> = if sections.is_empty() {
+        Some(Vec::new())
+    } else {
+        match client.get_states().await {
+            Ok(states) => Some(states),
+            Err(err) => {
+                tracing::warn!(%err, "failed to fetch entity states for the dashboard page");
+                None
+            }
+        }
+    };
+
     if !connection_alive {
         // Don't push this over what's already correctly on screen -- a
         // dead-connection fetch means `per_member_todos` is empty for
@@ -786,6 +1071,12 @@ async fn refresh_calendar_and_todos(
         app.set_todo_columns(todo_columns);
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
         apply_weather(&app, weather.as_ref(), forecast_today.as_ref(), backfill.as_ref());
+        if let Some(states) = &dashboard_states {
+            let by_id: std::collections::HashMap<&str, &EntityState> =
+                states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+            let cards = build_dashboard_cards(&sections, &by_id);
+            app.set_dashboard_cards(slint::ModelRc::new(slint::VecModel::from(cards)));
+        }
     });
 
     true
@@ -862,6 +1153,7 @@ async fn run_ha_sync(
     reference_date: Arc<Mutex<Date>>,
     family_state: Arc<Mutex<Vec<FamilyMember>>>,
     weather_entities: Arc<Mutex<WeatherEntities>>,
+    dashboard_sections: Arc<Mutex<Vec<DashboardSection>>>,
 ) {
     let token = match config.ha.load_token() {
         Ok(token) => token,
@@ -955,6 +1247,20 @@ async fn run_ha_sync(
             }
         }
 
+        // Same retry-every-reconnect-until-found shape as weather above --
+        // no per-card UI state a re-resolve could disturb, so there's no
+        // reason to resolve only once like the family roster does.
+        let current_sections = dashboard_sections.lock().unwrap().clone();
+        if current_sections.is_empty() {
+            if let Some(discovered) = discover_dashboard_sections(&client).await {
+                tracing::info!(
+                    count = discovered.len(),
+                    "loaded dashboard sections from the Skylight Dashboard integration"
+                );
+                *dashboard_sections.lock().unwrap() = discovered;
+            }
+        }
+
         // Calendar event ranges aren't pushed over the WS event bus (per
         // docs/plan.md), only polled -- but a todo entity's own `state` is
         // its needs-action count, which *does* change (and gets pushed as
@@ -980,7 +1286,17 @@ async fn run_ha_sync(
                             .unwrap()
                             .iter()
                             .any(|m| m.todo_entity.as_deref() == Some(state.entity_id.as_str()));
-                        if is_todo { Wake::RelevantStateChange } else { Wake::Irrelevant }
+                        // Same near-instant treatment for dashboard entities
+                        // -- a light toggled from the HA app or a physical
+                        // switch should reflect here without waiting for
+                        // the 5-minute poll, same as a todo checked off
+                        // from a phone.
+                        let is_dashboard = dashboard_sections
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|section| dashboard_section_contains(section, &state.entity_id));
+                        if is_todo || is_dashboard { Wake::RelevantStateChange } else { Wake::Irrelevant }
                     }
                     // Lagged just means we missed some events under load --
                     // refreshing anyway is the safe default. A closed
@@ -1011,6 +1327,7 @@ async fn run_ha_sync(
                 &app_weak,
                 &todo_uids,
                 &weather_entities,
+                &dashboard_sections,
             )
             .await;
             if !alive {
@@ -1209,6 +1526,66 @@ async fn discover_weather_backfill_entity(client: &Client, primary: Option<&str>
                 && (s.attributes.get("humidity").is_some() || s.attributes.get("pressure").is_some())
         })
         .map(|s| s.entity_id)
+}
+
+/// Dashboard sections from `sensor.skylight_dashboard_*` entities (Phase 2
+/// -- github.com/siesta5787/skylight-family extended with a "Dashboard
+/// Section" subentry type, same pattern as `sensor.skylight_family_*`).
+/// Not built on that integration's side yet, so this always returns
+/// `None` today; `config.dashboard` is the only working source until it
+/// is. Expected attribute shape once it exists: `section_type` ("toggle_
+/// group"/"climate"/"sensor_group"), `title`, `entities` (a list; for
+/// `climate` just the one entry is used).
+async fn discover_dashboard_sections(client: &Client) -> Option<Vec<DashboardSection>> {
+    let states = match client.get_states().await {
+        Ok(states) => states,
+        Err(err) => {
+            tracing::warn!(%err, "failed to list HA entities while checking for Skylight Dashboard sections");
+            return None;
+        }
+    };
+
+    let mut sections = Vec::new();
+    for state in &states {
+        if !state.entity_id.starts_with("sensor.skylight_dashboard_") {
+            continue;
+        }
+        let section_type = state.attributes.get("section_type").and_then(|v| v.as_str());
+        let title = state
+            .attributes
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let entities: Vec<String> = state
+            .attributes
+            .get("entities")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+
+        match section_type {
+            Some("toggle_group") => sections.push(DashboardSection::ToggleGroup { title, entities }),
+            Some("sensor_group") => sections.push(DashboardSection::SensorGroup { title, entities }),
+            Some("climate") => {
+                if let Some(entity) = entities.into_iter().next() {
+                    sections.push(DashboardSection::Climate { entity });
+                }
+            }
+            _ => tracing::warn!(entity = %state.entity_id, ?section_type, "unrecognized dashboard section_type"),
+        }
+    }
+
+    if sections.is_empty() { None } else { Some(sections) }
+}
+
+fn dashboard_section_contains(section: &DashboardSection, entity_id: &str) -> bool {
+    match section {
+        DashboardSection::ToggleGroup { entities, .. } | DashboardSection::SensorGroup { entities, .. } => {
+            entities.iter().any(|e| e == entity_id)
+        }
+        DashboardSection::Climate { entity } => entity == entity_id,
+    }
 }
 
 async fn fetch_calendar_events(
@@ -1600,6 +1977,166 @@ fn build_todo_model(
     (slint::ModelRc::new(slint::VecModel::from(columns)), uid_map, chips)
 }
 
+/// Builds the Dashboard page's cards from the configured sections and a
+/// snapshot of every HA entity's state (see `refresh_calendar_and_todos`).
+/// A section referencing an entity that isn't in `states` (not fetched
+/// yet, or deleted from HA) just skips that one row/card rather than
+/// showing something broken -- `SensorGroup`/`ToggleGroup` skip the
+/// missing entity and keep the rest; `Climate` (a single entity) skips
+/// the whole card if its one entity is missing.
+fn build_dashboard_cards(
+    sections: &[DashboardSection],
+    states: &std::collections::HashMap<&str, &EntityState>,
+) -> Vec<DashboardCardData> {
+    let empty_toggle_entities = || slint::ModelRc::new(slint::VecModel::from(Vec::<ToggleEntityData>::new()));
+    let empty_strings = || slint::ModelRc::new(slint::VecModel::from(Vec::<SharedString>::new()));
+    let empty_sensor_rows = || slint::ModelRc::new(slint::VecModel::from(Vec::<SensorRowData>::new()));
+
+    sections
+        .iter()
+        .filter_map(|section| match section {
+            DashboardSection::ToggleGroup { title, entities } => {
+                let toggle_entities: Vec<ToggleEntityData> = entities
+                    .iter()
+                    .filter_map(|id| {
+                        let state = *states.get(id.as_str())?;
+                        Some(ToggleEntityData {
+                            entity_id: id.clone().into(),
+                            name: entity_friendly_name(state).into(),
+                            domain: entity_domain(id).into(),
+                            is_on: state.state == "on",
+                        })
+                    })
+                    .collect();
+                let group_is_on = toggle_entities.iter().any(|e| e.is_on);
+                let group_entity_ids: Vec<SharedString> =
+                    toggle_entities.iter().map(|e| e.entity_id.clone()).collect();
+                Some(DashboardCardData {
+                    kind: "toggle_group".into(),
+                    title: title.clone().into(),
+                    toggle_entities: slint::ModelRc::new(slint::VecModel::from(toggle_entities)),
+                    group_is_on,
+                    group_entity_ids: slint::ModelRc::new(slint::VecModel::from(group_entity_ids)),
+                    climate_entity_id: SharedString::default(),
+                    climate_current: SharedString::default(),
+                    climate_target: SharedString::default(),
+                    climate_mode: SharedString::default(),
+                    climate_modes: empty_strings(),
+                    sensor_rows: empty_sensor_rows(),
+                })
+            }
+            DashboardSection::Climate { entity } => {
+                let state = *states.get(entity.as_str())?;
+                let current = state.attributes.get("current_temperature").and_then(|v| v.as_f64());
+                let target = state.attributes.get("temperature").and_then(|v| v.as_f64());
+                let hvac_mode = state.state.clone();
+                let hvac_modes: Vec<SharedString> = state
+                    .attributes
+                    .get("hvac_modes")
+                    .and_then(|v| v.as_array())
+                    .map(|modes| modes.iter().filter_map(|m| m.as_str()).map(SharedString::from).collect())
+                    .unwrap_or_default();
+                let current_label = match current {
+                    Some(c) => format!("{} · {}", capitalize_first(&hvac_mode), format_climate_temp(c)),
+                    None => capitalize_first(&hvac_mode),
+                };
+                Some(DashboardCardData {
+                    kind: "climate".into(),
+                    title: entity_friendly_name(state).into(),
+                    toggle_entities: empty_toggle_entities(),
+                    group_is_on: false,
+                    group_entity_ids: empty_strings(),
+                    climate_entity_id: entity.clone().into(),
+                    climate_current: current_label.into(),
+                    climate_target: target.map(format_climate_temp).unwrap_or_default().into(),
+                    climate_mode: hvac_mode.into(),
+                    climate_modes: slint::ModelRc::new(slint::VecModel::from(hvac_modes)),
+                    sensor_rows: empty_sensor_rows(),
+                })
+            }
+            DashboardSection::SensorGroup { title, entities } => {
+                let rows: Vec<SensorRowData> = entities
+                    .iter()
+                    .filter_map(|id| {
+                        let state = *states.get(id.as_str())?;
+                        let unit =
+                            state.attributes.get("unit_of_measurement").and_then(|v| v.as_str()).unwrap_or("");
+                        let device_class =
+                            state.attributes.get("device_class").and_then(|v| v.as_str()).unwrap_or("");
+                        Some(SensorRowData {
+                            label: entity_friendly_name(state).into(),
+                            value: format_sensor_value(&state.state, unit, device_class).into(),
+                            device_class: device_class.into(),
+                        })
+                    })
+                    .collect();
+                Some(DashboardCardData {
+                    kind: "sensor_group".into(),
+                    title: title.clone().into(),
+                    toggle_entities: empty_toggle_entities(),
+                    group_is_on: false,
+                    group_entity_ids: empty_strings(),
+                    climate_entity_id: SharedString::default(),
+                    climate_current: SharedString::default(),
+                    climate_target: SharedString::default(),
+                    climate_mode: SharedString::default(),
+                    climate_modes: empty_strings(),
+                    sensor_rows: slint::ModelRc::new(slint::VecModel::from(rows)),
+                })
+            }
+        })
+        .collect()
+}
+
+fn entity_domain(entity_id: &str) -> &str {
+    entity_id.split('.').next().unwrap_or("")
+}
+
+/// HA's own `friendly_name` attribute if set, else a titlecased version of
+/// the entity_id's own name part (e.g. "garage_freezer_temperature" ->
+/// "Garage Freezer Temperature") -- same fallback shape as
+/// `discover_family`'s local `friendly_name` helper, just usable from here
+/// too.
+fn entity_friendly_name(state: &EntityState) -> String {
+    match state.attributes.get("friendly_name").and_then(|v| v.as_str()) {
+        Some(name) => name.to_string(),
+        None => {
+            let slug = state.entity_id.split('.').nth(1).unwrap_or(&state.entity_id);
+            titlecase_slug(slug)
+        }
+    }
+}
+
+/// "75°" -- no unit letter, same reasoning as the weather widget's
+/// compact temp-range: climate entities don't carry their own
+/// `temperature_unit` attribute (the unit is HA's system-wide setting,
+/// implicit), and this always sits next to a mode label that gives it
+/// context.
+fn format_climate_temp(value: f64) -> String {
+    format!("{}°", value.round() as i64)
+}
+
+/// Sensor rows format to 1 decimal place normally (matches a real
+/// instance's "-15.88" -> "-15.9 °F"), but whole numbers for battery/
+/// signal-strength (matches "100%"/"−69 dBm", not "100.0%"). No space
+/// before a bare "%" unit; a space otherwise. Falls back to the raw state
+/// string unchanged if it isn't numeric (defensive -- every sensor this
+/// app targets has a numeric state, but a malformed one shouldn't panic).
+fn format_sensor_value(state: &str, unit: &str, device_class: &str) -> String {
+    let Ok(value) = state.parse::<f64>() else {
+        return if unit.is_empty() { state.to_string() } else { format!("{state} {unit}") };
+    };
+    let formatted = match device_class {
+        "battery" | "signal_strength" => format!("{}", value.round() as i64),
+        _ => format!("{value:.1}"),
+    };
+    if unit.is_empty() || unit == "%" {
+        format!("{formatted}{unit}")
+    } else {
+        format!("{formatted} {unit}")
+    }
+}
+
 fn weekday_short(w: Weekday) -> &'static str {
     match w {
         Weekday::Sunday => "Sun",
@@ -1954,5 +2491,173 @@ mod tests {
             assert_eq!(ev.member_colors.row_count(), 1);
             assert_eq!(ev.member_index, i as i32);
         }
+    }
+
+    fn entity_state(entity_id: &str, state: &str, attributes: serde_json::Value) -> EntityState {
+        EntityState { entity_id: entity_id.into(), state: state.into(), attributes, last_updated: None }
+    }
+
+    #[test]
+    fn resolves_entity_domain() {
+        assert_eq!(entity_domain("light.family_room_fan_light"), "light");
+        assert_eq!(entity_domain("climate.x2s_smart_thermostat"), "climate");
+    }
+
+    #[test]
+    fn formats_climate_temp() {
+        assert_eq!(format_climate_temp(75.4), "75°");
+    }
+
+    #[test]
+    fn formats_sensor_values_by_device_class() {
+        // Exact shapes confirmed against a real Garage Freezer thermometer
+        // device (4 separate sensor.* entities).
+        assert_eq!(format_sensor_value("-15.88", "°F", "temperature"), "-15.9 °F");
+        assert_eq!(format_sensor_value("100", "%", "battery"), "100%");
+        assert_eq!(format_sensor_value("-69", "dBm", "signal_strength"), "-69 dBm");
+        assert_eq!(format_sensor_value("60.0", "%", "humidity"), "60.0%");
+        // Non-numeric state (defensive -- shouldn't happen for these
+        // sensors, but shouldn't panic either) falls back to raw text.
+        assert_eq!(format_sensor_value("unavailable", "°F", "temperature"), "unavailable °F");
+    }
+
+    #[test]
+    fn friendly_name_falls_back_to_titlecased_entity_id() {
+        let named = entity_state("light.ava", "on", serde_json::json!({ "friendly_name": "Ava Light" }));
+        assert_eq!(entity_friendly_name(&named), "Ava Light");
+
+        let unnamed = entity_state("light.garage_side_door", "on", serde_json::json!({}));
+        assert_eq!(entity_friendly_name(&unnamed), "Garage Side Door");
+    }
+
+    #[test]
+    fn builds_toggle_group_card_with_group_on_state() {
+        // family_room on (brightness color_mode), ava off (onoff color
+        // mode) -- exact shapes confirmed against real light.* entities.
+        let states = [
+            entity_state(
+                "light.family_room_fan_light",
+                "on",
+                serde_json::json!({ "friendly_name": "Family Room Light", "color_mode": "brightness" }),
+            ),
+            entity_state(
+                "light.ava_fan_light",
+                "off",
+                serde_json::json!({ "friendly_name": "Ava Light", "color_mode": "onoff" }),
+            ),
+        ];
+        let by_id: std::collections::HashMap<&str, &EntityState> =
+            states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+        let sections = vec![DashboardSection::ToggleGroup {
+            title: "Lights".into(),
+            entities: vec!["light.family_room_fan_light".into(), "light.ava_fan_light".into()],
+        }];
+
+        let cards = build_dashboard_cards(&sections, &by_id);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert_eq!(card.kind, "toggle_group");
+        assert_eq!(card.title, "Lights");
+        assert_eq!(card.toggle_entities.row_count(), 2);
+        assert!(card.group_is_on, "one light on should mean the group switch shows on");
+        let first = card.toggle_entities.row_data(0).unwrap();
+        assert_eq!(first.name, "Family Room Light");
+        assert_eq!(first.domain, "light");
+        assert!(first.is_on);
+        assert_eq!(card.group_entity_ids.row_count(), 2);
+    }
+
+    #[test]
+    fn builds_climate_card_with_only_supported_modes() {
+        // Exact shape confirmed against a real climate.* entity.
+        let states = [entity_state(
+            "climate.x2s_smart_thermostat",
+            "cool",
+            serde_json::json!({
+                "friendly_name": "Upstairs Thermostat",
+                "hvac_modes": ["off", "heat", "cool", "fan_only"],
+                "current_temperature": 75,
+                "temperature": 75,
+                "min_temp": 50,
+                "max_temp": 99,
+            }),
+        )];
+        let by_id: std::collections::HashMap<&str, &EntityState> =
+            states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+        let sections = vec![DashboardSection::Climate { entity: "climate.x2s_smart_thermostat".into() }];
+
+        let cards = build_dashboard_cards(&sections, &by_id);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert_eq!(card.kind, "climate");
+        assert_eq!(card.title, "Upstairs Thermostat");
+        assert_eq!(card.climate_current, "Cool · 75°");
+        assert_eq!(card.climate_target, "75°");
+        assert_eq!(card.climate_mode, "cool");
+        assert_eq!(card.climate_modes.row_count(), 4);
+    }
+
+    #[test]
+    fn builds_sensor_group_card() {
+        let states = [
+            entity_state(
+                "sensor.garage_freezer_thermometer_temperature",
+                "-15.88",
+                serde_json::json!({
+                    "friendly_name": "Garage Freezer thermometer Temperature",
+                    "device_class": "temperature",
+                    "unit_of_measurement": "°F",
+                }),
+            ),
+            entity_state(
+                "sensor.garage_freezer_thermometer_battery",
+                "100",
+                serde_json::json!({
+                    "friendly_name": "Garage Freezer thermometer Battery",
+                    "device_class": "battery",
+                    "unit_of_measurement": "%",
+                }),
+            ),
+        ];
+        let by_id: std::collections::HashMap<&str, &EntityState> =
+            states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+        let sections = vec![DashboardSection::SensorGroup {
+            title: "Garage Freezer thermometer".into(),
+            entities: vec![
+                "sensor.garage_freezer_thermometer_temperature".into(),
+                "sensor.garage_freezer_thermometer_battery".into(),
+                "sensor.garage_freezer_thermometer_missing".into(), // not in `states` -- must be skipped
+            ],
+        }];
+
+        let cards = build_dashboard_cards(&sections, &by_id);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert_eq!(card.kind, "sensor_group");
+        assert_eq!(card.sensor_rows.row_count(), 2, "the missing entity must be skipped, not shown broken");
+        let temp_row = card.sensor_rows.row_data(0).unwrap();
+        assert_eq!(temp_row.value, "-15.9 °F");
+        assert_eq!(temp_row.device_class, "temperature");
+    }
+
+    #[test]
+    fn skips_climate_card_entirely_when_its_entity_is_missing() {
+        let by_id: std::collections::HashMap<&str, &EntityState> = std::collections::HashMap::new();
+        let sections = vec![DashboardSection::Climate { entity: "climate.gone".into() }];
+        assert!(build_dashboard_cards(&sections, &by_id).is_empty());
+    }
+
+    #[test]
+    fn dashboard_section_contains_matches_expected_entities() {
+        let toggle = DashboardSection::ToggleGroup {
+            title: "Lights".into(),
+            entities: vec!["light.a".into(), "light.b".into()],
+        };
+        assert!(dashboard_section_contains(&toggle, "light.a"));
+        assert!(!dashboard_section_contains(&toggle, "light.c"));
+
+        let climate = DashboardSection::Climate { entity: "climate.upstairs".into() };
+        assert!(dashboard_section_contains(&climate, "climate.upstairs"));
+        assert!(!dashboard_section_contains(&climate, "climate.downstairs"));
     }
 }

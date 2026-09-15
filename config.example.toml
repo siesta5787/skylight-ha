@@ -52,11 +52,31 @@ token_path = "./ha-token.secret"
 # todo_entity = "todo.chores_alice"
 # calendar_entities = ["calendar.alice"]
 
-[[views]]
-name = "Home"
-
-[[views.cards]]
-type = "calendar"
-
-[[views.cards]]
-type = "todo_list"
+# Dashboard page (Phase 1 -- config-driven; a later phase will move this to
+# the skylight-family HA integration so it doesn't need to live in a file).
+# Each [[dashboard]] block is one card, in the order you want them shown --
+# they don't all have to be the same type, e.g. a "climate" card can sit
+# between two "toggle_group"s. Three types:
+#
+#   toggle_group -- a titled group of on/off entities (lights, fans, ...)
+#   with a header switch that toggles all of them at once. Plain on/off
+#   only, no brightness/speed control.
+# [[dashboard]]
+# type = "toggle_group"
+# title = "Lights"
+# entities = ["light.family_room", "light.kitchen"]
+#
+#   climate -- one climate.* entity: mode buttons (only for whichever of
+#   off/fan_only/cool/heat it actually supports) plus a +/- temperature
+#   stepper. No title -- the card header is the entity's own friendly_name.
+# [[dashboard]]
+# type = "climate"
+# entity = "climate.upstairs"
+#
+#   sensor_group -- a titled group of read-only sensor rows, e.g. one
+#   device's several sensor.* entities (temperature/battery/signal
+#   strength) shown together under the device's name.
+# [[dashboard]]
+# type = "sensor_group"
+# title = "Garage Freezer thermometer"
+# entities = ["sensor.garage_freezer_temperature", "sensor.garage_freezer_battery"]
