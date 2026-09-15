@@ -345,7 +345,13 @@ export component DashboardPage inherits Rectangle {
             spacing: Theme.gap;
             alignment: start;
 
-            for card in root.cards: Rectangle {
+            // A plain `Rectangle` wrapper here (the previous version)
+            // doesn't propagate a conditionally-shown child's size upward
+            // -- every card collapsed to zero height and they all stacked
+            // on top of each other at the same position. A `VerticalLayout`
+            // wrapper does correctly aggregate its (conditional) children's
+            // sizes, since that's a layout container's actual job.
+            for card in root.cards: VerticalLayout {
                 if card.kind == "toggle_group": ToggleGroupCard {
                     width: 100%;
                     card: card;
