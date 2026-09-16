@@ -59,7 +59,12 @@ export component PinPad inherits Rectangle {
 
     Rectangle {
         width: 340px;
-        height: 460px;
+        // No explicit height -- let it size to the VerticalLayout content
+        // below instead (same pattern TodoCard/PlaceholderView already
+        // rely on). The fixed 460px this used to have was ~40px short of
+        // what the prompt + dots + error slot + 4-row grid + Cancel button
+        // actually needed, so Cancel rendered spilling out past the
+        // card's rounded bottom edge.
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         background: Theme.surface;
