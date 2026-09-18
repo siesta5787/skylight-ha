@@ -426,11 +426,16 @@ fn main() {
     {
         let app_weak = app.as_weak();
         let live_client = live_client.clone();
+        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let todo_uids = todo_uids.clone();
         let keyboard_buffer = keyboard_buffer.clone();
         let keyboard_target = keyboard_target.clone();
         let event_form_title = event_form_title.clone();
+        let reference_date = reference_date.clone();
+        let family_state = family_state.clone();
+        let weather_entities = weather_entities.clone();
+        let dashboard_sections = dashboard_sections.clone();
         app.on_keyboard_done(move || {
             let Some(app) = app_weak.upgrade() else { return };
             app.set_keyboard_open(false);
@@ -453,14 +458,47 @@ fn main() {
                         tracing::warn!("not connected to HA, new task won't be saved");
                         return;
                     };
+                    let app_weak = app_weak.clone();
+                    let live_rest = live_rest.clone();
+                    let todo_uids = todo_uids.clone();
+                    let ref_date = *reference_date.lock().unwrap();
+                    let family = family_state.lock().unwrap().clone();
+                    let weather_entities = weather_entities.clone();
+                    let dashboard_sections = dashboard_sections.clone();
                     rt_handle.spawn(async move {
                         // No optimistic UI insert here (unlike the toggle
                         // callback) -- adding a task doesn't have a
-                        // client-side uid to give it yet, and the new
-                        // item's own state_changed push (see run_ha_sync)
-                        // picks it up within moments regardless.
+                        // client-side uid to give it yet. Previously this
+                        // relied entirely on the new item's own
+                        // state_changed push (see run_ha_sync) to reflect
+                        // it, "within moments" -- but that push is a
+                        // best-effort WS message, not guaranteed, and on a
+                        // miss the only fallback was the 5-minute poll
+                        // (confirmed happening on real hardware: added from
+                        // this app, showed up on another device's HA app
+                        // right away, but didn't show up back here for
+                        // several minutes). Refreshing directly after,
+                        // same as event creation and every dashboard
+                        // control already do, doesn't depend on the push
+                        // succeeding at all for the common case of adding
+                        // from this app itself.
                         if let Err(err) = add_todo_item(&client, &entity_id, &text).await {
                             tracing::warn!(%err, "failed to add HA todo item");
+                        }
+                        let rest = live_rest.lock().unwrap().clone();
+                        if let Some(rest) = rest {
+                            refresh_calendar_and_todos(
+                                &rest,
+                                &client,
+                                &family,
+                                local_offset,
+                                ref_date,
+                                &app_weak,
+                                &todo_uids,
+                                &weather_entities,
+                                &dashboard_sections,
+                            )
+                            .await;
                         }
                     });
                 }
@@ -732,18 +770,19 @@ fn main() {
         });
     }
 
-    // Dashboard controls: each fires its `call_service`, then refreshes --
-    // but only the dashboard page (see refresh_dashboard_only), not the
-    // full calendar+todos+weather refresh event creation uses. That full
-    // refresh is what made these feel slow (3-4s to reflect a toggle that
-    // HA itself applies almost instantly): it was doing a REST calendar
-    // fetch, a todo fetch, and 3 sequential weather calls before it ever
-    // got to the one get_states() the dashboard actually needed. No
-    // optimistic client-side model flip (unlike the todo checkbox) --
-    // this single WS round trip plus the entity's own state_changed event
-    // (which the relevant-state filter below also listens for) both land
-    // fast enough now that one wasn't worth the extra bookkeeping of
-    // searching the nested card/entity model to mutate it.
+    // Dashboard controls: each flips the relevant bit of the on-screen
+    // model immediately (set_dashboard_*_optimistically), *then* fires its
+    // `call_service` and refreshes -- but only the dashboard page (see
+    // refresh_dashboard_only), not the full calendar+todos+weather refresh
+    // event creation uses. Two separate latency fixes stacked on top of
+    // each other: the full refresh was doing a REST calendar fetch, a todo
+    // fetch, and 3 sequential weather calls before it ever got to the one
+    // get_states() the dashboard actually needed (3-4s to reflect a toggle
+    // HA itself applies almost instantly); even after that fix, the
+    // remaining single WS round trip was still visibly laggy on real
+    // touchscreen hardware, hence the optimistic flip on top. If the
+    // `call_service` call actually fails, the refresh right after corrects
+    // the guess.
     {
         let live_client = live_client.clone();
         let rt_handle = rt_handle.clone();
@@ -755,6 +794,9 @@ fn main() {
                 return;
             };
             let entity_id = entity_id.to_string();
+            if let Some(app) = app_weak.upgrade() {
+                set_dashboard_entity_on_optimistically(&app, &entity_id, on);
+            }
             let app_weak = app_weak.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
@@ -780,6 +822,9 @@ fn main() {
             };
             let ids: Vec<String> =
                 (0..entity_ids.row_count()).filter_map(|i| entity_ids.row_data(i)).map(|s| s.to_string()).collect();
+            if let Some(app) = app_weak.upgrade() {
+                set_dashboard_group_on_optimistically(&app, &ids, on);
+            }
             let app_weak = app_weak.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
@@ -814,6 +859,9 @@ fn main() {
             };
             let entity_id = entity_id.to_string();
             let mode = mode.to_string();
+            if let Some(app) = app_weak.upgrade() {
+                set_dashboard_climate_mode_optimistically(&app, &entity_id, &mode);
+            }
             let app_weak = app_weak.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
@@ -2194,6 +2242,92 @@ fn build_todo_model(
     }
 
     (slint::ModelRc::new(slint::VecModel::from(columns)), uid_map, chips)
+}
+
+/// Flips one toggle-group entity's `is_on` (and recomputes its card's
+/// `group_is_on`) directly in the model already on screen, so a tap shows
+/// a response immediately rather than waiting on the round trip to HA and
+/// back through `refresh_dashboard_only` -- on real touchscreen hardware
+/// that round trip was visibly laggy even though HA itself applies the
+/// change almost instantly. `refresh_dashboard_only` (already called
+/// right after this in every caller) still runs and corrects this guess
+/// if the actual `call_service` fails.
+fn set_dashboard_entity_on_optimistically(app: &AppWindow, entity_id: &str, on: bool) {
+    let rows = app.get_dashboard_rows();
+    for row_idx in 0..rows.row_count() {
+        let Some(row) = rows.row_data(row_idx) else { continue };
+        let cards = row.cards;
+        for card_idx in 0..cards.row_count() {
+            let Some(mut card) = cards.row_data(card_idx) else { continue };
+            if card.kind.as_str() != "toggle_group" {
+                continue;
+            }
+            let entities = card.toggle_entities.clone();
+            let mut touched = false;
+            for i in 0..entities.row_count() {
+                let Some(mut entity) = entities.row_data(i) else { continue };
+                if entity.entity_id.as_str() == entity_id {
+                    entity.is_on = on;
+                    entities.set_row_data(i, entity);
+                    touched = true;
+                }
+            }
+            if touched {
+                card.group_is_on =
+                    (0..entities.row_count()).any(|i| entities.row_data(i).is_some_and(|e| e.is_on));
+                cards.set_row_data(card_idx, card);
+                return; // entity_ids are unique -- no need to keep scanning
+            }
+        }
+    }
+}
+
+/// Same idea as `set_dashboard_entity_on_optimistically` but for the
+/// section header switch -- flips every entity in whichever card contains
+/// them.
+fn set_dashboard_group_on_optimistically(app: &AppWindow, entity_ids: &[String], on: bool) {
+    let rows = app.get_dashboard_rows();
+    for row_idx in 0..rows.row_count() {
+        let Some(row) = rows.row_data(row_idx) else { continue };
+        let cards = row.cards;
+        for card_idx in 0..cards.row_count() {
+            let Some(mut card) = cards.row_data(card_idx) else { continue };
+            if card.kind.as_str() != "toggle_group" {
+                continue;
+            }
+            let entities = card.toggle_entities.clone();
+            let mut touched = false;
+            for i in 0..entities.row_count() {
+                let Some(mut entity) = entities.row_data(i) else { continue };
+                if entity_ids.iter().any(|id| id == entity.entity_id.as_str()) {
+                    entity.is_on = on;
+                    entities.set_row_data(i, entity);
+                    touched = true;
+                }
+            }
+            if touched {
+                card.group_is_on = on;
+                cards.set_row_data(card_idx, card);
+            }
+        }
+    }
+}
+
+/// Same idea again, for a climate card's mode buttons.
+fn set_dashboard_climate_mode_optimistically(app: &AppWindow, entity_id: &str, mode: &str) {
+    let rows = app.get_dashboard_rows();
+    for row_idx in 0..rows.row_count() {
+        let Some(row) = rows.row_data(row_idx) else { continue };
+        let cards = row.cards;
+        for card_idx in 0..cards.row_count() {
+            let Some(mut card) = cards.row_data(card_idx) else { continue };
+            if card.kind.as_str() == "climate" && card.climate_entity_id.as_str() == entity_id {
+                card.climate_mode = mode.into();
+                cards.set_row_data(card_idx, card);
+                return;
+            }
+        }
+    }
 }
 
 /// Builds the Dashboard page's cards from the configured sections and a
