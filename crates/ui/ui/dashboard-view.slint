@@ -44,8 +44,16 @@ export struct DashboardCardData {
 
     // climate
     climate-entity-id: string,
-    climate-current: string, // "75°F", already formatted
-    climate-target: string,
+    climate-current: string, // "Cool · 75°", already formatted
+    climate-target: string, // "75°", already formatted
+    // Raw numbers backing climate-target/its valid range -- lets a +/-
+    // tap compute (and optimistically show) the new setpoint straight
+    // from what's already on screen, without a REST round trip just to
+    // read the current setpoint back first (see
+    // set_dashboard_climate_target_optimistically in main.rs).
+    climate-target-value: float,
+    climate-min: float,
+    climate-max: float,
     climate-mode: string,
     // Only the hvac_modes this entity actually supports, so e.g. the
     // Sunroom AC (off/cool only) doesn't show fan/heat buttons it would

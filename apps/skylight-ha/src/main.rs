@@ -882,40 +882,30 @@ fn main() {
     }
     {
         let live_client = live_client.clone();
-        let live_rest = live_rest.clone();
         let rt_handle = rt_handle.clone();
         let app_weak = app.as_weak();
         let dashboard_sections = dashboard_sections.clone();
         app.on_dashboard_climate_temp_delta(move |entity_id, delta| {
-            let (Some(client), Some(rest)) =
-                (live_client.lock().unwrap().clone(), live_rest.lock().unwrap().clone())
-            else {
+            let Some(client) = live_client.lock().unwrap().clone() else {
                 tracing::warn!("not connected to HA, can't change thermostat temperature");
                 return;
             };
             let entity_id = entity_id.to_string();
+            // Computed from the card's own cached min/max/current-target
+            // (set on every dashboard fetch -- see build_dashboard_cards)
+            // rather than a fresh REST read of the current setpoint first,
+            // which used to make every +/- tap a 2-round-trip operation
+            // (read, then write) before the refresh afterward even
+            // started -- confirmed slow on real touchscreen hardware.
+            let Some(new_target) =
+                app_weak.upgrade().and_then(|app| set_dashboard_climate_target_optimistically(&app, &entity_id, delta))
+            else {
+                tracing::warn!(entity = %entity_id, "no cached climate card to adjust temperature from");
+                return;
+            };
             let app_weak = app_weak.clone();
             let dashboard_sections = dashboard_sections.clone();
             rt_handle.spawn(async move {
-                // Reads the entity's current setpoint fresh rather than
-                // caching it client-side -- a +/- tap is infrequent enough
-                // that the extra round trip doesn't matter, and it avoids
-                // keeping a second copy of dashboard state in sync with
-                // what's actually on screen.
-                let state = match rest.entity_state(&entity_id).await {
-                    Ok(state) => state,
-                    Err(err) => {
-                        tracing::warn!(%err, entity = %entity_id, "failed to read current thermostat state");
-                        return;
-                    }
-                };
-                let Some(current) = state.attributes.get("temperature").and_then(|v| v.as_f64()) else {
-                    tracing::warn!(entity = %entity_id, "thermostat has no current setpoint to adjust");
-                    return;
-                };
-                let min = state.attributes.get("min_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
-                let max = state.attributes.get("max_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
-                let new_target = (current + delta as f64).clamp(min, max);
                 if let Err(err) = client
                     .call_service(
                         "climate",
@@ -1200,83 +1190,48 @@ async fn refresh_calendar_and_todos(
     let range_start = grid_start.midnight().assume_offset(local_offset);
     let range_end = grid_end.midnight().assume_offset(local_offset);
 
+    let (primary_entity, backfill_entity) = {
+        let entities = weather_entities.lock().unwrap();
+        (entities.primary.clone(), entities.backfill.clone())
+    };
+
+    // Dashboard refresh is deliberately *not* joined with the fetches
+    // below -- it's fired off as its own detached task instead, updating
+    // the Dashboard page independently whenever it's ready rather than
+    // gating (or being gated by) calendar/todo/weather. This matters
+    // because `get_states()` (what the dashboard needs) turned out to be
+    // wildly variable on a real instance -- confirmed live: ~460ms once,
+    // 17.5s for 538 entities another time -- and with everything joined
+    // together (the previous version of this function), that one slow
+    // fetch held up pushing calendar/todo/weather updates that were ready
+    // in under a second, which is what several "feels slow"/"doesn't
+    // update" reports from real touchscreen testing actually traced back
+    // to. `refresh_dashboard_only` already does its own don't-push-on-
+    // failure and empty-sections handling.
+    {
+        let client = client.clone();
+        let dashboard_sections = dashboard_sections.clone();
+        let app_weak = app_weak.clone();
+        tokio::spawn(async move {
+            refresh_dashboard_only(&client, &dashboard_sections, &app_weak).await;
+        });
+    }
+
     // Fetching returns plain (Send) data -- `CalendarEvent`/`TodoItem` are
     // ordinary serde structs. Building the actual Slint models has to
     // happen below, *inside* `invoke_from_event_loop`: `ModelRc` is
     // `Rc`-based (not `Send`), so it can't be constructed on a tokio worker
     // thread and handed across into that closure.
-    let per_member_events = fetch_calendar_events(rest, family, range_start, range_end).await;
-    let (per_member_todos, connection_alive) = fetch_todos(client, family).await;
-
-    // REST calls, not WS -- there's no dedicated WS query for a single
-    // entity's state, and this only needs to happen on the same cadence as
-    // the calendar poll above, not on every `state_changed` event. `None`
-    // (entity not resolved yet, or the fetch failed) means "leave whatever's
-    // already on screen alone" -- same don't-flash-to-placeholder reasoning
-    // as the connection-dead check below.
-    let (primary_entity, backfill_entity) = {
-        let entities = weather_entities.lock().unwrap();
-        (entities.primary.clone(), entities.backfill.clone())
-    };
-    let weather = match &primary_entity {
-        Some(entity_id) => match rest.entity_state(entity_id).await {
-            Ok(state) => Some(state),
-            Err(err) => {
-                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather entity state");
-                None
-            }
-        },
-        None => None,
-    };
-    // A day's high/low isn't a plain state attribute on modern HA weather
-    // entities -- it needs its own service call (see
-    // Client::weather_daily_forecast). WS, not REST: the forecast service
-    // isn't exposed over the REST API.
-    let forecast_today = match &primary_entity {
-        Some(entity_id) => match client.weather_daily_forecast(entity_id).await {
-            Ok(days) => days.into_iter().next(),
-            Err(err) => {
-                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather forecast");
-                None
-            }
-        },
-        None => None,
-    };
-    let backfill = match &backfill_entity {
-        Some(entity_id) => match rest.entity_state(entity_id).await {
-            Ok(state) => Some(state),
-            Err(err) => {
-                tracing::warn!(entity = %entity_id, %err, "failed to fetch weather backfill entity state");
-                None
-            }
-        },
-        None => None,
-    };
-
-    // One `get_states()` covers every configured dashboard entity in a
-    // single round trip, same as the family/weather discovery scans --
-    // cheap at a home instance's scale, and simpler than a REST call per
-    // entity. Only the raw states are fetched here -- `EntityState` is a
-    // plain (Send) serde struct, but `DashboardCardData` embeds `ModelRc`s
-    // internally (same as every other Slint-facing struct this function
-    // builds), so turning these into cards has to happen below, inside
-    // `invoke_from_event_loop`, same as `build_calendar_grids`/
-    // `build_todo_model`. `None` on failure means "leave the dashboard
-    // page as it was" (same don't-flash-to-placeholder reasoning as the
-    // weather fetches above) -- an empty `sections` list is different,
-    // that's a legitimate "nothing configured" state, not a failure.
-    let sections = dashboard_sections.lock().unwrap().clone();
-    let dashboard_states: Option<Vec<EntityState>> = if sections.is_empty() {
-        Some(Vec::new())
-    } else {
-        match client.get_states().await {
-            Ok(states) => Some(states),
-            Err(err) => {
-                tracing::warn!(%err, "failed to fetch entity states for the dashboard page");
-                None
-            }
-        }
-    };
+    //
+    // These three fetches are independent of each other, so they run
+    // concurrently via `tokio::join!` rather than one after another as
+    // this used to -- with a several-member family plus 3 weather calls,
+    // that was a dozen-plus round trips stacked one after another.
+    let (per_member_events, (per_member_todos, connection_alive), (weather, forecast_today, backfill)) = tokio::join!(
+        fetch_calendar_events(rest, family, range_start, range_end),
+        fetch_todos(client, family),
+        fetch_weather(rest, client, primary_entity.as_deref(), backfill_entity.as_deref()),
+    );
 
     if !connection_alive {
         // Don't push this over what's already correctly on screen -- a
@@ -1303,13 +1258,6 @@ async fn refresh_calendar_and_todos(
         app.set_todo_columns(todo_columns);
         app.set_members(slint::ModelRc::new(slint::VecModel::from(chips)));
         apply_weather(&app, weather.as_ref(), forecast_today.as_ref(), backfill.as_ref());
-        if let Some(states) = &dashboard_states {
-            let by_id: std::collections::HashMap<&str, &EntityState> =
-                states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
-            let cards = build_dashboard_cards(&sections, &by_id);
-            let rows = group_dashboard_rows(cards);
-            app.set_dashboard_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
-        }
     });
 
     true
@@ -1322,6 +1270,62 @@ async fn refresh_calendar_and_todos(
 /// obviously haven't changed and waiting on them was the entire reason a
 /// toggle took 3-4 seconds to visibly react even though HA itself applied
 /// it almost immediately. Does nothing if no sections are configured.
+/// The 3 weather calls (current state, forecast, backfill state) as one
+/// unit, run concurrently against each other via `tokio::join!` -- same
+/// "independent fetches shouldn't be sequential" fix as the top-level
+/// join in `refresh_calendar_and_todos`, which is this function's only
+/// caller. `None` per-field on fetch failure or an unresolved entity, same
+/// don't-flash-to-placeholder meaning as everywhere else weather is
+/// handled.
+async fn fetch_weather(
+    rest: &RestClient,
+    client: &Client,
+    primary_entity: Option<&str>,
+    backfill_entity: Option<&str>,
+) -> (Option<EntityState>, Option<DailyForecast>, Option<EntityState>) {
+    let weather = async {
+        match primary_entity {
+            Some(entity_id) => match rest.entity_state(entity_id).await {
+                Ok(state) => Some(state),
+                Err(err) => {
+                    tracing::warn!(entity = %entity_id, %err, "failed to fetch weather entity state");
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    // A day's high/low isn't a plain state attribute on modern HA weather
+    // entities -- it needs its own service call (see
+    // Client::weather_daily_forecast). WS, not REST: the forecast service
+    // isn't exposed over the REST API.
+    let forecast = async {
+        match primary_entity {
+            Some(entity_id) => match client.weather_daily_forecast(entity_id).await {
+                Ok(days) => days.into_iter().next(),
+                Err(err) => {
+                    tracing::warn!(entity = %entity_id, %err, "failed to fetch weather forecast");
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    let backfill = async {
+        match backfill_entity {
+            Some(entity_id) => match rest.entity_state(entity_id).await {
+                Ok(state) => Some(state),
+                Err(err) => {
+                    tracing::warn!(entity = %entity_id, %err, "failed to fetch weather backfill entity state");
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    tokio::join!(weather, forecast, backfill)
+}
+
 async fn refresh_dashboard_only(
     client: &Client,
     dashboard_sections: &Arc<Mutex<Vec<DashboardSection>>>,
@@ -1855,35 +1859,60 @@ fn dashboard_section_contains(section: &DashboardSection, entity_id: &str) -> bo
     }
 }
 
+/// One REST call per member (per calendar, for members with more than
+/// one), all running concurrently via `JoinSet` rather than one after
+/// another -- with a 6-member family this used to mean 6+ sequential
+/// round trips before the calendar page could update at all, easily
+/// stacking into seconds. Order in the result doesn't matter (downstream,
+/// `build_calendar_grids` buckets everything by date using each tuple's
+/// own `usize` member-index, not Vec position), unlike `fetch_todos`
+/// below.
 async fn fetch_calendar_events(
     rest: &RestClient,
     family: &[FamilyMember],
     start: OffsetDateTime,
     end: OffsetDateTime,
 ) -> Vec<(usize, slint::Color, Vec<CalendarEvent>)> {
-    let mut out = Vec::new();
+    let mut set = tokio::task::JoinSet::new();
     for (index, member) in family.iter().enumerate() {
         if member.calendar_entities.is_empty() {
             continue;
         }
-        // A member can have more than one calendar linked; events from all
-        // of them are merged and shown in this member's single color --
-        // nothing downstream needs to know which specific calendar an
-        // event came from.
-        let mut events = Vec::new();
-        for entity in &member.calendar_entities {
-            match rest.calendar_events(entity, start, end).await {
-                Ok(fetched) => events.extend(fetched),
-                Err(err) => {
-                    tracing::warn!(entity = %entity, %err, "failed to fetch calendar events");
+        let rest = rest.clone();
+        let entities = member.calendar_entities.clone();
+        let color = parse_hex_color(&member.color);
+        set.spawn(async move {
+            // A member can have more than one calendar linked; events from
+            // all of them are merged and shown in this member's single
+            // color -- nothing downstream needs to know which specific
+            // calendar an event came from.
+            let mut events = Vec::new();
+            for entity in &entities {
+                match rest.calendar_events(entity, start, end).await {
+                    Ok(fetched) => events.extend(fetched),
+                    Err(err) => {
+                        tracing::warn!(entity = %entity, %err, "failed to fetch calendar events");
+                    }
                 }
             }
+            (index, color, events)
+        });
+    }
+    let mut out = Vec::new();
+    while let Some(result) = set.join_next().await {
+        if let Ok(item) = result {
+            out.push(item);
         }
-        out.push((index, parse_hex_color(&member.color), events));
     }
     out
 }
 
+/// Same concurrency treatment as `fetch_calendar_events`, one WS call per
+/// member. Unlike calendar events, order *does* matter here --
+/// `build_todo_model` zips `family` against this result positionally --
+/// so results go into a pre-sized `Vec` by index rather than however
+/// `JoinSet` happens to complete them.
+///
 /// Also reports whether the connection still looks alive: `ha-client`
 /// deliberately doesn't hide reconnection behind `Client` itself (see its
 /// own doc comment) -- once the underlying WS actor dies, every call on
@@ -1894,23 +1923,33 @@ async fn fetch_calendar_events(
 /// slow or wrong, the connection had quietly died and nothing ever asked
 /// for a fresh one.
 async fn fetch_todos(client: &Client, family: &[FamilyMember]) -> (Vec<Vec<TodoItem>>, bool) {
-    let mut out = Vec::with_capacity(family.len());
-    let mut connection_alive = true;
-    for member in family {
-        let items = match &member.todo_entity {
-            Some(entity) => match client.todo_items(entity).await {
-                Ok(items) => items,
-                Err(err) => {
-                    if matches!(err, ha_client::connection::Error::Closed) {
-                        connection_alive = false;
+    let mut set = tokio::task::JoinSet::new();
+    for (index, member) in family.iter().enumerate() {
+        let client = client.clone();
+        let entity = member.todo_entity.clone();
+        set.spawn(async move {
+            match entity {
+                Some(entity) => match client.todo_items(&entity).await {
+                    Ok(items) => (index, items, true),
+                    Err(err) => {
+                        let alive = !matches!(err, ha_client::connection::Error::Closed);
+                        tracing::warn!(entity = %entity, %err, "failed to fetch todo items");
+                        (index, Vec::new(), alive)
                     }
-                    tracing::warn!(entity = %entity, %err, "failed to fetch todo items");
-                    Vec::new()
-                }
-            },
-            None => Vec::new(),
-        };
-        out.push(items);
+                },
+                None => (index, Vec::new(), true),
+            }
+        });
+    }
+    let mut out: Vec<Vec<TodoItem>> = vec![Vec::new(); family.len()];
+    let mut connection_alive = true;
+    while let Some(result) = set.join_next().await {
+        if let Ok((index, items, alive)) = result {
+            out[index] = items;
+            if !alive {
+                connection_alive = false;
+            }
+        }
     }
     (out, connection_alive)
 }
@@ -2323,11 +2362,53 @@ fn set_dashboard_climate_mode_optimistically(app: &AppWindow, entity_id: &str, m
             let Some(mut card) = cards.row_data(card_idx) else { continue };
             if card.kind.as_str() == "climate" && card.climate_entity_id.as_str() == entity_id {
                 card.climate_mode = mode.into();
+                // climate_current ("Cool · 71°") wasn't being touched here
+                // before -- the mode button itself updated (it reads
+                // climate_mode directly), but the status line above it
+                // kept showing the old mode until the real refresh landed.
+                // Keeps whatever temperature portion was already there
+                // (that reading hasn't changed, only the mode has) by
+                // splitting on the " · " build_dashboard_cards' Climate
+                // arm always joins with.
+                let temp_part = card.climate_current.as_str().split_once(" · ").map(|(_, t)| t.to_string());
+                card.climate_current = match temp_part {
+                    Some(temp) => format!("{} · {temp}", capitalize_first(mode)).into(),
+                    None => capitalize_first(mode).into(),
+                };
                 cards.set_row_data(card_idx, card);
                 return;
             }
         }
     }
+}
+
+/// Computes the new setpoint straight from what's already cached on the
+/// card (see `climate-target-value`/`climate-min`/`climate-max` on
+/// `DashboardCardData`), updates the displayed value immediately, and
+/// hands back the computed number so the caller can send exactly that to
+/// `climate.set_temperature` -- no REST round trip to read the current
+/// setpoint back first. `None` if there's no matching card cached yet
+/// (e.g. tapped before the first dashboard fetch has ever completed).
+fn set_dashboard_climate_target_optimistically(app: &AppWindow, entity_id: &str, delta: i32) -> Option<f64> {
+    let rows = app.get_dashboard_rows();
+    for row_idx in 0..rows.row_count() {
+        let Some(row) = rows.row_data(row_idx) else { continue };
+        let cards = row.cards;
+        for card_idx in 0..cards.row_count() {
+            let Some(mut card) = cards.row_data(card_idx) else { continue };
+            if card.kind.as_str() == "climate" && card.climate_entity_id.as_str() == entity_id {
+                let current = card.climate_target_value as f64;
+                let min = card.climate_min as f64;
+                let max = card.climate_max as f64;
+                let new_target = (current + delta as f64).clamp(min, max);
+                card.climate_target_value = new_target as f32;
+                card.climate_target = format_climate_temp(new_target).into();
+                cards.set_row_data(card_idx, card);
+                return Some(new_target);
+            }
+        }
+    }
+    None
 }
 
 /// Builds the Dashboard page's cards from the configured sections and a
@@ -2373,6 +2454,9 @@ fn build_dashboard_cards(
                     climate_entity_id: SharedString::default(),
                     climate_current: SharedString::default(),
                     climate_target: SharedString::default(),
+                    climate_target_value: 0.0,
+                    climate_min: 0.0,
+                    climate_max: 0.0,
                     climate_mode: SharedString::default(),
                     climate_modes: empty_strings(),
                     sensor_rows: empty_sensor_rows(),
@@ -2382,6 +2466,8 @@ fn build_dashboard_cards(
                 let state = *states.get(entity.as_str())?;
                 let current = state.attributes.get("current_temperature").and_then(|v| v.as_f64());
                 let target = state.attributes.get("temperature").and_then(|v| v.as_f64());
+                let min_temp = state.attributes.get("min_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MIN);
+                let max_temp = state.attributes.get("max_temp").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
                 let hvac_mode = state.state.clone();
                 let hvac_modes: Vec<SharedString> = state
                     .attributes
@@ -2402,6 +2488,14 @@ fn build_dashboard_cards(
                     climate_entity_id: entity.clone().into(),
                     climate_current: current_label.into(),
                     climate_target: target.map(format_climate_temp).unwrap_or_default().into(),
+                    // Falls back to min_temp (never NaN/garbage) when the
+                    // entity has no active setpoint (e.g. an AC that's
+                    // currently off) -- a +/- tap in that state is an edge
+                    // case HA itself may just reject, but this keeps the
+                    // cached value sane either way.
+                    climate_target_value: target.unwrap_or(min_temp) as f32,
+                    climate_min: min_temp as f32,
+                    climate_max: max_temp as f32,
                     climate_mode: hvac_mode.into(),
                     climate_modes: slint::ModelRc::new(slint::VecModel::from(hvac_modes)),
                     sensor_rows: empty_sensor_rows(),
@@ -2432,6 +2526,9 @@ fn build_dashboard_cards(
                     climate_entity_id: SharedString::default(),
                     climate_current: SharedString::default(),
                     climate_target: SharedString::default(),
+                    climate_target_value: 0.0,
+                    climate_min: 0.0,
+                    climate_max: 0.0,
                     climate_mode: SharedString::default(),
                     climate_modes: empty_strings(),
                     sensor_rows: slint::ModelRc::new(slint::VecModel::from(rows)),
@@ -3010,6 +3107,38 @@ mod tests {
         assert_eq!(card.climate_target, "75°");
         assert_eq!(card.climate_mode, "cool");
         assert_eq!(card.climate_modes.row_count(), 4);
+        // Cached so a +/- tap can compute the new setpoint without a REST
+        // round trip to read it back first -- see
+        // set_dashboard_climate_target_optimistically.
+        assert_eq!(card.climate_target_value, 75.0);
+        assert_eq!(card.climate_min, 50.0);
+        assert_eq!(card.climate_max, 99.0);
+    }
+
+    #[test]
+    fn climate_card_falls_back_to_min_temp_when_no_active_setpoint() {
+        // The exact shape confirmed live for the Sunroom AC while off --
+        // no "temperature" key at all (not even null), unlike the other
+        // thermostats which always have one.
+        let states = [entity_state(
+            "climate.window_ac",
+            "off",
+            serde_json::json!({
+                "friendly_name": "Sunroom AC",
+                "hvac_modes": ["off", "cool"],
+                "current_temperature": 71,
+                "min_temp": 45,
+                "max_temp": 95,
+            }),
+        )];
+        let by_id: std::collections::HashMap<&str, &EntityState> =
+            states.iter().map(|s| (s.entity_id.as_str(), s)).collect();
+        let sections = vec![DashboardSection::Climate { entity: "climate.window_ac".into() }];
+
+        let cards = build_dashboard_cards(&sections, &by_id);
+        let card = &cards[0];
+        assert_eq!(card.climate_target, "", "no active setpoint -- nothing to show in the stepper");
+        assert_eq!(card.climate_target_value, 45.0, "falls back to min_temp, not 0 or NaN");
     }
 
     #[test]
@@ -3072,6 +3201,9 @@ mod tests {
             climate_entity_id: SharedString::default(),
             climate_current: SharedString::default(),
             climate_target: SharedString::default(),
+            climate_target_value: 0.0,
+            climate_min: 0.0,
+            climate_max: 0.0,
             climate_mode: SharedString::default(),
             climate_modes: slint::ModelRc::new(slint::VecModel::from(Vec::<SharedString>::new())),
             sensor_rows: slint::ModelRc::new(slint::VecModel::from(Vec::<SensorRowData>::new())),
