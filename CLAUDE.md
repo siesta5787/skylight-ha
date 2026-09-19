@@ -90,6 +90,73 @@ with `sudo`).
   the previous artifact as a sanity check that the new build actually
   differs when you expect it to.
 
+## App features built since the initial calendar/tasks MVP
+
+Quick orientation for a fresh session -- not a full history (see `git log`
+for that), just what exists, where, and the non-obvious facts.
+
+**Weather widget** (top bar, single compact line pinned against the
+clock): `crates/ui/ui/top-bar.slint`'s `WeatherWidget` +
+`crates/ui/ui/weather-icon.slint`. Config: top-level (not nested under
+`[ha]`) `weather_entity` (condition/temp/wind/forecast) and
+`weather_backfill_entity` (humidity/pressure, only consulted if the
+primary doesn't report them) -- both optional, auto-discovered from HA's
+`weather.*` entities if unset. **Must be placed before the first `[table]`
+header in `config.toml`** -- TOML has no table-reset until the next
+header, so a bare `key = value` after `[ha]` silently becomes
+`ha.weather_entity` instead (this bit once already). On this instance,
+`weather.home` (the integration actually added) has no humidity/pressure
+attributes at all; `weather.forecast_home` (HA's default Met.no forecast)
+does -- hence the primary/backfill split. Today's high/low needs the
+`weather.get_forecasts` service with `return_response: true` (see
+`Client::weather_daily_forecast` in ha-client) -- it isn't a plain state
+attribute on modern HA weather entities. No percentage-chance-of-rain
+field exists on either entity here; what's shown is a precipitation
+*amount* (inches), matching what HA's own more-info dialog shows.
+
+**Dashboard page** (lights/fans/climate/sensor cards): two-phase plan.
+- *Phase 1 (done)*: config-driven via `dashboard-config::DashboardSection`
+  (`ToggleGroup`/`Climate`/`SensorGroup`), set with `[[dashboard]]` blocks
+  in `config.toml`, in render order. Consecutive same-`kind` blocks share
+  a horizontal row (`group_dashboard_rows` in main.rs) -- reorder
+  `config.toml` to control what sits next to what (e.g. Lights
+  immediately followed by Fans -> side by side).
+- *Phase 2 (not started)*: extend the `skylight-family` HA integration
+  (github.com/siesta5787/skylight-family, sibling repo, separate
+  Python/HACS deploy) with a new "Dashboard Section" subentry type -- same
+  `ConfigSubentryFlow` pattern it already uses for family members
+  (confirmed by reading its `config_flow.py`/`sensor.py`), exposing
+  `sensor.skylight_dashboard_*` entities. `discover_dashboard_sections` in
+  main.rs already expects that exact shape and returns `None` until it
+  exists -- no Rust/Slint rework needed when Phase 2 lands.
+- Controls are on/off only for lights/fans (no brightness/speed -- out of
+  scope, matches the reference Lovelace screenshots this was modeled on),
+  climate mode buttons (only for whichever of off/fan_only/cool/heat the
+  entity's own `hvac_modes` actually supports) plus a +/- temperature
+  stepper. All writes go through `Client::call_service` (ha-client/
+  connection.rs), a generic domain/service/entity_ids/data wrapper added
+  because dashboard controls needed it four different ways.
+- Every dashboard control updates the on-screen model *optimistically*
+  (synchronously, the instant the tap fires -- `set_dashboard_entity_on_
+  optimistically`/`_group_on_optimistically`/`_climate_mode_
+  optimistically`/`_climate_target_optimistically` in main.rs) before the
+  network call even starts; the real `call_service` + a
+  `refresh_dashboard_only` afterward reconciles if the guess was wrong.
+
+**Parental PIN lock** (Settings page): fully local/on-device, no HA
+involved. 4-digit PIN, SHA-256 hashed (not plaintext -- proportionate to
+the actual threat model of "a curious kid", not real auth) into
+`config.toml`'s `pin_hash_path` (default `pin.secret`, already covered by
+`.gitignore`'s `*.secret`). "Is a PIN configured" == "does that file
+exist" -- no separate flag that could drift out of sync with it. Gates the
+Dashboard/Settings nav buttons; **re-locks the moment you navigate away**
+to Calendar/Tasks/Photos (confirmed-with-user behavior) -- moving
+*between* Dashboard and Settings themselves does not re-lock, one PIN
+entry covers "being in that area". One `PinFlow` state machine in main.rs
+(`pin_flow: Rc<RefCell<Option<PinFlow>>>`) drives every setup/change/
+disable/unlock flow, paired with a dedicated numeric `PinPad` component
+(`crates/ui/ui/pin-pad.slint`) -- not the general `VirtualKeyboard`.
+
 ## Known app-level bugs (fixed or open)
 
 - **Fixed — font panic on the real device**: Slint's software renderer
@@ -139,11 +206,56 @@ with `sudo`).
   `AppWindow.calendar-day-selected` to `main.rs`'s
   `on_calendar_day_selected`, confirmed working end-to-end via `evtest` +
   a vendored/instrumented Slint backend + a temporary on-screen tap-counter
-  probe (all debug scaffolding removed except the tap-counter box, kept in
-  the bottom-right corner as a standing touch sanity check). This should be
-  considered resolved on the Pi too, pending final hardware validation —
-  the same panel, same `backend-linuxkms-noseat` code path, same libinput
-  version behavior.
+  probe (the tap-counter box was later removed along with the rest of that
+  debug scaffolding once the full sidebar/calendar/dashboard redesign gave
+  the app plenty of real tappable surface -- confirmed working via touch
+  on real hardware multiple times since via `backend-linuxkms` on this dev
+  machine's USB touchscreen; not yet validated on the actual Pi).
+- **`backend-linuxkms-noseat` doesn't cooperate with VT switching** --
+  confirmed live: with the app running from a raw VT (Dev loop #2 above),
+  Ctrl+Alt+F1 does *nothing* (not frozen -- the app keeps running fine,
+  the switch request just silently stalls forever). Without a seatd/
+  logind seat manager, a VT switch needs the process holding the VT to
+  catch `SIGUSR1` and acknowledge release via `VT_RELDISP`; `noseat` mode
+  doesn't implement that handshake, so the kernel's switch request has
+  nothing to acknowledge it. **Not an issue on the real Pi** (no desktop
+  session to switch back to there -- purely a dev-machine wrinkle). Here,
+  the only reliable recovery is killing the process from elsewhere (`ps
+  aux | grep skylight-ha`, then `kill <pid>` -- from SSH or another
+  terminal, since the stuck console's own keyboard input isn't reaching
+  anything useful either). After killing it, the display may stay black
+  until the compositor notices and repaints -- rule out plain monitor
+  power-save first (move the mouse/press a key), then try cycling VTs
+  (Ctrl+Alt+F2 then Ctrl+Alt+F1) if it's still blank. `timeout <seconds>
+  ./target/release/skylight-ha config.toml` is the simple preventative --
+  auto-kills itself, nothing to remember mid-test.
+- **Fixed -- PIN pad crashed on the 4th digit ("RefCell already
+  borrowed")**: `match some_refcell.borrow_mut().take() { ... }` keeps the
+  `RefMut` alive for the *entire* match (Rust extends a scrutinee's
+  temporaries across all its arms) -- any arm that also borrowed the same
+  `RefCell` (nearly all of them, to advance a multi-step flow) panicked
+  immediately. Same class of bug as the `MutexGuard`-in-`if let` issue
+  above (`fetch_calendar_events`'s history), just `RefCell`/`match`
+  instead of `Mutex`/`if let` -- same fix: bind the taken value to a `let`
+  first so the guard drops before the match arms run.
+- **Fixed -- refresh felt slow / "doesn't update"**: `get_states()` turned
+  out to be wildly variable in practice on the real instance -- measured
+  live at ~460ms once, 17.5s (538 entities) another time, 30s+ (didn't
+  finish within that) a third time. The old `refresh_calendar_and_todos`
+  joined calendar+todos+weather+dashboard into one wait, so the *whole*
+  refresh (including the calendar grid, which has nothing to do with
+  `get_states()`) sat blocked behind whichever fetch was slowest that
+  time. Fixed two ways: `fetch_calendar_events`/`fetch_todos` now fan out
+  one task per family member via `tokio::task::JoinSet` instead of
+  awaiting sequentially (todos preserves family-index order via a
+  pre-sized `Vec`, since `build_todo_model` zips positionally; calendar
+  events don't care about order); and the dashboard's `get_states()` fetch
+  is no longer joined with calendar/todo/weather at all -- it's a fully
+  detached `tokio::spawn` (`refresh_dashboard_only`) so a slow one can't
+  block the others, or vice versa. **`get_states()` itself being slow is
+  HA-instance-side**, not fixable in this app's code -- 538 entities is a
+  lot; recorder/database load, an unhealthy integration, or general
+  system load are the usual suspects if it recurs.
 
 ## Buildroot / OS image (on the Pop!_OS machine, `~/buildroot`)
 
@@ -187,17 +299,97 @@ with `sudo`).
   - `etc/init.d/S99skylight` — execs `/usr/bin/skylight-ha
     /etc/skylight/config.toml` via `start-stop-daemon`
   - `usr/bin/skylight-ha` — the app binary
-  - Still needed: `etc/skylight/config.toml` (and optionally
-    `ha-token.secret`) baked into the overlay — so far only tested via live
-    `scp` to the running device, not yet made permanent.
-- **eero mesh WiFi issue (unresolved, deprioritized)**: association
-  consistently succeeds but the WPA handshake times out, across all three
-  mesh BSSIDs identically. Kernel/driver logs a `Disconnect event of DFS
-  AP` even though this chip is 2.4GHz-only (no real DFS band) — suspected
-  mislabeled driver message actually reflecting eero's mesh
-  Channel-Switch-Announcement handling confusing `brcmfmac`. Not a
-  password/PMF issue (both explicitly ruled out). USB Ethernet is the
-  working network path for now.
+  - `etc/skylight/config.toml` and `etc/skylight/ha-token.secret` — both
+    now baked into the overlay permanently (this used to say "still
+    needed, only tested via live scp" — that's done).
+- **A full image has been built successfully**: `~/buildroot/output/
+  images/` has `sdcard.img`, `rootfs.ext2`/`.ext4`, the kernel `Image`,
+  and the `.dtb`, all dated **Sep 8**. Buildroot's own config is fully
+  sorted (musl toolchain, eudev, wpa_supplicant w/ WPA3+ctrl_iface+cli,
+  `brcmfmac_sdio-firmware-rpi`, kernel `CONFIG_USB_RTL8152=y` confirmed
+  set) — nothing further needed there to produce a bootable image.
+- **The baked-in binary and config.toml are stale**, though: both date
+  from **Sep 6** (matching the last successful CI run,
+  `gh run list --workflow=build-pi.yml`), which predates basically all of
+  this session's app work (multi-member calendar events, the weather
+  widget, the whole Dashboard page, the PIN lock, the refresh/latency
+  fixes). Before flashing a "real" image: trigger a fresh CI run
+  (`gh workflow run build-pi.yml` — commit+push first, it builds from the
+  GitHub remote, not local files; ~2-3.5h regardless of caching), download
+  the artifact, drop it into `board/skylight/rootfs-overlay/usr/bin/
+  skylight-ha` (`chmod 755` explicitly — see Process gotchas below), bring
+  the overlay's `config.toml` up to date with the real one (it's missing
+  `[[dashboard]]`, `pin_hash_path`, `weather_entity`/
+  `weather_backfill_entity` — none of that existed on Sep 6), then
+  rebuild (`make` in `~/buildroot`) to fold the new binary/config into a
+  fresh `sdcard.img`.
+- **eero mesh WiFi (open, now a hard requirement — see WiFi diagnostics
+  below)**: association consistently succeeds but the WPA handshake times
+  out, across all three mesh BSSIDs identically. Kernel/driver logs a
+  `Disconnect event of DFS AP` even though this chip is 2.4GHz-only (no
+  real DFS band) — suspected mislabeled driver message actually reflecting
+  eero's mesh Channel-Switch-Announcement handling confusing `brcmfmac`,
+  or a regulatory-domain misclassification (no `iw reg set`/CRDA
+  configured yet, so the kernel's default/unset reg domain may be feeding
+  into whatever's deciding "DFS"). Not a password/PMF issue (both
+  explicitly ruled out). USB Ethernet is the working network path for
+  now, but WiFi is required for the actual wall-mounted deployment (no
+  Ethernet run to that location).
+
+### WiFi diagnostics added to help solve the eero issue (2026-09-18)
+
+Four changes to the overlay/Buildroot config, purely to get enough real
+data to actually root-cause the handshake timeout next time it's tested
+against the eero mesh (none of this fixes it by itself):
+
+- **`BR2_PACKAGE_WIRELESS_REGDB=y`** enabled in Buildroot's `.config`. The
+  kernel here has `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y` (confirmed in
+  `output/build/linux-custom/.config`) but `wireless-regdb` — the package
+  that actually provides the signed `regulatory.db`/`regulatory.db.p7s`
+  the kernel needs to apply `country=US` (already set in
+  `etc/wpa_supplicant.conf`) — wasn't installed. Real possibility that the
+  country-code request has been silently failing to apply this whole
+  time, leaving the kernel on a conservative fallback regulatory domain,
+  which could easily be tangled up in whatever's making brcmfmac log a
+  "DFS AP" disconnect on a chip with no real DFS band. Kernel ≥4.15 (this
+  one's 6.12) loads the regdb straight from `/lib/firmware` — no CRDA
+  userspace daemon needed, `BR2_PACKAGE_CRDA` was deliberately left off.
+- **`etc/modprobe.d/brcmfmac.conf`** (new) sets the `brcmfmac` driver's
+  `debug` module parameter to `0xd404` — bitmask for
+  CONN|EVENT|INFO|FIL|SCAN (see `drivers/net/wireless/broadcom/brcm80211/
+  brcmfmac/debug.h` in the kernel tree for the bit values). `EVENT` is
+  specifically where the "Disconnect event of DFS AP" message itself
+  comes from; `CONN`/`FIL` should show the actual auth/assoc/IOVAR
+  sequence leading up to it.
+- **`etc/init.d/S10syslog`** (new) starts BusyBox's `syslogd`/`klogd`
+  early (before `S39ethernet`/`S40wifi`), writing to `/var/log/messages`.
+  Needed because dmesg's ring buffer is bounded and can wrap during a
+  boot with this much extra debug logging turned on — this persists
+  everything for the whole session instead.
+- **`etc/init.d/S40wifi`** — `wpa_supplicant` now launches with `-dd -t -f
+  /var/log/wpa_supplicant.log` instead of `-q`. Verbose, timestamped,
+  logged to its own file.
+
+**To actually diagnose next time**: boot, let it attempt (and fail) to
+join the eero mesh, then SSH in over the USB Ethernet fallback (still the
+reliable path) and pull `/var/log/wpa_supplicant.log` and
+`/var/log/messages`. Look for the EAPOL message sequence (which of the
+4-way handshake's messages actually got exchanged before it gave up),
+`brcmfmac`'s own connect/roam/event log lines around the same timestamp,
+and whether the "DFS" disconnect message correlates with a specific event
+(e.g. right after an eero mesh channel-switch, or right after a
+particular EAPOL message).
+
+**All of this is diagnostic-only and should come back out once the issue
+is actually fixed** — `brcmfmac.conf`'s debug level and `-dd` are both
+too noisy for normal operation, and `S10syslog` writing continuously to
+`/var/log/messages` isn't something a production image needs either.
+Checked `output/target/etc/fstab`: unlike `/tmp`/`/run`/`/dev/shm`
+(tmpfs), `/var` is a plain directory on the real (`ext2`, read-write)
+rootfs, not tmpfs -- so these logs *do* persist across reboots (handy for
+catching an overnight retry, but also a real SD-card-wear concern for
+continuous verbose logging left on long-term, another reason this is
+meant to come back out once solved).
 
 ## Process gotchas worth remembering
 
