@@ -18,6 +18,18 @@ Windows machine is retired. On this box:
   testing happen here.
 - Buildroot source tree: `~/buildroot` — a **separate** checkout, NOT this
   repo, still used only for the Pi OS image (see Buildroot section below).
+  It's a clone of upstream Buildroot's own repo (`gitlab.com/
+  buildroot.org/buildroot.git`) — don't expect `git status`/`git log` in
+  there to show project history; that's upstream's.
+- **The actual board overlay lives in its own repo now**:
+  `~/pizero2-buildroot` (github.com/siesta5787/pizero2-buildroot,
+  private). `~/buildroot/.config`'s `BR2_ROOTFS_OVERLAY` points at
+  `~/pizero2-buildroot/rootfs-overlay` (an external absolute path, not
+  anything inside `~/buildroot` itself) — this used to live untracked at
+  `~/buildroot/board/skylight/rootfs-overlay/`, with zero version control
+  or backup, until 2026-09-27. See that repo's own README for what's in
+  it and why it's separate (kept general-purpose on purpose, in case this
+  Buildroot setup gets reused for a different app someday).
 - `config.toml` and `ha-token.secret` are both `.gitignore`d — recreate on
   a fresh clone (`cp config.example.toml config.toml`, fill in real values;
   `ha-token.secret` is a single line with the token). The `config.toml`
@@ -400,10 +412,15 @@ disable/unlock flow, paired with a dedicated numeric `PinPad` component
   `CONFIG_USB_RTL8152` kernel driver (Realtek uses a vendor-specific
   protocol, not generic CDC-ECM, so the generic driver won't work for this
   one).
-- Overlay directory: `board/skylight/rootfs-overlay/` (an arbitrary name
-  chosen for this project, not a Buildroot-recognized board — had to be
-  manually `mkdir -p`'d, doesn't pre-exist). Set via System configuration →
-  Root filesystem overlay directories. Contents as of 2026-09-27:
+- Overlay directory: **`~/pizero2-buildroot/rootfs-overlay/` — outside
+  `~/buildroot` entirely, in its own repo** (see the note in "One machine
+  now" above; moved there 2026-09-27, used to live untracked at
+  `~/buildroot/board/skylight/rootfs-overlay/`). `~/buildroot/.config`'s
+  `BR2_ROOTFS_OVERLAY` points at it by absolute path. Set via System
+  configuration → Root filesystem overlay directories if it's ever lost
+  from `.config` (**verify with `grep BR2_ROOTFS_OVERLAY .config`
+  afterward** — same "menuconfig changes don't land" gotcha as everything
+  else in this section). Contents as of 2026-09-27:
   - `etc/wpa_supplicant.conf` — `country=US` + a placeholder network block
     (`YourNetworkName`/`YourPassword`). **The real SSID/password only ever
     exist hand-edited directly on the physical SD card**, never in this
@@ -451,7 +468,7 @@ disable/unlock flow, paired with a dedicated numeric `PinPad` component
   itself.
 - **Keeping the overlay's binary current**: after any Rust change, rebuild
   aarch64 locally (see "Building the Pi binary" above), `cp` the result
-  into `board/skylight/rootfs-overlay/usr/bin/skylight-ha`, `chmod 755`
+  into `~/pizero2-buildroot/rootfs-overlay/usr/bin/skylight-ha`, `chmod 755`
   it, `md5sum` both copies to confirm the copy landed correctly, *then*
   `make` in `~/buildroot`. As of 2026-09-27 the overlay's binary/config
   are current with everything described in this doc (all of App
