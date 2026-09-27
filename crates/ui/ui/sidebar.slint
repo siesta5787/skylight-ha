@@ -140,12 +140,24 @@ component SettingsIcon inherits Rectangle {
 component NavItem inherits Rectangle {
     in property <string> label;
     in property <bool> active;
+    // A small unread-style dot in the top-right corner. Currently only used
+    // by Settings, to signal that a software update is available without
+    // making the user go looking (see update-overlay.slint / update.rs).
+    in property <bool> badge: false;
     callback tapped();
 
     height: 78px;
     background: touch.pressed ? Theme.border : transparent;
 
     touch := TouchArea {
+        // Sized explicitly. It used to be this Rectangle's sole child and
+        // relied on Slint's implicit "fill the parent" behaviour, which is
+        // documented in this project's CLAUDE.md as unreliable the moment a
+        // second child appears -- and the badge dot below is exactly that
+        // second child. Getting this wrong breaks touch on the whole nav rail.
+        width: 100%;
+        height: 100%;
+
         clicked => { tapped(); }
 
         VerticalLayout {
@@ -164,10 +176,28 @@ component NavItem inherits Rectangle {
             }
         }
     }
+
+    // Declared after the TouchArea so it paints on top; absolutely positioned
+    // so it takes part in no layout and cannot disturb the icon/caption
+    // column above. Always present, only `visible` toggling -- not an `if`,
+    // for the same reason.
+    Rectangle {
+        visible: root.badge;
+        x: parent.width - self.width - 14px;
+        y: 12px;
+        width: 10px;
+        height: 10px;
+        border-radius: 5px;
+        background: #e0607a;
+    }
 }
 
 export component Sidebar inherits Rectangle {
     in property <Page> active-page;
+    // Dot on the Settings nav item, set when the updater has found an
+    // installable newer release. Nothing here auto-installs -- this is the
+    // whole of the "come and look" nudge.
+    in property <bool> settings-badge: false;
     callback page-selected(Page);
 
     width: Theme.sidebar-width;
@@ -217,6 +247,7 @@ export component Sidebar inherits Rectangle {
         NavItem {
             label: "Settings";
             active: root.active-page == Page.Settings;
+            badge: root.settings-badge;
             tapped => { root.page-selected(Page.Settings); }
             SettingsIcon { icon-color: root.settings-color; }
         }

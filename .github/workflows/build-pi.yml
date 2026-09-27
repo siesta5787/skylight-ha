@@ -3,7 +3,28 @@ name: Build Pi binary (aarch64-musl)
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    # `master`, not `main`. This said `main` from the start and therefore never
+    # once fired -- this repository's default branch has always been `master`.
+    #
+    # `paths-ignore` matters more here than it usually would: a run takes
+    # 2-3.5h regardless of caching (QEMU emulation tax, not something caching
+    # fixes), so a README-only commit triggering one is a real cost.
+    branches: [master]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+    # Pushing an annotated tag is what publishes a real GitHub Release (see the
+    # `release` job below), which is what the in-app updater polls. A tag push
+    # matches this filter only, not the `branches` one above, so tagging
+    # doesn't double-build.
+    tags: ['v*']
+
+# A superseded run is wasted hours. Tag runs are never cancelled -- they
+# publish a release, and losing one halfway through would leave a tag with no
+# assets behind it.
+concurrency:
+  group: build-pi-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
@@ -33,12 +54,17 @@ jobs:
       # exactly -- so building natively inside an emulated aarch64 Alpine
       # container gets us correctly-linked libinput/libudev for free,
       # instead of assembling a cross sysroot by hand.
+      #
+      # SKYLIGHT_GIT_SHA is passed in rather than letting build.rs ask git:
+      # the container has no git installed, and a bind-mounted checkout would
+      # trip git's "dubious ownership" check even if it did. See build.rs.
       - name: Build inside emulated aarch64 Alpine container
         run: |
           mkdir -p .cache/cargo-registry target
           docker run --rm --platform linux/arm64 \
             -v "${{ github.workspace }}":/workspace -w /workspace \
             -v "${{ github.workspace }}/.cache/cargo-registry":/root/.cargo/registry \
+            -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
             alpine:3.20 sh -c '
               set -eu
               apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
@@ -49,8 +75,135 @@ jobs:
                 --no-default-features -F ui/backend-linuxkms
             '
 
+      # Still needed even now that tags publish releases: the manual
+      # reflash path (copy into pizero2-buildroot's rootfs-overlay, then
+      # `make`) consumes this artifact, and a plain master-branch build has no
+      # release to attach anything to.
       - uses: actions/upload-artifact@v4
         with:
           name: skylight-ha-aarch64-linux-musl
           path: target/release/skylight-ha
           if-no-files-found: error
+
+  # Publishes the GitHub Release the in-app updater polls. Only on a tag.
+  #
+  # Two assets, and the updater needs both:
+  #   skylight-ha-aarch64-linux-musl  -- the raw binary
+  #   manifest.json                   -- version + sha256 + size + flags
+  # both reachable at the stable, unauthenticated, rate-limit-free
+  # https://github.com/<owner>/skylight-ha/releases/latest/download/<name>
+  # redirect. That URL also skips prereleases automatically, which is the whole
+  # test channel: tag `v0.3.0-rc1`, it goes out as a prerelease (see the `-`
+  # check below), and no device ever sees it.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # `gh release create` writes to the repo.
+      contents: write
+    steps:
+      # fetch-depth: 0 so the annotated tag's own message is available below --
+      # it's the source of the manifest's `notes` and of the opt-in
+      # `requires-reflash` flag.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: skylight-ha-aarch64-linux-musl
+          path: dist
+
+      # The single highest-value gate in this whole pipeline. Runs the *actual
+      # artifact that is about to be published*, on emulated aarch64, with only
+      # the three runtime libraries the target image provides -- so a wrong
+      # architecture, a missing DT_NEEDED, or a forgotten Cargo.toml version
+      # bump all fail here rather than on a wall-mounted Pi with no keyboard.
+      #
+      # Safe to run at all because `--version` is handled as the very first
+      # thing in main(), before any Slint/DRM/config initialisation. It is the
+      # same check the on-device installer performs as its preflight.
+      - name: Verify the built binary reports the tagged version
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          EXPECTED="${TAG#v}"
+          chmod 755 dist/skylight-ha
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/dist":/dist:ro \
+            alpine:3.20 sh -c '
+              set -eu
+              apk add --no-cache libinput eudev-libs libxkbcommon >/dev/null
+              /dist/skylight-ha --version
+            ' | tee version.txt
+          REPORTED="$(head -n 1 version.txt | cut -d' ' -f2)"
+          echo "tag says $EXPECTED, binary says $REPORTED"
+          if [ "$REPORTED" != "$EXPECTED" ]; then
+            echo "::error::version mismatch: tag $TAG implies $EXPECTED but the binary reports $REPORTED. Bump the workspace version in Cargo.toml (and Cargo.lock) to match the tag." >&2
+            exit 1
+          fi
+
+      - name: Render manifest.json
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          ASSET="skylight-ha-aarch64-linux-musl"
+          mv dist/skylight-ha "dist/$ASSET"
+          SHA256="$(sha256sum "dist/$ASSET" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "dist/$ASSET")"
+
+          # The annotated tag's message becomes the manifest's `notes` (shown
+          # in the on-device Settings card, so it's trimmed to something that
+          # fits) and carries the opt-in reflash flag. A `requires-reflash:
+          # true` trailer in the tag message means "this release needs more
+          # than a new binary" -- a new required config.toml key, a kernel or
+          # overlay change -- and the app will report it but refuse to install
+          # it in-app.
+          TAG_MESSAGE="$(git for-each-ref "refs/tags/$TAG" --format='%(contents)')"
+          REQUIRES_REFLASH=false
+          if printf '%s\n' "$TAG_MESSAGE" | grep -qiE '^requires-reflash:[[:space:]]*true[[:space:]]*$'; then
+            REQUIRES_REFLASH=true
+          fi
+          NOTES="$(printf '%s\n' "$TAG_MESSAGE" \
+            | grep -viE '^requires-reflash:' \
+            | grep -viE '^-----BEGIN PGP' \
+            | head -c 400)"
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg asset "$ASSET" \
+            --arg sha256 "$SHA256" \
+            --argjson size "$SIZE" \
+            --argjson requires_reflash "$REQUIRES_REFLASH" \
+            --arg notes "$NOTES" \
+            '{version:$version, asset:$asset, sha256:$sha256, size:$size, requires_reflash:$requires_reflash, notes:$notes}' \
+            > manifest.json
+          cat manifest.json
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Any tag with a hyphen (v0.3.0-rc1) is a prerelease, which keeps it
+          # out of /releases/latest/download/ and therefore invisible to every
+          # device. That is the test channel.
+          case "$TAG" in
+            *-*) PRERELEASE=(--prerelease) ;;
+            *)   PRERELEASE=() ;;
+          esac
+          gh release create "$TAG" \
+            "dist/skylight-ha-aarch64-linux-musl" \
+            "manifest.json" \
+            --title "$TAG" \
+            --generate-notes \
+            --verify-tag \
+            "${PRERELEASE[@]}"

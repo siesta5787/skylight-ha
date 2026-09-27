@@ -1,0 +1,100 @@
+import { Theme } from "theme.slint";
+
+// The full-screen "Updating..." curtain, shown for a beat immediately before
+// the app calls exit(0) so that `skylight-supervise` can respawn it against
+// the newly-swapped-in binary.
+//
+// Why it exists at all: this is a DRM/KMS process on a wall-mounted display,
+// and a DRM process's last rendered frame stays on screen after it exits.
+// Without this, a perfectly successful update looks exactly like a crash --
+// the dashboard freezes mid-render for 2-4 seconds and then redraws.
+//
+// STRUCTURAL CONSTRAINT, load-bearing -- read before moving this:
+// this component is instantiated as a *top-level sibling* in
+// app-window.slint, always present, sized unconditionally (width/height
+// 100%), with only `visible: open` toggling it. It is deliberately NOT a
+// second `if` alternate nested inside a page's own Rectangle. That shape was
+// tried once for a Settings -> Logs page and rendered correctly while never
+// responding to touch *anywhere on the page*, even after wrapping both
+// alternates in a single outer VerticalLayout -- see the "Attempted and
+// reverted: a Settings -> Logs page" entry in CLAUDE.md. PinPad
+// (pin-pad.slint) is the shape that is confirmed to work on real hardware,
+// and this mirrors it exactly.
+export component UpdateOverlay inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> title: "Updating...";
+    in property <string> detail: "";
+
+    visible: open;
+    width: 100%;
+    height: 100%;
+    background: #14161fcc;
+    // Above PinPad's 3000 and VirtualKeyboard's 2000: once the swap has
+    // happened the process is seconds from exiting, and nothing should be
+    // able to sit on top of the explanation for why the screen is about to
+    // go blank.
+    z: 4000;
+
+    // Swallows taps for the ~1.5s this is up, so a stray touch can't reach
+    // the dashboard underneath while the binary is being replaced. Sized
+    // explicitly rather than relying on implicit "sole child fills parent"
+    // sizing, since there is a sibling card below.
+    TouchArea {
+        width: 100%;
+        height: 100%;
+    }
+
+    Rectangle {
+        width: 420px;
+        // No explicit height: sized by the VerticalLayout's content, the same
+        // way PinPad's card is (a fixed height there was once ~40px short of
+        // what the content needed and spilled past the rounded corner).
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding: 28px;
+            spacing: 14px;
+            alignment: center;
+
+            Text {
+                text: root.title;
+                font-size: 20px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            Text {
+                text: root.detail;
+                font-size: 14px;
+                color: Theme.text-muted;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+
+            // A static barber-pole-free progress hint: no animation, because
+            // this is only on screen for about a second and a half and an
+            // animated indicator would just draw attention to the frozen
+            // frame that follows it.
+            Rectangle {
+                height: 6px;
+                border-radius: 3px;
+                background: Theme.border;
+
+                Rectangle {
+                    x: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    border-radius: 3px;
+                    background: Theme.accent;
+                }
+            }
+        }
+    }
+}

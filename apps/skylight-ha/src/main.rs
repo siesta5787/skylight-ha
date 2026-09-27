@@ -1,3 +1,5 @@
+mod update;
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -145,6 +147,24 @@ fn reference_date_after_today_changed(
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `--version` is answered before *anything* else -- before the tracing
+    // subscriber, before reading config.toml, before any Slint/DRM
+    // initialisation. That ordering is load-bearing, not tidiness: the
+    // updater's install preflight (see `update::install`) runs the
+    // freshly-downloaded binary with this flag while the currently-running app
+    // still holds DRM master, and it must therefore never touch the display,
+    // the input devices, or the config file. Getting exit code 0 and a
+    // matching version line out of it is what proves the download is the right
+    // architecture, links against a compatible libc and
+    // libinput/libudev/libxkbcommon, and isn't truncated -- all before the
+    // atomic swap happens.
+    if args.iter().any(|arg| arg == "--version" || arg == "-V") {
+        println!("{}", update::version_line());
+        return;
+    }
+
     tracing_subscriber::fmt::init();
 
     // First offset lookup. Deliberately here, at the very top of `main`,
@@ -164,7 +184,13 @@ fn main() {
     }
     let today = OffsetDateTime::now_utc().to_offset(local_offset()).date();
 
-    let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
+    // First non-flag argument, so that `--version` (handled above) and any
+    // future flag can't be mistaken for the config path.
+    let config_path = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .cloned()
+        .unwrap_or_else(|| "config.toml".into());
     let config = match Config::load(&config_path) {
         Ok(config) => config,
         Err(err) => {
@@ -1063,6 +1089,91 @@ fn main() {
         });
     }
 
+    // ---- In-app software update -------------------------------------------
+    // Deliberately configured from constants + environment variables rather
+    // than `config.toml`: that file is `deny_unknown_fields` and a parse
+    // failure is a hard `exit(1)` before any window exists, so a rollback to
+    // a binary predating a new updater key would crash-loop with the rollback
+    // already spent. See the module docs in update.rs.
+    let update_settings = Arc::new(update::Settings::from_env());
+    // A staged `<target>.new` left over from an install that failed or was
+    // interrupted. ~20 MB on a small rootfs, so it goes at every startup; the
+    // supervisor does the same before each spawn, since the app isn't
+    // necessarily what runs next.
+    update::cleanup_stale_staging(&update_settings);
+    // One check or install at a time. Shared with the periodic task, so it's
+    // an atomic rather than a `Cell` -- the manual button lives on the UI
+    // thread and the periodic check lives on a tokio worker.
+    let update_busy = Arc::new(AtomicBool::new(false));
+    // The manifest a successful check found, so the Install button knows what
+    // it is installing without re-fetching.
+    let update_latest: Arc<Mutex<Option<update::Manifest>>> = Arc::new(Mutex::new(None));
+
+    app.set_update_version_line(format!("Skylight HA {}", update::CURRENT_VERSION).into());
+    app.set_update_build_line(format!("build {}", update::GIT_SHA).into());
+    apply_update_state(&app, &update::State::load(&update_settings), false);
+    {
+        let update_settings = update_settings.clone();
+        let update_busy = update_busy.clone();
+        let update_latest = update_latest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_update_check_requested(move || {
+            let update_settings = update_settings.clone();
+            let update_busy = update_busy.clone();
+            let update_latest = update_latest.clone();
+            let app_weak = app_weak.clone();
+            rt_handle.spawn(async move {
+                run_one_update_check(&update_settings, &app_weak, &update_busy, &update_latest)
+                    .await;
+            });
+        });
+    }
+    {
+        let update_settings = update_settings.clone();
+        let update_busy = update_busy.clone();
+        let update_latest = update_latest.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_update_install_requested(move || {
+            let Some(manifest) = update_latest.lock().unwrap().clone() else {
+                tracing::warn!("install tapped with no manifest in hand; ignoring");
+                return;
+            };
+            // `swap` rather than load-then-store: two taps in quick succession
+            // on a touchscreen are common, and the second must lose.
+            if update_busy.swap(true, Ordering::SeqCst) {
+                tracing::info!("an update check or install is already running; ignoring the tap");
+                return;
+            }
+            let update_settings = update_settings.clone();
+            let update_busy = update_busy.clone();
+            let app_weak = app_weak.clone();
+            rt_handle.spawn(async move {
+                run_update_install(&update_settings, &app_weak, &update_busy, manifest).await;
+            });
+        });
+    }
+
+    // Proof of life, and the app's half of the rollback contract: the
+    // supervisor treats a `pending` marker that is still present when the
+    // child dies as a failed update, so something has to clear it once the
+    // new binary has demonstrably worked. A *Slint* timer is the right
+    // instrument because it only fires if the event loop is genuinely
+    // running -- much stronger evidence than "the process hasn't exited",
+    // which a binary wedged before `app.run()` would also satisfy.
+    //
+    // Deliberately not gated on a successful HA connection: WiFi or HA being
+    // briefly down is routine here and says nothing about whether this binary
+    // works, and gating on it would roll back perfectly good releases during
+    // a router reboot.
+    {
+        let update_settings = update_settings.clone();
+        slint::Timer::single_shot(std::time::Duration::from_secs(60), move || {
+            update::commit_pending(&update_settings);
+        });
+    }
+
     // The 1s clock tick does three jobs, not one:
     //   1. redraw the clock/date text (what it always did),
     //   2. re-derive the local UTC offset, so a clock corrected by NTP after
@@ -1162,7 +1273,301 @@ fn main() {
         dashboard_sections,
     ));
 
+    // Same shape as `run_ha_sync`: a detached task on the same runtime that
+    // talks to the UI only through `slint::invoke_from_event_loop`. It can
+    // fail as much as it likes without affecting anything else.
+    rt.spawn(run_update_checks(
+        update_settings,
+        app.as_weak(),
+        update_busy,
+        update_latest,
+    ));
+
     app.run().expect("event loop error");
+}
+
+/// The periodic update check.
+///
+/// Lives in the Rust app rather than in `crond` -- a deliberate departure from
+/// this project's usual "system automation is shell + cron" norm, forced by the
+/// target image: busybox here is built without HTTPS support, there is no
+/// `curl` or `openssl`, and `/etc/ssl/certs` is empty, so a shell script on
+/// this device physically cannot fetch a manifest. This binary already carries
+/// rustls and a bundled root store for Home Assistant.
+///
+/// Never installs anything. The most it does is set a dot on the Settings nav
+/// item.
+async fn run_update_checks(
+    settings: Arc<update::Settings>,
+    app_weak: slint::Weak<AppWindow>,
+    busy: Arc<AtomicBool>,
+    latest: Arc<Mutex<Option<update::Manifest>>>,
+) {
+    if !settings.periodic_enabled {
+        tracing::info!(
+            "periodic update checks are off (SKYLIGHT_UPDATE_DISABLE); the Settings button still works"
+        );
+        return;
+    }
+    tracing::info!(
+        first_check_in_secs = settings.first_check_delay.as_secs(),
+        interval_secs = settings.check_interval.as_secs(),
+        base_url = %settings.base_url,
+        "update checks armed"
+    );
+
+    // The first check waits out the documented cold-boot settling window
+    // (WiFi association, then DHCP, then the NTP correction off the 1970
+    // kernel epoch -- 30s to a minute, inconsistently). Checking sooner would
+    // mostly just record a failure.
+    tokio::time::sleep(settings.first_check_delay).await;
+    loop {
+        run_one_update_check(&settings, &app_weak, &busy, &latest).await;
+        // Jitter so a fleet, or one device that reboots on a schedule, doesn't
+        // hit GitHub in lockstep.
+        tokio::time::sleep(settings.check_interval + update::jitter(settings.check_interval)).await;
+    }
+}
+
+/// One check: mark busy, fetch, record, push to the UI. Shared by the periodic
+/// task and the Settings button so the two can't diverge.
+async fn run_one_update_check(
+    settings: &update::Settings,
+    app_weak: &slint::Weak<AppWindow>,
+    busy: &Arc<AtomicBool>,
+    latest: &Arc<Mutex<Option<update::Manifest>>>,
+) {
+    if busy.swap(true, Ordering::SeqCst) {
+        tracing::info!("an update check or install is already running; skipping this one");
+        return;
+    }
+    push_update_status(app_weak, settings, "Checking for updates...", true);
+
+    let outcome = match update::http_client() {
+        Ok(http) => update::check(settings, &http).await,
+        Err(err) => Err(update::Error::Http(err)),
+    };
+    busy.store(false, Ordering::SeqCst);
+
+    // Every failure here is soft by design: a wall appliance whose WiFi is
+    // occasionally down must not treat "couldn't reach GitHub" as anything
+    // more than a line of text in Settings.
+    match &outcome {
+        Ok(update::CheckOutcome::ClockNotReady) => {
+            *latest.lock().unwrap() = None;
+            // No state was persisted (this isn't a real check), so say so
+            // directly rather than going through `apply_update_state`.
+            push_update_status(
+                app_weak,
+                settings,
+                "Waiting for the clock to be set before checking.",
+                false,
+            );
+            return;
+        }
+        Ok(update::CheckOutcome::Available(manifest)) => {
+            tracing::info!(version = %manifest.version, "an update is available");
+            *latest.lock().unwrap() = Some(manifest.clone());
+        }
+        Ok(other) => {
+            tracing::info!(?other, "update check finished with nothing to install");
+            *latest.lock().unwrap() = None;
+        }
+        Err(err) => {
+            tracing::warn!(%err, "update check failed (soft -- will retry)");
+            *latest.lock().unwrap() = None;
+        }
+    }
+
+    let state = update::State::load(settings);
+    let app_weak = app_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = app_weak.upgrade() {
+            apply_update_state(&app, &state, false);
+        }
+    });
+}
+
+/// Download, verify, preflight, swap, then show the overlay and exit so the
+/// supervisor respawns against the new binary.
+async fn run_update_install(
+    settings: &update::Settings,
+    app_weak: &slint::Weak<AppWindow>,
+    busy: &Arc<AtomicBool>,
+    manifest: update::Manifest,
+) {
+    let version = manifest.version.clone();
+    tracing::info!(%version, "starting update install");
+
+    let progress = {
+        let app_weak = app_weak.clone();
+        move |phase: update::Phase| {
+            let text = match phase {
+                update::Phase::Downloading { received, total } => {
+                    let percent = received.checked_mul(100).and_then(|n| n.checked_div(total)).unwrap_or(0);
+                    format!("Downloading... {percent}%")
+                }
+                update::Phase::Verifying => "Verifying download...".to_string(),
+                update::Phase::Preflight => "Checking the new version runs...".to_string(),
+                update::Phase::Installing => "Installing...".to_string(),
+            };
+            let app_weak = app_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    app.set_update_status_text(text.into());
+                    app.set_update_busy(true);
+                }
+            });
+        }
+    };
+
+    let result = match update::http_client() {
+        Ok(http) => update::install(settings, &http, &manifest, &progress).await,
+        Err(err) => Err(update::Error::Http(err)),
+    };
+
+    match result {
+        Ok(()) => {
+            // Note `busy` is deliberately *not* cleared: the binary on disk is
+            // no longer the one running, so there is nothing sensible left to
+            // do in this process but exit.
+            let app_weak = app_weak.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = app_weak.upgrade() else {
+                    // Without a window there's no frame to paint, so nothing
+                    // is gained by waiting.
+                    std::process::exit(0);
+                };
+                app.set_update_status_text("Restarting...".into());
+                app.set_update_overlay_detail(
+                    format!("Installing version {version} and restarting. This takes a few seconds.")
+                        .into(),
+                );
+                app.set_update_overlay_open(true);
+                // Give Slint a chance to actually *paint* the overlay before
+                // the process goes away: this is a DRM/KMS app, so whatever
+                // frame is on screen when it exits is what stays on screen
+                // until the respawn draws over it. Without this the user sees
+                // a frozen dashboard, which is indistinguishable from the
+                // crash this feature is supposed to avoid looking like.
+                slint::Timer::single_shot(std::time::Duration::from_millis(1500), || {
+                    tracing::info!("exiting so skylight-supervise respawns the new binary");
+                    std::process::exit(0);
+                });
+            });
+        }
+        Err(err) => {
+            tracing::error!(%err, %version, "update install failed");
+            busy.store(false, Ordering::SeqCst);
+            let message = format!("Update failed: {}", update::short_error(&err));
+            let app_weak = app_weak.clone();
+            let settings_snapshot = settings.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(app) = app_weak.upgrade() {
+                    // Re-apply the persisted state first so the version/notes
+                    // lines and the Install button come back, then overwrite
+                    // just the status line with why it failed.
+                    apply_update_state(&app, &update::State::load(&settings_snapshot), false);
+                    app.set_update_status_text(message.into());
+                }
+            });
+        }
+    }
+}
+
+/// Pushes one status line (and the busy flag) without touching anything else.
+/// Used for the transient "Checking..."/"Waiting for the clock" states that
+/// aren't worth persisting.
+fn push_update_status(
+    app_weak: &slint::Weak<AppWindow>,
+    settings: &update::Settings,
+    text: &str,
+    busy: bool,
+) {
+    let text = text.to_string();
+    let settings = settings.clone();
+    let app_weak = app_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app) = app_weak.upgrade() {
+            // Keep the rest of the card consistent (version line, install
+            // button) with whatever was last persisted.
+            apply_update_state(&app, &update::State::load(&settings), busy);
+            app.set_update_status_text(text.into());
+        }
+    });
+}
+
+/// Renders a persisted [`update::State`] into the Settings card's properties.
+///
+/// All the "what should this say" logic is here rather than in `.slint`
+/// because it has to fold together six mutually-exclusive situations, and Rust
+/// already has to decide between them to write `state.json` at all.
+fn apply_update_state(app: &AppWindow, state: &update::State, busy: bool) {
+    app.set_update_available(state.available);
+    app.set_update_installable(state.installable());
+    app.set_update_busy(busy);
+    app.set_update_notes(state.notes.clone().unwrap_or_default().into());
+    if let Some(version) = &state.latest_version {
+        app.set_update_install_label(format!("Install {version}").into());
+    }
+    app.set_update_status_text(update_status_line(state, busy).into());
+}
+
+/// The single line under the version in the Software Update card.
+///
+/// Split out from `apply_update_state` purely so it can be unit-tested without
+/// a live `AppWindow`.
+fn update_status_line(state: &update::State, busy: bool) -> String {
+    if busy {
+        return "Checking for updates...".to_string();
+    }
+    let latest = state.latest_version.as_deref().unwrap_or("?");
+    if state.blocked {
+        return format!(
+            "Version {latest} was installed but failed to start, so it won't be offered again."
+        );
+    }
+    if state.requires_reflash {
+        return format!(
+            "Version {latest} is available, but needs a manual SD-card reflash rather than an \
+             in-app update."
+        );
+    }
+    if state.available {
+        return format!("Version {latest} is available.");
+    }
+    match (&state.last_check_error, state.last_check_epoch) {
+        (Some(err), _) => format!("Last check failed: {err}"),
+        (None, Some(epoch)) => {
+            format!("Up to date. Last checked {}.", format_check_time(epoch, local_offset()))
+        }
+        (None, None) => "Not checked yet.".to_string(),
+    }
+}
+
+/// Renders a stored check timestamp in local time.
+///
+/// Callers pass the current [`local_offset`] (the self-correcting one the clock
+/// tick maintains), so a check recorded before NTP fixed the clock isn't
+/// rendered in the wrong DST bucket afterwards. Taken as an argument rather
+/// than read from the global purely so this is testable without writing to
+/// `LOCAL_OFFSET_SECONDS`, which the offset tests also read.
+///
+/// A value the `time` crate can't represent falls back to the raw epoch rather
+/// than being hidden -- it's diagnostic text either way.
+fn format_check_time(epoch: u64, offset: UtcOffset) -> String {
+    // `try_from`, not `as i64`: an absurd stored value would otherwise wrap to
+    // a negative timestamp and render as a plausible-looking 1969 date instead
+    // of being recognised as nonsense.
+    match i64::try_from(epoch).map_err(|_| ()).and_then(|secs| {
+        OffsetDateTime::from_unix_timestamp(secs).map_err(|_| ())
+    }) {
+        Ok(when) => {
+            let local = when.to_offset(offset);
+            format!("{} {}", local.date(), format_time_12h(local))
+        }
+        Err(_) => format!("at {epoch}"),
+    }
 }
 
 fn navigate(app_weak: &slint::Weak<AppWindow>, new_date: Date) {
@@ -3267,6 +3672,65 @@ mod tests {
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(""))), None);
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!([255, 0]))), None);
         assert_eq!(parse_ha_color_attribute(Some(&serde_json::json!(null))), None);
+    }
+
+    /// The Software Update card's single status line. Six mutually exclusive
+    /// situations fold into it, which is exactly why the decision lives in
+    /// Rust rather than in `.slint` expressions -- and why it's worth pinning
+    /// down here.
+    #[test]
+    fn describes_every_update_state() {
+        let never = update::State::default();
+        assert_eq!(update_status_line(&never, false), "Not checked yet.");
+        assert_eq!(
+            update_status_line(&never, true),
+            "Checking for updates...",
+            "busy wins over everything else"
+        );
+
+        let failed = update::State {
+            last_check_epoch: Some(1_760_000_000),
+            last_check_error: Some("could not reach GitHub".into()),
+            ..update::State::default()
+        };
+        assert_eq!(update_status_line(&failed, false), "Last check failed: could not reach GitHub");
+
+        let current = update::State {
+            last_check_epoch: Some(1_760_000_000),
+            latest_version: Some("0.1.0".into()),
+            ..update::State::default()
+        };
+        assert!(update_status_line(&current, false).starts_with("Up to date. Last checked "));
+
+        let available = update::State {
+            last_check_epoch: Some(1_760_000_000),
+            latest_version: Some("0.9.0".into()),
+            available: true,
+            ..update::State::default()
+        };
+        assert_eq!(update_status_line(&available, false), "Version 0.9.0 is available.");
+
+        let reflash = update::State { requires_reflash: true, ..available.clone() };
+        assert!(
+            update_status_line(&reflash, false).contains("manual SD-card reflash"),
+            "a reflash-only release has to say so, since no Install button appears"
+        );
+        assert!(!reflash.installable());
+
+        let blocked = update::State { available: false, blocked: true, ..available.clone() };
+        assert!(update_status_line(&blocked, false).contains("failed to start"));
+        assert!(!blocked.installable());
+    }
+
+    /// A stored check timestamp renders in local time rather than UTC, using
+    /// the same self-correcting offset as the clock.
+    #[test]
+    fn formats_a_check_timestamp_in_local_time() {
+        let edt = UtcOffset::from_whole_seconds(-4 * 3600).unwrap();
+        // 2025-10-09T08:53:20Z -> 04:53 EDT.
+        assert_eq!(format_check_time(1_760_000_000, edt), "2025-10-09 4:53 AM");
+        assert_eq!(format_check_time(1_760_000_000, UtcOffset::UTC), "2025-10-09 8:53 AM");
+        assert_eq!(format_check_time(u64::MAX, edt), format!("at {}", u64::MAX));
     }
 
     fn member(id: &str, name: &str) -> FamilyMember {

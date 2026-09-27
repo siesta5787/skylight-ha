@@ -2,35 +2,100 @@ import { Theme } from "theme.slint";
 
 component SettingsButton inherits Rectangle {
     in property <string> label;
+    // Outlined in red, for anything that switches protection off.
     in property <bool> danger: false;
+    // Outlined in the neutral border colour, for a non-committal action next
+    // to a primary one (e.g. "Check for updates" beside "Install 0.2.0").
+    in property <bool> secondary: false;
+    // Greyed out and non-tappable. Used by the Software Update card while a
+    // check or download is in flight -- the work happens on a tokio task, and
+    // a second tap while it runs would be ignored anyway, so say so visually
+    // rather than looking broken.
+    in property <bool> enabled: true;
     callback tapped();
+
+    property <bool> outlined: root.danger || root.secondary;
 
     height: 44px;
     border-radius: 10px;
-    background: danger ? transparent : Theme.accent;
+    background: !root.enabled
+        ? Theme.surface-alt
+        : (root.outlined ? transparent : Theme.accent);
     border-width: 1px;
-    border-color: danger ? #d9534f : Theme.accent;
+    border-color: !root.enabled
+        ? Theme.border
+        : (root.danger ? #d9534f : (root.secondary ? Theme.border : Theme.accent));
 
     TouchArea {
-        clicked => { root.tapped(); }
+        // Guarded here rather than by wrapping the whole button in an `if`:
+        // swapping a component in and out of a layout as its enabled state
+        // changes is exactly the kind of conditional-structure churn this
+        // project has been bitten by in Slint before.
+        clicked => { if root.enabled { root.tapped(); } }
         Text {
             text: root.label;
             font-size: 14px;
             font-weight: 700;
-            color: danger ? #d9534f : white;
+            color: !root.enabled
+                ? Theme.text-muted
+                : (root.danger ? #d9534f : (root.secondary ? Theme.text-primary : white));
             horizontal-alignment: center;
             vertical-alignment: center;
         }
     }
 }
 
-// The Settings page. Just the parental PIN lock for now -- everything
-// else on this page is still to come.
+// Shared frame for each titled block on this page.
+component SettingsCard inherits Rectangle {
+    in property <string> title;
+
+    background: Theme.surface-alt;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        Text {
+            text: root.title;
+            font-size: 16px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+
+        @children
+    }
+}
+
+// The Settings page: the parental PIN lock, and the in-app software updater.
 export component SettingsPage inherits Rectangle {
     in property <bool> pin-configured;
     callback pin-setup-requested();
     callback pin-change-requested();
     callback pin-disable-requested();
+
+    // --- Software update (see apps/skylight-ha/src/update.rs) --------------
+    // All Rust-computed strings rather than logic expressed here: the status
+    // line has to fold together "never checked" / "checking" / "up to date" /
+    // "failed, here's why" / "available" / "needs a reflash" / "blocked",
+    // which is a judgement Rust already has to make anyway to persist
+    // state.json.
+    in property <string> update-version-line: "";
+    in property <string> update-build-line: "";
+    in property <string> update-status-text: "";
+    in property <string> update-notes: "";
+    // Whether there is a newer version that this device is actually allowed
+    // to install -- false for a reflash-only or previously-failed release, so
+    // the install button stays absent rather than offering something that
+    // would be refused.
+    in property <bool> update-installable: false;
+    in property <string> update-install-label: "Install update";
+    // A check or an install is in flight; both buttons go inert.
+    in property <bool> update-busy: false;
+    callback update-check-requested();
+    callback update-install-requested();
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -48,49 +113,89 @@ export component SettingsPage inherits Rectangle {
             color: Theme.text-primary;
         }
 
-        Rectangle {
-            background: Theme.surface-alt;
-            border-radius: Theme.radius;
-            border-width: 1px;
-            border-color: Theme.border;
+        SettingsCard {
+            title: "Parental PIN Lock";
 
-            VerticalLayout {
-                padding: 18px;
-                spacing: 12px;
+            Text {
+                text: root.pin-configured
+                    ? "PIN lock is on -- Dashboard and Settings ask for it before opening."
+                    : "PIN lock is off -- anyone can open Dashboard and Settings.";
+                font-size: 13px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
 
-                Text {
-                    text: "Parental PIN Lock";
-                    font-size: 16px;
-                    font-weight: 700;
-                    color: Theme.text-primary;
+            if !root.pin-configured: SettingsButton {
+                label: "Set up PIN";
+                tapped => { root.pin-setup-requested(); }
+            }
+
+            if root.pin-configured: HorizontalLayout {
+                spacing: 10px;
+                SettingsButton {
+                    label: "Change PIN";
+                    horizontal-stretch: 1;
+                    tapped => { root.pin-change-requested(); }
                 }
-                Text {
-                    text: root.pin-configured
-                        ? "PIN lock is on -- Dashboard and Settings ask for it before opening."
-                        : "PIN lock is off -- anyone can open Dashboard and Settings.";
-                    font-size: 13px;
-                    color: Theme.text-muted;
-                    wrap: word-wrap;
+                SettingsButton {
+                    label: "Turn Off PIN Lock";
+                    danger: true;
+                    horizontal-stretch: 1;
+                    tapped => { root.pin-disable-requested(); }
                 }
+            }
+        }
 
-                if !root.pin-configured: SettingsButton {
-                    label: "Set up PIN";
-                    tapped => { root.pin-setup-requested(); }
+        SettingsCard {
+            title: "Software Update";
+
+            // Read-only build identity. Phase 1 of the updater design asked
+            // for this to live somewhere sensible rather than getting its own
+            // UI surface, and this is the card that already has to talk about
+            // versions.
+            Text {
+                text: root.update-version-line;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-primary;
+            }
+            Text {
+                text: root.update-build-line;
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+
+            Text {
+                text: root.update-status-text;
+                font-size: 13px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            // Release notes, straight from manifest.json. Height-capped
+            // implicitly by being plain wrapped text in a start-aligned
+            // column; a long body just pushes the buttons down.
+            if root.update-notes != "": Text {
+                text: root.update-notes;
+                font-size: 12px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                SettingsButton {
+                    label: "Check for updates";
+                    secondary: true;
+                    enabled: !root.update-busy;
+                    horizontal-stretch: 1;
+                    tapped => { root.update-check-requested(); }
                 }
-
-                if root.pin-configured: HorizontalLayout {
-                    spacing: 10px;
-                    SettingsButton {
-                        label: "Change PIN";
-                        horizontal-stretch: 1;
-                        tapped => { root.pin-change-requested(); }
-                    }
-                    SettingsButton {
-                        label: "Turn Off PIN Lock";
-                        danger: true;
-                        horizontal-stretch: 1;
-                        tapped => { root.pin-disable-requested(); }
-                    }
+                if root.update-installable: SettingsButton {
+                    label: root.update-install-label;
+                    enabled: !root.update-busy;
+                    horizontal-stretch: 1;
+                    tapped => { root.update-install-requested(); }
                 }
             }
         }

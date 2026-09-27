@@ -17,7 +17,12 @@ ui = { path = "../../crates/ui" }
 # this just brings the `slint` API (ModelRc, Timer, ComponentHandle, ...)
 # into scope here without re-declaring the backend choice.
 slint = { version = "1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
-tokio = { workspace = true }
+# "process" on top of the workspace feature set: the self-updater runs the
+# *downloaded* binary with `--version` as an install preflight, and needs to
+# wrap that in a `tokio::time::timeout` because busybox on the target has no
+# `timeout` applet. See crates/ha-client for why the rest of the features are
+# where they are.
+tokio = { workspace = true, features = ["process"] }
 # No `local-offset` feature any more: it existed purely for
 # `UtcOffset::current_local_offset()`, which this app no longer calls (see
 # `system_utc_offset` in main.rs -- that API is documented as unsound to call
@@ -27,13 +32,26 @@ tokio = { workspace = true }
 time = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-# For building the `call_service` payload when creating a new HA calendar event.
+# For building the `call_service` payload when creating a new HA calendar event,
+# and for the self-updater's `manifest.json` / `state.json`.
 serde_json.workspace = true
-# Hashing the local 4-digit parental PIN before writing it to disk.
+# Deriving Deserialize/Serialize for the updater's manifest and state files.
+serde.workspace = true
+# Error types for the updater (`update::Error`), same as the other crates here.
+thiserror.workspace = true
+# Hashing the local 4-digit parental PIN before writing it to disk, and
+# verifying the SHA-256 of a downloaded update while it streams.
 sha2.workspace = true
+# The self-updater's HTTPS client. Same crate, version and feature set
+# ha-client already uses (rustls, no OpenSSL, so it stays static-musl
+# friendly and carries its own webpki root store rather than depending on the
+# target having a CA trust store -- the device's /etc/ssl/certs is empty).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # Only for `tzset`/`localtime_r`, to re-derive the local UTC offset *after*
 # startup -- see `system_utc_offset` in main.rs for why `time`'s own
 # `UtcOffset::current_local_offset()` can't be used there. Already present in
 # the dependency tree (via tokio/reqwest/etc., same 0.2.x), so this adds
 # nothing to the build.
+# Also `statvfs`, for the updater's free-space precheck before staging a
+# ~20 MB download onto a small rootfs.
 libc = "0.2"
