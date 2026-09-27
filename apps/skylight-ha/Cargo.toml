@@ -18,10 +18,22 @@ ui = { path = "../../crates/ui" }
 # into scope here without re-declaring the backend choice.
 slint = { version = "1", default-features = false, features = ["std", "renderer-software", "compat-1-2"] }
 tokio = { workspace = true }
-time = { workspace = true, features = ["local-offset"] }
+# No `local-offset` feature any more: it existed purely for
+# `UtcOffset::current_local_offset()`, which this app no longer calls (see
+# `system_utc_offset` in main.rs -- that API is documented as unsound to call
+# once other threads exist, which is precisely what re-deriving the offset
+# after startup needs to do). Leaving the feature enabled would keep an
+# easy-to-reach-for unsound API in scope for no benefit.
+time = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 # For building the `call_service` payload when creating a new HA calendar event.
 serde_json.workspace = true
 # Hashing the local 4-digit parental PIN before writing it to disk.
 sha2.workspace = true
+# Only for `tzset`/`localtime_r`, to re-derive the local UTC offset *after*
+# startup -- see `system_utc_offset` in main.rs for why `time`'s own
+# `UtcOffset::current_local_offset()` can't be used there. Already present in
+# the dependency tree (via tokio/reqwest/etc., same 0.2.x), so this adds
+# nothing to the build.
+libc = "0.2"

@@ -89,6 +89,46 @@ with `sudo`).
   skylight-ha-aarch64-linux-musl -D dist`. Compare file size/BuildID against
   the previous artifact as a sanity check that the new build actually
   differs when you expect it to.
+- **CI's artifact storage can fill up account-wide** ("Artifact storage
+  quota has been hit" — happened once, wasting a full ~3h46m run right at
+  the finish line). When that happens, or when iterating fast, build
+  locally instead — same QEMU-emulated-Alpine approach CI uses, just run on
+  this machine with `docker` + binfmt (`sudo apt install docker.io
+  qemu-user-static binfmt-support` once; if the current shell session
+  predates being added to the `docker` group, prefix commands with `sg
+  docker -c "..."` rather than waiting for a fresh login):
+  ```
+  mkdir -p .cache/cargo-registry target
+  docker run --rm --platform linux/arm64 \
+    -v "$PWD":/workspace -w /workspace \
+    -v "$PWD/.cache/cargo-registry":/root/.cargo/registry \
+    alpine:3.20 sh -c '
+      set -eu
+      apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
+      curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --profile minimal --default-toolchain stable
+      . "$HOME/.cargo/env"
+      cargo build --release -p skylight-ha \
+        --no-default-features -F ui/backend-linuxkms
+    '
+  ```
+  Output lands directly at `target/release/skylight-ha` — no artifact
+  upload, no quota, no waiting on GitHub's queue. `target/` and the cargo
+  registry persist on disk between runs (unlike CI's cache, no
+  upload/download round trip), so a **cold** build is ~4h (matches CI's own
+  timing — this is QEMU emulation tax, not something caching fixes) but an
+  **incremental** build (only this workspace's own crates changed) is
+  ~1-1.5h, dominated almost entirely by the final whole-program LTO
+  relink (`[profile.release]` has `lto = true, codegen-units = 1` —
+  deliberate, for a smaller/faster binary on the Pi's weak CPU) which has
+  to redo its whole-program pass regardless of how small the change was.
+  True cross-compilation (no QEMU at all) would eliminate that tax
+  entirely but needs a hand-assembled aarch64-musl sysroot with
+  `libinput`/`libudev`/`libxkbcommon` built for that arch — a real
+  undertaking, not worth it unless build time becomes the actual
+  bottleneck (see `feedback_static_vs_dynamic_libs`-style reasoning: the
+  emulated-native-build approach gets Alpine's own correctly-linked
+  aarch64 packages "for free").
 
 ## App features built since the initial calendar/tasks MVP
 
@@ -142,6 +182,80 @@ field exists on either entity here; what's shown is a precipitation
   optimistically`/`_climate_target_optimistically` in main.rs) before the
   network call even starts; the real `call_service` + a
   `refresh_dashboard_only` afterward reconciles if the guess was wrong.
+
+**Connection resilience** (ha-client, 2026-09-26): the app used to be able
+to freeze *permanently* on a silently-dropped WiFi link — no timeout
+existed anywhere on the HA connection. `Client::call` now has a 45s
+`CALL_TIMEOUT` (generous on purpose: `get_states()` has been measured
+taking up to 17.5s on this real instance under load, so anything tighter
+would fire spuriously). `run_actor` sends an application-level
+`{"type":"ping"}` every 30s (`PING_INTERVAL`) and treats a missing `pong`
+within another 30s (`PONG_TIMEOUT`) as a dead connection — necessary
+because `tungstenite` doesn't enable TCP keepalive, so a link that dies
+without a FIN/RST leaves the socket looking "open" at the OS level
+forever, with writes silently succeeding into the kernel buffer and reads
+just never returning. `RestClient` (the REST/calendar path, `rest.rs`)
+gets the equivalent it never had: `.timeout(45s)`/`.connect_timeout(15s)`
+on its `reqwest::ClientBuilder` instead of the no-timeout
+`reqwest::Client::new()`. Also fixed: `run_actor` used to kill the whole
+connection on *any* non-`Text` WebSocket frame (a server `Ping`, a `Pong`,
+a `Binary` frame all looked identical to "closed" and forced an
+unnecessary reconnect) — now only an actual `Close`/error/end-of-stream
+breaks the loop. And the dead-connection signal the app watches for
+(`Client::wait_closed()`) was rewritten to key off the command channel
+closing (`cmd_tx.closed()`, which *does* fire once `run_actor`'s loop
+exits for any reason) rather than the event-broadcast channel closing,
+which structurally could never fire in practice since `live_client` holds
+a live sender clone for the whole session.
+
+**Clock self-correction** (main.rs, 2026-09-26): this device has no RTC,
+so it boots at the kernel epoch (1970) and a background NTP sync
+(`S45ntp`) corrects it some seconds-to-a-minute later, racing the app's
+own startup. The original code called `time::UtcOffset::
+current_local_offset()` exactly once, at the very top of `main`, and
+never again — which routinely resolved the wrong DST bucket (e.g. EST
+instead of EDT) from a pre-correction clock and then never re-checked, so
+the on-screen time stayed an hour off for the life of the process, and the
+calendar grid's `reference_date` could sit on "January 1970" until someone
+manually tapped Today. Can't just call `current_local_offset()` again
+later, though — the `time` crate documents that as unsound once other
+threads exist (which by definition they do, later), and that's exactly
+why it was only ever called once at the top. Fixed with `libc::
+localtime_r` instead (`system_utc_offset` in main.rs): POSIX guarantees
+the reentrant `_r` variant is thread-safe (glibc/musl both hold an
+internal lock over their cached TZ state), so — unlike `time`'s own
+implementation — it's sound to call every second from the existing clock
+timer. `tm_gmtoff` reports the offset *for the given instant*, which is
+what makes a 1970→2026 correction actually move to the right DST bucket
+instead of just changing the number of a still-wrong bucket. The
+day-rollover logic (`reference_date_after_today_changed`) is deliberately
+narrow: it only follows "today" changing if the currently-displayed date
+*was* the old today (i.e. the user hadn't navigated anywhere) — yanking
+the grid out from under someone who'd paged to next month would be worse
+than the original bug.
+
+**Attempted and reverted: a Settings → Logs page** (2026-09-19,
+reverted same day). The idea was an in-app viewer for recent `tracing`
+output (captured via a custom `tracing_subscriber::Layer` into a ring
+buffer), so on-device debugging wouldn't need SSH. Implemented as a
+second `if root.showing-logs: VerticalLayout {...}` block living directly
+inside `SettingsPage`'s root `Rectangle`, alongside the existing `if
+!root.showing-logs: ...` block. This **rendered correctly but never
+responded to touch at all** — confirmed live, repeatedly, on real
+hardware. Root cause understanding stayed incomplete (no interactive
+debugger on-device), but the going theory: Slint's "auto-fill the parent"
+sizing for a `Rectangle`'s sole child only reliably applies to a single
+*static* layout child, not two mutually-exclusive `if` alternates: even
+after wrapping the two blocks in one always-present outer `VerticalLayout`
+(the same fix that worked for the dashboard-cards bug), touch still didn't
+work. What *is* confirmed to work, because it's the exact shape `PinPad`
+already uses successfully: a full-page overlay needs to be its own
+**top-level component**, always present as a sibling in `app-window.slint`
+(not nested inside another page's conditional state), sized
+unconditionally (`width: 100%; height: 100%;`), with only a `visible:
+some-bool` toggling it — see `crates/ui/ui/pin-pad.slint`. If this gets
+revisited, build it that way from the start rather than re-attempting the
+nested-`if`-inside-a-page shape.
 
 **Parental PIN lock** (Settings page): fully local/on-device, no HA
 involved. 4-digit PIN, SHA-256 hashed (not plaintext -- proportionate to
@@ -289,107 +403,257 @@ disable/unlock flow, paired with a dedicated numeric `PinPad` component
 - Overlay directory: `board/skylight/rootfs-overlay/` (an arbitrary name
   chosen for this project, not a Buildroot-recognized board — had to be
   manually `mkdir -p`'d, doesn't pre-exist). Set via System configuration →
-  Root filesystem overlay directories. Contents so far:
-  - `etc/wpa_supplicant.conf`
-  - `etc/init.d/S39ethernet` — brings up `eth0` via `udhcpc`
-  - `etc/init.d/S40wifi` — brings up `wlan0`: link up, **`iw dev wlan0 set
-    power_save off`** (brcmfmac on this chip drops connections repeatedly
-    without this — confirmed root cause, not a hypothesis), `wpa_supplicant`,
-    `udhcpc`
-  - `etc/init.d/S99skylight` — execs `/usr/bin/skylight-ha
-    /etc/skylight/config.toml` via `start-stop-daemon`
-  - `usr/bin/skylight-ha` — the app binary
+  Root filesystem overlay directories. Contents as of 2026-09-27:
+  - `etc/wpa_supplicant.conf` — `country=US` + a placeholder network block
+    (`YourNetworkName`/`YourPassword`). **The real SSID/password only ever
+    exist hand-edited directly on the physical SD card**, never in this
+    overlay/repo — re-enter them after every single reflash.
+  - `etc/init.d/S39ethernet`, `etc/init.d/S40wifi` — bring up `eth0`/`wlan0`
+    respectively: link up, (wlan0 only) `iw dev wlan0 set power_save off`
+    (brcmfmac on this chip drops connections repeatedly without this —
+    confirmed root cause, not a hypothesis) + `wpa_supplicant`, then in
+    both scripts a `udhcpc` invocation via `start-stop-daemon -b -x
+    /sbin/udhcpc -- -f -i $IFACE -t 0 -T 5 -S -v` — see the DHCP-timing fix
+    below for why this replaced a plain `udhcpc -i $IFACE -b`.
+  - `usr/share/udhcpc/default.script.d/10-default-route-metric` — see the
+    "two default routes" fix below.
+  - `etc/init.d/S45ntp` — one-shot-but-retried NTP time sync; see below.
+  - `etc/init.d/S46wifidiag` — periodic (5 min) WiFi signal/error-counter +
+    ping logger to `/var/log/messages`, added while chasing the WiFi
+    reliability issues below. Still there, still useful as an ongoing
+    health log even though the bugs it was built to diagnose are fixed.
+  - `etc/cron/crontabs/root` — the connectivity self-healing watchdog; see
+    below.
+  - `etc/default/syslogd` — `SYSLOGD_ARGS`, log rotation sizing; see below.
+  - `etc/modprobe.d/brcmfmac.conf` — `feature_disable=0x82000`, the
+    permanent WiFi handshake fix; see below.
+  - `usr/bin/skylight-supervise` + `etc/init.d/S99skylight` — crash-recovery
+    respawn wrapper around the app; see below.
+  - `usr/bin/skylight-ha` — the app binary.
   - `etc/skylight/config.toml` and `etc/skylight/ha-token.secret` — both
-    now baked into the overlay permanently (this used to say "still
-    needed, only tested via live scp" — that's done).
-- **A full image has been built successfully**: `~/buildroot/output/
-  images/` has `sdcard.img`, `rootfs.ext2`/`.ext4`, the kernel `Image`,
-  and the `.dtb`, all dated **Sep 8**. Buildroot's own config is fully
-  sorted (musl toolchain, eudev, wpa_supplicant w/ WPA3+ctrl_iface+cli,
-  `brcmfmac_sdio-firmware-rpi`, kernel `CONFIG_USB_RTL8152=y` confirmed
-  set) — nothing further needed there to produce a bootable image.
-- **The baked-in binary and config.toml are stale**, though: both date
-  from **Sep 6** (matching the last successful CI run,
-  `gh run list --workflow=build-pi.yml`), which predates basically all of
-  this session's app work (multi-member calendar events, the weather
-  widget, the whole Dashboard page, the PIN lock, the refresh/latency
-  fixes). Before flashing a "real" image: trigger a fresh CI run
-  (`gh workflow run build-pi.yml` — commit+push first, it builds from the
-  GitHub remote, not local files; ~2-3.5h regardless of caching), download
-  the artifact, drop it into `board/skylight/rootfs-overlay/usr/bin/
-  skylight-ha` (`chmod 755` explicitly — see Process gotchas below), bring
-  the overlay's `config.toml` up to date with the real one (it's missing
-  `[[dashboard]]`, `pin_hash_path`, `weather_entity`/
-  `weather_backfill_entity` — none of that existed on Sep 6), then
-  rebuild (`make` in `~/buildroot`) to fold the new binary/config into a
-  fresh `sdcard.img`.
-- **eero mesh WiFi (open, now a hard requirement — see WiFi diagnostics
-  below)**: association consistently succeeds but the WPA handshake times
-  out, across all three mesh BSSIDs identically. Kernel/driver logs a
-  `Disconnect event of DFS AP` even though this chip is 2.4GHz-only (no
-  real DFS band) — suspected mislabeled driver message actually reflecting
-  eero's mesh Channel-Switch-Announcement handling confusing `brcmfmac`,
-  or a regulatory-domain misclassification (no `iw reg set`/CRDA
-  configured yet, so the kernel's default/unset reg domain may be feeding
-  into whatever's deciding "DFS"). Not a password/PMF issue (both
-  explicitly ruled out). USB Ethernet is the working network path for
-  now, but WiFi is required for the actual wall-mounted deployment (no
-  Ethernet run to that location).
+    baked into the overlay, but **`ha-token.secret` in the repo itself is
+    only ever a placeholder** (currently 22 bytes — nowhere near a real ~200
+    char HA long-lived token). Same as the WiFi credentials: the real token
+    only exists hand-edited onto the physical SD card, re-entered after
+    every reflash. Don't trust a past note here that said this was "baked
+    in permanently" — that was never true of the real secret value, only
+    of the fact that a file exists at that path.
+- **Image builds cleanly and reliably**: Buildroot's own config is fully
+  sorted (musl toolchain, eudev, wpa_supplicant w/ WPA3+ctrl_iface+cli
+  *enabled in Buildroot's `.config`* — see the Process gotcha below about
+  why that alone doesn't mean much —, `brcmfmac_sdio-firmware-rpi`, kernel
+  `CONFIG_USB_RTL8152=y`). `cd ~/buildroot && make` after updating the
+  overlay (new binary copied into `usr/bin/skylight-ha` +
+  `chmod 755`, or any overlay file edited) reliably produces a fresh,
+  correct `sdcard.img` — this has been done many times over this session
+  without a single Buildroot-level failure; every incident traced back to
+  overlay *content* (a boot-critical script bug), never the build system
+  itself.
+- **Keeping the overlay's binary current**: after any Rust change, rebuild
+  aarch64 locally (see "Building the Pi binary" above), `cp` the result
+  into `board/skylight/rootfs-overlay/usr/bin/skylight-ha`, `chmod 755`
+  it, `md5sum` both copies to confirm the copy landed correctly, *then*
+  `make` in `~/buildroot`. As of 2026-09-27 the overlay's binary/config
+  are current with everything described in this doc (all of App
+  features, all of the fixes below) — this note itself is the thing
+  liable to go stale, not the image.
+- **eero mesh WiFi — RESOLVED (2026-09-25/26), permanent fix.** Association
+  always succeeded, but the WPA handshake never appeared to complete and
+  the link dropped ~10s later — across all three mesh BSSIDs, and (this
+  was the key clue that ruled out eero specifically) identically against a
+  plain phone hotspot too. The `Disconnect event of DFS AP` message and
+  the regulatory-domain hypothesis below were both dead ends. **Actual root
+  cause**, found by reading the driver's own decision logic
+  (`brcmf_is_linkup`/`brcmf_notify_connect_status` in
+  `drivers/net/wireless/broadcom/brcm80211/brcmfmac/cfg80211.c`) against
+  live `wpa_supplicant.log`/`/var/log/messages` captures: this chip's
+  firmware completes the entire WPA-PSK 4-way handshake *itself*
+  (`PSK_SUP` event, `status=6` = `BRCMF_E_STATUS_FWSUP_COMPLETED`, a real
+  success) and the driver correctly reports `Linkup` to the kernel's
+  wireless stack — but `wpa_supplicant` 2.12 never logs
+  `CTRL-EVENT-CONNECTED` and the link drops anyway. This matches a known
+  upstream `wpa_supplicant` ≥2.11 regression: it waits for an
+  `NL80211_CMD_PORT_AUTHORIZED` event before considering a
+  firmware-offloaded connection complete, but `brcmfmac` only ever sends
+  that event for Fast BSS Transition roams, not normal connections — so
+  `wpa_supplicant` waits forever for an authorization signal that's never
+  coming, on *any* AP. Fix: `options brcmfmac feature_disable=0x82000` in
+  `etc/modprobe.d/brcmfmac.conf` — `0x82000` = `BIT(13)` `BRCMF_FEAT_FWSUP`
+  `| BIT(19)` `BRCMF_FEAT_SAE` (verified against this exact kernel's own
+  `feature.h`, not assumed from a value quoted online), disabling the
+  firmware-offload handshake for both WPA2-PSK and WPA3-SAE and forcing
+  the traditional path where `wpa_supplicant` itself processes EAPOL
+  frames in userspace, sidestepping the broken `PORT_AUTHORIZED`
+  dependency entirely. **This is a permanent fix, keep it.** (A "WiFi
+  diagnostics" subsection used to live here documenting the verbose
+  `brcmfmac` debug logging and `S10syslog` added to find this bug — both
+  were scaffolding, not the fix, and have since been removed now that
+  their job is done; see the log-rotation entry a bit further down.)
+  `BR2_PACKAGE_WIRELESS_REGDB` is still enabled (harmless, and a real gap
+  regardless — the kernel does require a signed regdb for `country=US` to
+  apply — just wasn't actually this bug).
 
-### WiFi diagnostics added to help solve the eero issue (2026-09-18)
+### DHCP timing — RESOLVED (2026-09-26)
 
-Four changes to the overlay/Buildroot config, purely to get enough real
-data to actually root-cause the handshake timeout next time it's tested
-against the eero mesh (none of this fixes it by itself):
+Separate, unrelated bug found *after* the WiFi handshake fix above: even
+with a rock-solid WiFi link (confirmed live — signal -34 to -43 dBm the
+whole time, healthy 65-72 Mbit/s bitrates, steadily climbing RX/TX
+counters with no resets, 0% ping packet loss throughout), the device
+ended up on most boots with an IPv6 address (via SLAAC, no server round
+trip needed) but **no IPv4 address at all** — `udhcpc` just never got a
+lease. HA data and NTP both failed as a result, but not because of IPv6
+itself: the router's DNS server is only reachable via IPv4
+(`nameserver 192.168.0.1` in `resolv.conf`, no IPv6 DNS ever advertised),
+so no IPv4 route meant no DNS meant nothing could resolve, regardless of
+which address family a hostname would otherwise resolve to. A static DHCP
+reservation on the router "fixed" it 2/2 clean boots, pointing at DHCP
+request timing/reliability rather than the router being unable to serve
+this device at all.
 
-- **`BR2_PACKAGE_WIRELESS_REGDB=y`** enabled in Buildroot's `.config`. The
-  kernel here has `CONFIG_CFG80211_REQUIRE_SIGNED_REGDB=y` (confirmed in
-  `output/build/linux-custom/.config`) but `wireless-regdb` — the package
-  that actually provides the signed `regulatory.db`/`regulatory.db.p7s`
-  the kernel needs to apply `country=US` (already set in
-  `etc/wpa_supplicant.conf`) — wasn't installed. Real possibility that the
-  country-code request has been silently failing to apply this whole
-  time, leaving the kernel on a conservative fallback regulatory domain,
-  which could easily be tangled up in whatever's making brcmfmac log a
-  "DFS AP" disconnect on a chip with no real DFS band. Kernel ≥4.15 (this
-  one's 6.12) loads the regdb straight from `/lib/firmware` — no CRDA
-  userspace daemon needed, `BR2_PACKAGE_CRDA` was deliberately left off.
-- **`etc/modprobe.d/brcmfmac.conf`** (new) sets the `brcmfmac` driver's
-  `debug` module parameter to `0xd404` — bitmask for
-  CONN|EVENT|INFO|FIL|SCAN (see `drivers/net/wireless/broadcom/brcm80211/
-  brcmfmac/debug.h` in the kernel tree for the bit values). `EVENT` is
-  specifically where the "Disconnect event of DFS AP" message itself
-  comes from; `CONN`/`FIL` should show the actual auth/assoc/IOVAR
-  sequence leading up to it.
-- **`etc/init.d/S10syslog`** (new) starts BusyBox's `syslogd`/`klogd`
-  early (before `S39ethernet`/`S40wifi`), writing to `/var/log/messages`.
-  Needed because dmesg's ring buffer is bounded and can wrap during a
-  boot with this much extra debug logging turned on — this persists
-  everything for the whole session instead.
-- **`etc/init.d/S40wifi`** — `wpa_supplicant` now launches with `-dd -t -f
-  /var/log/wpa_supplicant.log` instead of `-q`. Verbose, timestamped,
-  logged to its own file.
+Two wrong turns before the real fix, worth remembering:
+- First theory: `udhcpc`'s foreground DISCOVER phase (3 tries, ~9-12s by
+  default) could fire before `wpa_supplicant` finished associating,
+  wasting the whole budget on a not-yet-up link. Attempted fix: a
+  `wpa_cli -i wlan0 status` polling loop in `S40wifi`, waiting for
+  `wpa_state=COMPLETED` before calling `udhcpc`. **This broke boot
+  completely, every single time** — turned out `wpa_cli` doesn't even
+  exist on this image (`CONFIG_CTRL_IFACE=y` was set in Buildroot's
+  top-level `.config`, but `wpa_supplicant`'s *own* build `.config` still
+  had it commented out because the package was never actually rebuilt
+  after that symbol changed — see the Process gotcha below, this is a
+  deeper version of the already-known "menuconfig didn't land" trap), and
+  worse, adding `ctrl_interface=` to `wpa_supplicant.conf` made
+  `wpa_supplicant` itself refuse to start at all (an unrecognized config
+  directive is a hard parse error when `CONFIG_CTRL_IFACE` isn't
+  compiled in). **Do not re-add `ctrl_interface`/`wpa_cli` usage** without
+  first confirming `output/target/usr/sbin/wpa_cli` actually exists.
+  Reverted immediately back to the prior working `S40wifi`.
+  - **Don't try `wpa_cli`/`ping6`/`nslookup <name>` (no server arg)/`ip -s
+    link`/`timeout <cmd>` on this image without checking first** — none of
+    them exist or work as expected in this busybox/wpa_supplicant build.
+    `nslookup` specifically needs the server passed explicitly
+    (`nslookup <name> <server-ip>`) since it can't parse the (perfectly
+    valid) inline comments `udhcpc`'s own hook script writes into
+    `resolv.conf` (`nameserver 192.168.0.1 # eth0`).
+- Second theory (also wrong, but harmlessly so): `busybox udhcpc -b`
+  "gives up after 3 tries". **It doesn't** — confirmed directly in
+  `networking/udhcp/dhcpc.c`: after the foreground DISCOVER phase fails,
+  `-b` backgrounds and then keeps retrying *indefinitely* on a ~29s cycle.
+  So neither "add a fixed delay" nor "give it more foreground retries"
+  (the two fixes being considered before this was caught) would have
+  addressed a *persistent* DHCP failure — the bug was never a one-time
+  missed window.
+- **Actual fix**: replaced the `udhcpc` invocation in both `S39ethernet`
+  and `S40wifi` with `start-stop-daemon -b -x /sbin/udhcpc -- -f -i
+  "$IFACE" -t 0 -T 5 -S -v` — `-t 0` retries DISCOVER forever on a tight
+  5s cycle instead of ever falling into the slower ~29s post-failure loop,
+  and moving the backgrounding to `start-stop-daemon` (rather than
+  `udhcpc`'s own internal fork, which only happens *after* the ~10s
+  foreground phase) means both init scripts return immediately instead of
+  blocking boot for ~10s each. `-S` logs DISCOVER/OFFER/lease activity to
+  syslog — actual visibility into what's happening, which didn't exist
+  before. No live capture of a *failing* boot with this in place yet, so
+  the precise mechanism of the original persistent failures (bad timing
+  vs. something router/mesh-side rejecting/ignoring requests) is still
+  technically unconfirmed — but the fix is unconditionally more robust
+  regardless of which it was.
+- **Self-healing backstop**: `etc/cron/crontabs/root` (busybox `crond`,
+  already running via Buildroot's own `S50crond`) checks once a minute for
+  an IPv4 default route and restarts `S40wifi` if there isn't one. Covers
+  this whole class of problem generally (a router reboot, `brcmfmac`
+  silently dropping the link at 3am, a lease that never renews), not just
+  this specific bug — for an unattended wall appliance this matters more
+  than having pinned down the exact original mechanism.
+- **Known remaining rough edge, accepted for now**: even with all of the
+  above, a boot can still take something like 30s-1min to get both the
+  clock and HA data fully settled (confirmed by the user across several
+  reboots — inconsistent, not every boot). Believed to be inherent
+  variability in how long the very first WiFi-association-then-DHCP dance
+  takes on a cold boot (it's varied throughout this whole project), plus
+  `crond`'s watchdog only running once a minute (busybox `crond`'s actual
+  granularity floor) rather than checking sooner. Nothing currently
+  auto-recovers *faster* than that; the app's own reconnect logic and the
+  clock self-correction (see App features above) mean it always gets
+  there without user intervention, just not always quickly. Revisit if it
+  becomes annoying enough to matter — a tighter boot-time polling loop
+  (separate from the ongoing `crond` job) is the likely next step, not
+  yet built.
+- Three smaller companion fixes from the same investigation:
+  - **Log rotation, and `S10syslog` was dead code all along.** The
+    `brcmfmac` debug logging (`debug=0xd404`) used to find the WiFi
+    handshake bug above was so verbose it rotated `/var/log/messages`
+    away every few minutes (busybox `syslogd`'s default is `-s 200 -b 1`,
+    ~400KB total). `etc/init.d/S10syslog` — added early on to try to fix
+    this by starting `syslogd`/`klogd` earlier in boot — turned out to be
+    dead code the whole time: Buildroot's own `S01syslogd`/`S02klogd`
+    (not part of this overlay, run earlier regardless) already start the
+    real daemons, so `S10syslog`'s own `start-stop-daemon` call just
+    matched an already-running process and did nothing; its `-O
+    /var/log/messages` flag was never actually applied. **Deleted
+    entirely.** Rotation is now sized the supported way: `etc/default/
+    syslogd`'s `SYSLOGD_ARGS="-s 2000 -b 5"`, sourced by Buildroot's own
+    `S01syslogd` (confirmed by reading that script directly — it does
+    `[ -r "/etc/default/$DAEMON" ] && . "/etc/default/$DAEMON"` with
+    `DAEMON=syslogd`) — ~12MB of history instead of ~400KB. The noisy
+    `debug=0xd404` itself is also gone now that its job (finding the
+    handshake bug) is done, leaving only the permanent
+    `feature_disable=0x82000` in `brcmfmac.conf`.
+  - **Two default routes when both `eth0` and `wlan0` have leases**
+    (common during testing, with Ethernet plugged in as a fallback
+    alongside WiFi): Buildroot's own `udhcpc` hook script only ever
+    touches the interface whose lease just changed, never removing the
+    *other* interface's default route, so both ended up at metric 0 with
+    non-deterministic egress selection — a plausible contributor to
+    "works over Ethernet, intermittently fails over WiFi" observations.
+    Fixed via `usr/share/udhcpc/default.script.d/10-default-route-metric`
+    (a hook script, confirmed via reading the real `default.script` that
+    Buildroot does source every executable file in that directory after
+    its own work) — gives `eth0` a lower/preferred metric (100) than
+    `wlan0` (600) so they stop fighting.
+  - **Crash recovery**: `panic = "abort"` (deliberate, not changing that)
+    plus a DRM/KMS process leaving its last frame on screen after exit
+    meant any panic used to freeze the wall-mounted display indefinitely
+    with zero indication anything was wrong, no way to recover short of a
+    power cycle. `S99skylight` now launches `usr/bin/skylight-supervise` (a
+    small respawn-loop wrapper) instead of `skylight-ha` directly —
+    auto-restarts within 2s of any exit, logs to
+    `/var/log/skylight-ha.log`. Chose a plain shell loop over busybox
+    `inittab`'s `respawn` mechanism specifically to avoid having to copy
+    Buildroot's own generated `/etc/inittab` into the overlay just to add
+    one line (which would mean keeping it in sync with Buildroot's version
+    by hand forever).
 
-**To actually diagnose next time**: boot, let it attempt (and fail) to
-join the eero mesh, then SSH in over the USB Ethernet fallback (still the
-reliable path) and pull `/var/log/wpa_supplicant.log` and
-`/var/log/messages`. Look for the EAPOL message sequence (which of the
-4-way handshake's messages actually got exchanged before it gave up),
-`brcmfmac`'s own connect/roam/event log lines around the same timestamp,
-and whether the "DFS" disconnect message correlates with a specific event
-(e.g. right after an eero mesh channel-switch, or right after a
-particular EAPOL message).
+### NTP / clock — RESOLVED (2026-09-20 boot-side, 2026-09-26 app-side)
 
-**All of this is diagnostic-only and should come back out once the issue
-is actually fixed** — `brcmfmac.conf`'s debug level and `-dd` are both
-too noisy for normal operation, and `S10syslog` writing continuously to
-`/var/log/messages` isn't something a production image needs either.
-Checked `output/target/etc/fstab`: unlike `/tmp`/`/run`/`/dev/shm`
-(tmpfs), `/var` is a plain directory on the real (`ext2`, read-write)
-rootfs, not tmpfs -- so these logs *do* persist across reboots (handy for
-catching an overnight retry, but also a real SD-card-wear concern for
-continuous verbose logging left on long-term, another reason this is
-meant to come back out once solved).
+This device has no RTC, so every boot starts at the kernel epoch (1970).
+Two-layer fix, boot-side and app-side, and both ended up mattering:
+
+- **Boot-side**: `etc/init.d/S45ntp` runs `ntpd -n -q` in the background
+  (so it can't block `dropbear`/`skylight-ha` from starting — an earlier,
+  blocking, single-attempt version of this script did exactly that and
+  had to be fixed), first polling for a default route (up to 30x2s) since
+  `S40wifi` backgrounds its own `udhcpc` call and networking may not be
+  up yet when this script runs, then retrying the actual `ntpd` sync up
+  to 5 times with a 5s gap. Still not airtight on its own — see the "known
+  remaining rough edge" note above — which is exactly why the app-side fix
+  below matters as much as it does.
+- **Timezone**: hardcoded via Buildroot's own `BR2_TARGET_TZ_INFO=y` +
+  `BR2_TARGET_LOCALTIME="America/New_York"` (`BR2_TARGET_TZ_ZONELIST`
+  left at `"default"`, installs the common set, a few MB). This is a
+  first-class Buildroot mechanism (`system/Config.in`), not a hand-rolled
+  `/etc/localtime` symlink. **The user wants this eventually exposed as a
+  Settings-UI picker rather than hardcoded** — deliberately deferred, not
+  forgotten; scope for that is real (needs the app to handle changing
+  timezone *while running*, which given `time`'s local-offset soundness
+  constraints — see the clock self-correction entry under App features —
+  isn't just "call the lookup again").
+- **App-side**: see "Clock self-correction" under App features above —
+  this is what actually makes the boot-side timing variability tolerable.
+  Even if NTP takes a while (or the first couple of `S45ntp` attempts
+  fail and `crond`'s watchdog eventually gets WiFi re-associated), the app
+  now re-derives its own displayed offset every second and corrects
+  `reference_date` on whatever tick the clock actually jumps, rather than
+  being frozen at whatever was true when the process started.
 
 ## Process gotchas worth remembering
 
@@ -414,6 +678,35 @@ meant to come back out once solved).
   exits — the display doesn't clear or hand back to the text console
   automatically. Don't infer "still running" from what's on screen; check
   `ps` (or watch whether the on-screen clock is still ticking).
+- **A symbol appearing set in Buildroot's top-level `.config` does not
+  mean the package that owns it was actually rebuilt with it.** This is a
+  deeper version of the "menuconfig changes don't land in `.config`"
+  gotcha above — this time the setting genuinely *was* in `.config`
+  (`BR2_PACKAGE_WPA_SUPPLICANT_CTRL_IFACE=y`), but `wpa_supplicant`
+  itself hadn't been rebuilt since before that was set, so its *own*
+  build-time `.config` still had `#CONFIG_CTRL_IFACE=y` (commented out)
+  and the resulting binary genuinely had no `wpa_cli` and no control
+  socket support — directly caused a boot-breaking incident (see the
+  DHCP-timing section above). **Always verify against the actual built
+  artifact**, not just Buildroot's `.config`: `ls output/target/...` for
+  the file you expect, or check the specific package's own `.config`
+  under `output/build/<pkg>-<ver>/`, or its `.stamp_built` timestamp
+  against when you changed the symbol. If a symbol changed after a
+  package was last built, force a rebuild explicitly (`make
+  <pkg>-dirclean <pkg>`), don't assume `make` alone will notice.
+- **Boot-critical `init.d` script changes are high-risk — test more
+  conservatively than feels necessary.** Two real incidents this session:
+  a `wpa_cli`-based change killed `wpa_supplicant` outright (config parse
+  error → refuses to start) and looked identical to a boot hang, and
+  earlier, a Slint UI restructuring broke touch across the *entire* app,
+  not just the new feature being added. In both cases the safe recovery
+  was reverting to the exact prior working state and getting the user
+  unblocked *first*, diagnosing calmly afterward — not iterating further
+  on a device that's currently stuck. `sh -n` every shell script before
+  it goes anywhere near a rebuild; don't introduce a new command
+  dependency (`wpa_cli`, `timeout`, `ping6`, `ip -s link` — none of which
+  exist/work as expected on this busybox build) without confirming it's
+  actually present in `output/target/` first.
 
 ## Feedback / working-style notes
 
@@ -424,3 +717,25 @@ meant to come back out once solved).
   the usual "version mismatch" risk of dynamic linking doesn't apply, and
   these libraries have runtime *data* dependencies (hwdb, xkb data) that
   static linking wouldn't solve anyway.
+- **Reaching for an Opus-model subagent for high-stakes review/
+  implementation, when asked, paid off clearly** (2026-09-26/27): an
+  independent Opus review of the WiFi/DHCP boot chain and the app's
+  connection-handling code both corrected a wrong diagnosis (the "udhcpc
+  gives up after 3 tries" theory was actually just false — it retries
+  forever) and found the *real* reason a prior fix broke boot (`wpa_cli`
+  genuinely doesn't exist on the image, not a hang), plus surfaced several
+  additional real bugs unprompted (the connection-freeze-on-silent-drop
+  issue, the `/var/log` symlink-to-tmpfs documentation error). A follow-up
+  Opus agent then implemented the full fix set directly, and every claim
+  it made was independently re-verified (against `busybox`/
+  `wpa_supplicant` source, `sh -n`, `cargo build`/`test`) before trusting
+  it — worth doing again for similarly concurrency-sensitive or
+  boot-critical work, but the verification step is still what actually
+  builds confidence, not the model choice alone.
+- The general "verify against the actual current state of the system —
+  build artifacts, live device behavior, source code — rather than trust
+  docs, memory, or a config symbol in isolation" approach has repeatedly
+  been what actually solved things this project (the font panic, the
+  touch-misdiagnosis, the `get_states()` timing, the WiFi handshake bug,
+  the DHCP timing bug, the `/var/log` correction above). Keep defaulting
+  to it.

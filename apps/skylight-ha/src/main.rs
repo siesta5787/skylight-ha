@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use dashboard_config::{Config, DashboardSection, FamilyMember};
@@ -14,14 +15,154 @@ use ui::{
     TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
 };
 
+/// The local UTC offset in whole seconds east of UTC, re-derived once per
+/// second by the clock tick in `main` (see [`refresh_local_offset`]) and read
+/// by everything that needs to convert between UTC and wall-clock time via
+/// [`local_offset`].
+///
+/// This is a mutable global rather than a value computed once in `main`
+/// because the device has no RTC: it boots at the kernel epoch (1970) and a
+/// *background* NTP sync (`/etc/init.d/S45ntp`) corrects the clock some
+/// seconds or minutes later, racing this app's own startup. A single
+/// startup-time lookup therefore routinely resolved to the wrong DST bucket
+/// (EST instead of EDT, say) and then never got re-checked, so the on-screen
+/// clock stayed an hour off indefinitely -- until the process restarted.
+static LOCAL_OFFSET_SECONDS: AtomicI32 = AtomicI32::new(0);
+
+/// The most recently derived local UTC offset. Defaults to UTC until
+/// [`refresh_local_offset`] has succeeded once.
+fn local_offset() -> UtcOffset {
+    UtcOffset::from_whole_seconds(LOCAL_OFFSET_SECONDS.load(Ordering::Relaxed))
+        .unwrap_or(UtcOffset::UTC)
+}
+
+/// Asks the C library what the local UTC offset is *at the given instant*.
+///
+/// Why `libc::localtime_r` and not `time::UtcOffset::current_local_offset()`:
+/// the `time` crate documents its local-offset lookup as unsound to call once
+/// the process is multithreaded, which is why the original code called it
+/// exactly once at the very top of `main`, before the tokio runtime existed.
+/// That restriction is specifically about `time`'s *own* implementation -- it
+/// reads the `TZ` environment variable and `/etc/localtime` itself, and can
+/// race a concurrent `setenv`/fork+exec. It is not a property of the
+/// underlying platform call.
+///
+/// POSIX requires `localtime_r` to be thread-safe (it is the reentrant
+/// variant, and both glibc and musl take an internal lock over their cached
+/// TZ state), so it is sound to call from the UI thread with tokio workers
+/// running -- which is exactly what re-deriving the offset after startup
+/// requires. `tm_gmtoff` is a glibc/musl extension present on Linux and
+/// exposed by the `libc` crate; it already accounts for DST at `at`, which is
+/// the whole point: passing the *current* timestamp is what makes a 1970 ->
+/// 2026 clock correction move us from the wrong DST bucket to the right one.
+///
+/// The one-time reading of the TZ database (`/etc/localtime`, or `TZ`) is
+/// done lazily by the first `localtime_r` call, and both implementations hold
+/// their own lock across it (glibc: `tzset_lock` in `__tz_convert`; musl:
+/// `LOCK(lock)` in `do_tzset`), so even that is safe concurrently. `main`
+/// nonetheless triggers it deliberately, before the tokio runtime is created,
+/// so the initialisation happens while the process is single-threaded and
+/// every later call is pure arithmetic over cached zone rules -- which is
+/// also what makes calling this once per second from the clock tick cheap.
+///
+/// (`libc::tzset` is not an option: the `libc` crate only binds it on
+/// Windows. It isn't needed given the above.)
+fn system_utc_offset(at: OffsetDateTime) -> Option<UtcOffset> {
+    let timestamp = at.unix_timestamp() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `timestamp` is a valid `time_t` and `tm` is a valid, writable,
+    // correctly-sized `struct tm` that outlives the call. `localtime_r`
+    // writes only through the pointers given (that is what distinguishes it
+    // from `localtime`), and is documented thread-safe.
+    let result = unsafe { libc::localtime_r(&timestamp, &mut tm) };
+    if result.is_null() {
+        return None;
+    }
+    // Offsets are bounded by +/-26h, so the i32 narrowing can't lose data.
+    UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32).ok()
+}
+
+/// Re-derives the local UTC offset and publishes it to
+/// [`LOCAL_OFFSET_SECONDS`]. Returns `None` (and warns, once per process) if
+/// the platform couldn't answer, leaving the previous value in place.
+fn refresh_local_offset() -> Option<UtcOffset> {
+    match system_utc_offset(OffsetDateTime::now_utc()) {
+        Some(offset) => {
+            let seconds = offset.whole_seconds();
+            let previous = LOCAL_OFFSET_SECONDS.swap(seconds, Ordering::Relaxed);
+            if previous != seconds {
+                tracing::info!(
+                    previous_seconds = previous,
+                    new_seconds = seconds,
+                    "local UTC offset changed (clock corrected, or a DST transition)"
+                );
+            }
+            Some(offset)
+        }
+        None => {
+            // Once per process only: this is called every second by the
+            // clock tick, and a permanent failure (no TZ database on the
+            // target at all) would otherwise emit a warning per second
+            // forever.
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "localtime_r() could not resolve the local UTC offset -- falling back to UTC. \
+                     The clock and calendar will be wrong by the local offset until this starts \
+                     working. Check that /etc/localtime exists and points into /usr/share/zoneinfo."
+                );
+            }
+            None
+        }
+    }
+}
+
+/// Whether the calendar's displayed date should follow the wall clock's
+/// "today" changing, and to what.
+///
+/// Two situations produce a change: an ordinary midnight rollover, and the
+/// device's clock being corrected by NTP from the kernel epoch to the real
+/// date (it has no RTC, so every boot starts in 1970 -- which is why the grid
+/// could sit on "January 1970" until someone manually tapped "Today").
+///
+/// The rule is deliberately narrow: only follow if the view was showing the
+/// *old* today, i.e. the user hadn't navigated anywhere. Yanking the grid out
+/// from under someone who had deliberately paged to next month would be worse
+/// than the bug.
+fn reference_date_after_today_changed(
+    reference_date: Date,
+    previous_today: Date,
+    new_today: Date,
+) -> Option<Date> {
+    if previous_today == new_today {
+        return None;
+    }
+    if reference_date == previous_today {
+        Some(new_today)
+    } else {
+        None
+    }
+}
+
 fn main() {
     tracing_subscriber::fmt::init();
 
-    // `time`'s local-offset lookup isn't sound once other threads exist (on
-    // Unix it reads TZ state that a concurrent fork/exec could race), so this
-    // has to happen before the tokio runtime spawns any worker threads.
-    let local_offset = UtcOffset::current_local_offset().unwrap_or(UtcOffset::UTC);
-    let today = OffsetDateTime::now_utc().to_offset(local_offset).date();
+    // First offset lookup. Deliberately here, at the very top of `main`,
+    // while the process is still single-threaded (the tokio runtime is
+    // created much further down): this is the call that makes libc read the
+    // TZ database, so getting it out of the way now means every later lookup
+    // from the clock tick is pure arithmetic over cached zone rules. Unlike
+    // the `time` crate's `UtcOffset::current_local_offset()` this replaces,
+    // it is also *sound* to call again later -- see `system_utc_offset`,
+    // which is the whole reason the offset can now self-correct after NTP
+    // fixes the clock instead of being frozen for the life of the process.
+    if refresh_local_offset().is_none() {
+        tracing::warn!(
+            "no local UTC offset available at startup, continuing in UTC -- the 1s clock tick \
+             will keep retrying and pick it up if it becomes available"
+        );
+    }
+    let today = OffsetDateTime::now_utc().to_offset(local_offset()).date();
 
     let config_path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
     let config = match Config::load(&config_path) {
@@ -42,7 +183,7 @@ fn main() {
     // empty until `run_ha_sync` resolves it below -- `config.family` is
     // usually empty too (see `discover_family`), so there's nothing
     // meaningful to seed it with yet anyway.
-    let empty_grids = build_calendar_grids(local_offset, today, &[], &[]);
+    let empty_grids = build_calendar_grids(local_offset(), today, &[], &[]);
     apply_calendar_grids(&app, empty_grids);
     let (empty_todos, _, empty_chips) =
         build_todo_model(&config.family, &vec![Vec::new(); config.family.len()]);
@@ -491,7 +632,7 @@ fn main() {
                                 &rest,
                                 &client,
                                 &family,
-                                local_offset,
+                                local_offset(),
                                 ref_date,
                                 &app_weak,
                                 &todo_uids,
@@ -557,7 +698,7 @@ fn main() {
         let event_form_title = event_form_title.clone();
         app.on_new_event_requested(move || {
             let Some(app) = app_weak.upgrade() else { return };
-            let now = OffsetDateTime::now_utc().to_offset(local_offset);
+            let now = OffsetDateTime::now_utc().to_offset(local_offset());
             let next_hour = (now.hour() as u16 + 1).min(23) as u8;
             open_event_form(&app, &pending_slot, &event_form_title, now.date(), next_hour);
         });
@@ -625,7 +766,7 @@ fn main() {
                 return;
             };
             let Ok(start_naive) = date.with_hms(hour, 0, 0) else { return };
-            let start = start_naive.assume_offset(local_offset);
+            let start = start_naive.assume_offset(local_offset());
             let end = start + TimeDuration::minutes(duration_minutes as i64);
 
             let app_weak = app_weak.clone();
@@ -655,7 +796,7 @@ fn main() {
                         &rest,
                         &client,
                         &family,
-                        local_offset,
+                        local_offset(),
                         ref_date,
                         &app_weak,
                         &todo_uids,
@@ -690,7 +831,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset(), new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -711,7 +852,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset(), new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -732,7 +873,7 @@ fn main() {
             };
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset(), new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -746,11 +887,11 @@ fn main() {
         let weather_entities = weather_entities.clone();
         let dashboard_sections = dashboard_sections.clone();
         app.on_nav_today(move || {
-            let new_date = OffsetDateTime::now_utc().to_offset(local_offset).date();
+            let new_date = OffsetDateTime::now_utc().to_offset(local_offset()).date();
             *reference_date.lock().unwrap() = new_date;
             navigate(&app_weak, new_date);
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset(), new_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
     {
@@ -766,7 +907,7 @@ fn main() {
         app.on_manual_refresh_requested(move || {
             let ref_date = *reference_date.lock().unwrap();
             let family = family_state.lock().unwrap().clone();
-            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset, ref_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
+            spawn_refresh(&rt_handle, &live_rest, &live_client, &family, local_offset(), ref_date, &app_weak, &todo_uids, &weather_entities, &dashboard_sections);
         });
     }
 
@@ -922,27 +1063,96 @@ fn main() {
         });
     }
 
+    // The 1s clock tick does three jobs, not one:
+    //   1. redraw the clock/date text (what it always did),
+    //   2. re-derive the local UTC offset, so a clock corrected by NTP after
+    //      startup (this board has no RTC -- it boots in 1970) stops being
+    //      displayed in the wrong DST bucket, and
+    //   3. notice the calendar day actually changing -- either an ordinary
+    //      midnight rollover or that same NTP correction -- and move the
+    //      calendar's `reference_date` with it, rather than leaving the grid
+    //      parked on the boot-time date until someone taps "Today".
+    //
+    // These all belong on the same timer because they're all "what time does
+    // this device think it is", and the offset lookup has to happen somewhere
+    // that runs repeatedly rather than once at startup.
     let clock_weak = app.as_weak();
     let clock_timer = slint::Timer::default();
+    // Cloned here rather than reusing the bindings below, because
+    // `run_ha_sync` takes ownership of all of these a few lines further down.
+    let clock_reference_date = reference_date.clone();
+    let clock_rt_handle = rt_handle.clone();
+    let clock_live_rest = live_rest.clone();
+    let clock_live_client = live_client.clone();
+    let clock_family_state = family_state.clone();
+    let clock_todo_uids = todo_uids.clone();
+    let clock_weather_entities = weather_entities.clone();
+    let clock_dashboard_sections = dashboard_sections.clone();
+    // What this tick believed "today" was last time round. Seeded with the
+    // startup value, which on a fresh boot is very likely 1970-01-01.
+    let mut last_today = today;
     clock_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_secs(1),
         move || {
+            // Cheap: `localtime_r` works off libc's cached zone rules after
+            // the one-time `tzset()` in `main`, so this is arithmetic, not a
+            // filesystem read, every second.
+            refresh_local_offset();
+            let offset = local_offset();
+            let now = OffsetDateTime::now_utc().to_offset(offset);
+
             if let Some(app) = clock_weak.upgrade() {
-                let now = OffsetDateTime::now_utc().to_offset(local_offset);
                 app.set_clock_text(format!("{:02}:{:02}", now.hour(), now.minute()).into());
                 app.set_date_text(format!("{}", now.date()).into());
                 // Deliberately not touching `month_label` here -- it tracks
                 // `reference_date` (whatever's being navigated/viewed), not
-                // wall-clock "now"; the nav callbacks and initial setup own it.
+                // wall-clock "now". It *is* updated below, but only on the
+                // rare tick where `reference_date` itself moves.
             }
+
+            let new_today = now.date();
+            if new_today == last_today {
+                return;
+            }
+            let previous_today = last_today;
+            last_today = new_today;
+            tracing::info!(
+                previous_today = %previous_today,
+                new_today = %new_today,
+                "wall-clock date changed (midnight rollover, or the clock was corrected)"
+            );
+
+            // `build_calendar_grids` already recomputes "today" itself for
+            // *highlighting*, so the highlight was never stuck -- what was
+            // stuck is the grid's own reference/display date, which is this.
+            let Some(new_date) = ({
+                let guard = clock_reference_date.lock().unwrap();
+                reference_date_after_today_changed(*guard, previous_today, new_today)
+            }) else {
+                return;
+            };
+            *clock_reference_date.lock().unwrap() = new_date;
+            navigate(&clock_weak, new_date);
+            let family = clock_family_state.lock().unwrap().clone();
+            spawn_refresh(
+                &clock_rt_handle,
+                &clock_live_rest,
+                &clock_live_client,
+                &family,
+                offset,
+                new_date,
+                &clock_weak,
+                &clock_todo_uids,
+                &clock_weather_entities,
+                &clock_dashboard_sections,
+            );
         },
     );
 
     rt.spawn(run_ha_sync(
         config,
         app.as_weak(),
-        local_offset,
         live_client,
         live_rest,
         todo_uids,
@@ -1410,14 +1620,20 @@ fn apply_weather(
 /// creation refresh independently of this loop via `spawn_refresh`.
 ///
 /// Reconnects (outer loop) whenever the WS connection is detected dead
-/// (see `fetch_todos`) rather than connecting exactly once for the life of
-/// the process -- `ha_client::Client` doesn't reconnect itself by design
-/// (its own doc comment says so explicitly), so something has to.
+/// (see `fetch_todos`, and `Client::wait_closed` in the inner select) rather
+/// than connecting exactly once for the life of the process --
+/// `ha_client::Client` doesn't reconnect itself by design (its own doc
+/// comment says so explicitly), so something has to.
+///
+/// No `local_offset` parameter: it used to take one, captured once at spawn
+/// time, which on this RTC-less board meant a whole session's worth of
+/// calendar range calculations could be pinned to whatever DST bucket was
+/// current before NTP fixed the clock. It reads `local_offset()` fresh per
+/// refresh instead.
 #[allow(clippy::too_many_arguments)]
 async fn run_ha_sync(
     config: Config,
     app_weak: slint::Weak<AppWindow>,
-    local_offset: UtcOffset,
     live_client: Arc<Mutex<Option<Client>>>,
     live_rest: Arc<Mutex<Option<RestClient>>>,
     todo_uids: Arc<Mutex<Vec<(String, Vec<String>)>>>,
@@ -1440,6 +1656,18 @@ async fn run_ha_sync(
     // out any chip the user had toggled off.
     let mut family_resolved = false;
 
+    // Built once, outside the reconnect loop, and cloned per iteration. It
+    // used to be constructed fresh on every reconnect, which threw away the
+    // underlying `reqwest::Client`'s connection pool and rustls
+    // configuration each time -- i.e. it paid for a fresh TLS handshake (and
+    // re-parsed the bundled webpki root store) precisely when the network
+    // had just come back and things were already slow. Nothing about it
+    // depends on the WS connection: `RestClient` is stateless over
+    // base_url + token, both of which are fixed for the process, and
+    // `reqwest::Client` is designed to be long-lived and shared. Cloning is
+    // cheap -- it's an `Arc` internally, so all clones share the one pool.
+    let rest = RestClient::new(&config.ha.base_url, &token);
+
     loop {
         let client = ha_client::connect_with_backoff(
             &config.ha.base_url,
@@ -1449,7 +1677,6 @@ async fn run_ha_sync(
         .await;
         tracing::info!("connected to Home Assistant");
         *live_client.lock().unwrap() = Some(client.clone());
-        let rest = RestClient::new(&config.ha.base_url, &token);
         *live_rest.lock().unwrap() = Some(rest.clone());
 
         if !family_resolved {
@@ -1550,6 +1777,21 @@ async fn run_ha_sync(
             }
             let wake = tokio::select! {
                 _ = interval.tick() => Wake::Interval,
+                // The real liveness signal. This resolves exactly when
+                // ha-client's actor task has exited -- which now includes
+                // "the keepalive ping went unanswered" (see `PING_INTERVAL`
+                // in connection.rs), the case that previously left the app
+                // sitting on stale data forever behind a silently-dropped
+                // socket.
+                //
+                // The `RecvError::Closed` arm below was supposed to be this
+                // check and structurally could not fire: a broadcast channel
+                // only closes once *every* sender drops, and `live_client`
+                // holds a `Client` clone (hence a sender) for the whole
+                // session. It's kept anyway -- it costs nothing and is
+                // correct if it ever does happen -- but it is no longer what
+                // detects a dead connection.
+                _ = client.wait_closed() => Wake::ConnectionDead,
                 event = state_events.recv() => match event {
                     Ok(state) => {
                         let is_todo = family_state
@@ -1570,9 +1812,9 @@ async fn run_ha_sync(
                         if is_todo || is_dashboard { Wake::RelevantStateChange } else { Wake::Irrelevant }
                     }
                     // Lagged just means we missed some events under load --
-                    // refreshing anyway is the safe default. A closed
-                    // channel means the actor (and so the whole connection)
-                    // has died, same as a failed fetch below.
+                    // refreshing anyway is the safe default. (See the
+                    // `wait_closed` arm above for why the `Closed` case below
+                    // can't actually be relied on.)
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Wake::RelevantStateChange,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => Wake::ConnectionDead,
                 },
@@ -1581,7 +1823,7 @@ async fn run_ha_sync(
                 continue;
             }
             if matches!(wake, Wake::ConnectionDead) {
-                tracing::warn!("HA event stream closed, reconnecting");
+                tracing::warn!("HA connection is dead, reconnecting");
                 *live_client.lock().unwrap() = None;
                 *live_rest.lock().unwrap() = None;
                 break;
@@ -1593,7 +1835,7 @@ async fn run_ha_sync(
                 &rest,
                 &client,
                 &family,
-                local_offset,
+                local_offset(),
                 ref_date,
                 &app_weak,
                 &todo_uids,
@@ -2799,6 +3041,111 @@ mod tests {
     /// crate dependency.
     fn temp_pin_path(tag: &str) -> String {
         std::env::temp_dir().join(format!("skylight-ha-test-pin-{}-{tag}.secret", std::process::id())).display().to_string()
+    }
+
+    fn date(y: i32, m: Month, d: u8) -> Date {
+        Date::from_calendar_date(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn follows_an_ordinary_midnight_rollover() {
+        let yesterday = date(2026, Month::September, 25);
+        let today = date(2026, Month::September, 26);
+        assert_eq!(
+            reference_date_after_today_changed(yesterday, yesterday, today),
+            Some(today),
+            "the view was on 'today', so it should move with it"
+        );
+    }
+
+    #[test]
+    fn follows_the_ntp_correction_off_the_kernel_epoch() {
+        // The real-hardware case: no RTC, so the process starts in 1970 and
+        // seeds both `reference_date` and the clock tick's `last_today` with
+        // it. Once S45ntp lands, the grid has to stop showing January 1970
+        // without anyone tapping "Today".
+        let epoch = date(1970, Month::January, 1);
+        let real = date(2026, Month::September, 26);
+        assert_eq!(
+            reference_date_after_today_changed(epoch, epoch, real),
+            Some(real)
+        );
+    }
+
+    #[test]
+    fn does_not_yank_the_view_the_user_navigated_to() {
+        let yesterday = date(2026, Month::September, 25);
+        let today = date(2026, Month::September, 26);
+        let browsing = date(2026, Month::December, 24);
+        assert_eq!(
+            reference_date_after_today_changed(browsing, yesterday, today),
+            None,
+            "deliberately paged-to dates must survive a midnight rollover"
+        );
+    }
+
+    #[test]
+    fn does_nothing_when_the_day_has_not_changed() {
+        let today = date(2026, Month::September, 26);
+        assert_eq!(reference_date_after_today_changed(today, today, today), None);
+        // Also the case where the user navigated *and* nothing changed.
+        let elsewhere = date(2026, Month::October, 1);
+        assert_eq!(
+            reference_date_after_today_changed(elsewhere, today, today),
+            None
+        );
+    }
+
+    /// Guards the mechanism itself, not a specific zone: whatever
+    /// `localtime_r` reports has to be a legal `UtcOffset` and has to agree
+    /// with what `local_offset()` publishes after a refresh.
+    #[test]
+    fn derives_and_publishes_a_plausible_local_offset() {
+        let refreshed = refresh_local_offset().expect("localtime_r should work on the test host");
+        assert_eq!(refreshed, local_offset(), "refresh must publish what it returns");
+        let seconds = refreshed.whole_seconds();
+        assert!(
+            (-26 * 3600..=26 * 3600).contains(&seconds),
+            "offset out of the range any real timezone can have: {seconds}s"
+        );
+    }
+
+    /// The DST-bucket half of the bug: the offset must be derived *for a
+    /// given instant*, not once for the life of the process. Checked against
+    /// a fixed zone so it holds regardless of the test host's own timezone.
+    #[test]
+    fn offset_is_instant_dependent_across_a_dst_boundary() {
+        // Safe here: `set_var` is only unsound with concurrent readers, and
+        // Rust's test harness runs each `#[test]` on its own thread but this
+        // is the only test that touches TZ -- and it restores it immediately.
+        // (If this ever becomes flaky, mark it `#[ignore]`; it documents the
+        // property either way.)
+        let original = std::env::var("TZ").ok();
+        std::env::set_var("TZ", "America/New_York");
+
+        // 2026-01-15 12:00Z -> EST (-5), 2026-07-15 12:00Z -> EDT (-4).
+        let winter = date(2026, Month::January, 15).midnight().assume_utc();
+        let summer = date(2026, Month::July, 15).midnight().assume_utc();
+        let winter_offset = system_utc_offset(winter);
+        let summer_offset = system_utc_offset(summer);
+
+        match original {
+            Some(tz) => std::env::set_var("TZ", tz),
+            None => std::env::remove_var("TZ"),
+        }
+
+        let (w, s) = match (winter_offset, summer_offset) {
+            (Some(w), Some(s)) => (w, s),
+            // No TZ database on the build host -- nothing to assert.
+            _ => return,
+        };
+        assert_ne!(
+            w, s,
+            "the same lookup must give different offsets either side of a DST transition; \
+             getting the same one back is exactly the frozen-offset bug"
+        );
+        assert_eq!(w.whole_hours(), -5, "January in America/New_York is EST");
+        assert_eq!(s.whole_hours(), -4, "July in America/New_York is EDT");
     }
 
     #[test]

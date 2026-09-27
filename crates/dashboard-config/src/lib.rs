@@ -26,7 +26,17 @@ pub enum ConfigError {
 /// Home Assistant connection details. The access token is deliberately kept
 /// out of this struct's `Deserialize` derive — it's loaded separately from
 /// `token_path` at runtime so it never ends up in the config file itself.
+/// `deny_unknown_fields` is here specifically to catch the mistake TOML makes
+/// easy and this project has already made once: a bare `key = value` written
+/// *after* the `[ha]` header is part of the `[ha]` table, not the top level,
+/// because TOML has no table-reset until the next header. `weather_entity`
+/// placed below `[ha]` silently became `ha.weather_entity` -- accepted,
+/// ignored, and indistinguishable from "the weather widget doesn't work".
+/// With this, the same typo is a startup parse error naming the offending
+/// key. Note `Config::load` failing is fatal (`exit(1)` in main.rs, before
+/// any window exists), which is the intended outcome: loud, not silent.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HaConnection {
     /// e.g. "http://homeassistant.local:8123"
     pub base_url: String,
@@ -107,7 +117,11 @@ pub enum DashboardSection {
     },
 }
 
+/// Also `deny_unknown_fields` (same reasoning as `HaConnection`): a
+/// misspelled or obsolete top-level key is a config bug worth failing on, and
+/// this is the table where a stray key is likeliest to look like it worked.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub ha: HaConnection,
     #[serde(default)]
@@ -209,5 +223,56 @@ mod tests {
         assert!(matches!(config.dashboard[0], DashboardSection::ToggleGroup { .. }));
         assert!(matches!(config.dashboard[1], DashboardSection::Climate { .. }));
         assert!(matches!(config.dashboard[2], DashboardSection::SensorGroup { .. }));
+    }
+
+    /// The exact mistake `deny_unknown_fields` on `HaConnection` exists for:
+    /// a top-level key written after the `[ha]` header. TOML puts it inside
+    /// `[ha]`, where it used to be silently ignored.
+    #[test]
+    fn rejects_a_top_level_key_misplaced_under_ha() {
+        let toml_src = r#"
+            [ha]
+            base_url = "http://homeassistant.local:8123"
+            token_path = "/etc/skylight-ha/token"
+            weather_entity = "weather.home"
+        "#;
+        let err = toml::from_str::<Config>(toml_src).expect_err("should not silently accept this");
+        assert!(
+            err.to_string().contains("weather_entity"),
+            "the error should name the offending key, got: {err}"
+        );
+    }
+
+    /// The same key one line higher up is the correct placement and must
+    /// still parse -- guards against `deny_unknown_fields` being applied to
+    /// the wrong struct.
+    #[test]
+    fn accepts_weather_entity_above_the_ha_table() {
+        let toml_src = r#"
+            weather_entity = "weather.home"
+            weather_backfill_entity = "weather.forecast_home"
+
+            [ha]
+            base_url = "http://homeassistant.local:8123"
+            token_path = "/etc/skylight-ha/token"
+        "#;
+        let config: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(config.weather_entity.as_deref(), Some("weather.home"));
+        assert_eq!(
+            config.weather_backfill_entity.as_deref(),
+            Some("weather.forecast_home")
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_top_level_key() {
+        let toml_src = r#"
+            weather_entityy = "weather.home"
+
+            [ha]
+            base_url = "http://homeassistant.local:8123"
+            token_path = "/etc/skylight-ha/token"
+        "#;
+        assert!(toml::from_str::<Config>(toml_src).is_err());
     }
 }
