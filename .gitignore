@@ -1,4 +1,5 @@
 /target
+/target-host
 /.cache
 /dist
 /config.toml

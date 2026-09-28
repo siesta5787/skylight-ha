@@ -51,26 +51,41 @@ with `sudo`).
 
 ## Dev loop — pick the right one for what you're testing
 
-1. **`backend-winit` desktop (fastest, default choice)**: `cargo run -p
-   skylight-ha -- config.toml` opens a normal window on the Pop!_OS
-   desktop. Use this for UI layout, calendar rendering, HA WebSocket/REST
-   logic, config schema, todo interactions — anything that isn't
-   specifically about touch input or the display driver. Seconds of
+**Both commands below are prefixed with `CARGO_TARGET_DIR=target-host`.**
+This is deliberate, not optional: the aarch64 Docker build (see "Building the
+Pi binary" below) doesn't cross-compile with an explicit `--target` — it
+just runs `cargo build` natively inside an aarch64 container, which writes
+to the *same* `target/release/` this repo's plain `cargo build` would use.
+Without separating them, whichever architecture built most recently
+poisons the other's cache with incompatible object files, silently turning
+the next build on either side into a full from-scratch rebuild (this
+happened once, turned a documented ~1h incremental Pi build into a ~4h cold
+one). `target-host` is `.gitignore`d; the env var only affects the host
+invocation, never the Docker container (which doesn't see host env vars
+unless explicitly passed with `-e`), so the Pi build's own `target/` stays
+untouched by local desktop work.
+
+1. **`backend-winit` desktop (fastest, default choice)**: `CARGO_TARGET_DIR=target-host
+   cargo run -p skylight-ha -- config.toml` opens a normal window on the
+   Pop!_OS desktop. Use this for UI layout, calendar rendering, HA
+   WebSocket/REST logic, config schema, todo interactions — anything that
+   isn't specifically about touch input or the display driver. Seconds of
    iteration instead of hours. (This is the default feature set; no extra
    flags needed.)
-2. **`backend-linuxkms` native on this machine**: `cargo build --release -p
-   skylight-ha --no-default-features -F ui/backend-linuxkms`, then run
-   `./target/release/skylight-ha config.toml` from a raw VT (`Ctrl+Alt+F3`,
-   log in at the text console — KMS needs exclusive DRM master, and the
-   desktop Wayland compositor on tty1 holds it otherwise). `Ctrl+Alt+F1`
-   switches back. Same evdev/libinput code path as the real Pi, no
-   cross-compilation, no Buildroot, no SD card flashing. **This is the
-   right tool for touch/display-driver bugs** — `backend-winit` cannot
-   reproduce them at all, since it's a completely different input pipeline
-   (winit windowing/mouse events vs. raw evdev + libinput + DRM). The
-   USB touchscreen on this machine enumerates as `/dev/input/event13`
-   ("Jieli Technology USB Composite Device", MT-B, `INPUT_PROP_DIRECT`);
-   `event14` is its stylus interface.
+2. **`backend-linuxkms` native on this machine**: `CARGO_TARGET_DIR=target-host
+   cargo build --release -p skylight-ha --no-default-features -F
+   ui/backend-linuxkms`, then run `./target-host/release/skylight-ha
+   config.toml` from a raw VT (`Ctrl+Alt+F3`, log in at the text console —
+   KMS needs exclusive DRM master, and the desktop Wayland compositor on
+   tty1 holds it otherwise). `Ctrl+Alt+F1` switches back. Same
+   evdev/libinput code path as the real Pi, no cross-compilation, no
+   Buildroot, no SD card flashing. **This is the right tool for
+   touch/display-driver bugs** — `backend-winit` cannot reproduce them at
+   all, since it's a completely different input pipeline (winit
+   windowing/mouse events vs. raw evdev + libinput + DRM). The USB
+   touchscreen on this machine enumerates as `/dev/input/event13` ("Jieli
+   Technology USB Composite Device", MT-B, `INPUT_PROP_DIRECT`); `event14`
+   is its stylus interface.
 3. **Real Pi hardware** — only needed for final validation once both of the
    above look right, or for anything genuinely Pi-specific (WiFi chip
    firmware, the actual touchscreen's real-world behavior, boot process).
@@ -86,9 +101,17 @@ with `sudo`).
   decision (see Feedback below), not an accident.
 - Runtime deps the target distro must provide: musl's loader
   (`ld-musl-aarch64.so.1`), `libinput.so`, `libudev.so`(via `eudev`),
-  `libxkbcommon.so`, udev hwdb data (for touchscreen identification), xkb
-  keymap data (`xkeyboard-config`), and root permission to open
-  `/dev/dri/*` directly (`backend-linuxkms-noseat`, no seatd broker).
+  `libxkbcommon.so`, **`libgcc_s.so.1`** (a `readelf -d` NEEDED entry on
+  every build so far, on this target regardless of `panic = "abort"` --
+  discovered 2026-09-27 when a quick manual `--version` check against a
+  minimal 3-package Alpine container failed with `_Unwind_*: symbol not
+  found`; the real device has always had it, via the musl toolchain's own
+  runtime libs at `output/target/lib/libgcc_s.so.1` -- this was only ever a
+  gap in ad-hoc verification containers, not a real device issue, but
+  worth having written down explicitly this time), udev hwdb data (for
+  touchscreen identification), xkb keymap data (`xkeyboard-config`), and
+  root permission to open `/dev/dri/*` directly
+  (`backend-linuxkms-noseat`, no seatd broker).
 - **Each CI run takes ~2-3.5h regardless of caching** — this is documented
   from repeated real runs, don't expect a "just rebuilt recently" run to be
   faster.
