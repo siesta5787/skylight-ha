@@ -137,16 +137,37 @@ untouched by local desktop work.
   docker run --rm --platform linux/arm64 \
     -v "$PWD":/workspace -w /workspace \
     -v "$PWD/.cache/cargo-registry":/root/.cargo/registry \
+    -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
     alpine:3.20 sh -c '
       set -eu
       apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
-      curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
-        sh -s -- -y --profile minimal --default-toolchain stable
+      # rustup'"'"'s own toolchain-component download (separate HTTP client from
+      # the curl below, which only fetches the installer script) has hung
+      # indefinitely on a stalled connection multiple times in practice, with no
+      # timeout of its own -- bound each attempt and retry rather than risk
+      # burning hours on one bad connection.
+      i=0
+      until curl --proto "=https" --tlsv1.2 -sSf --retry 3 --retry-delay 5 --max-time 120 https://sh.rustup.rs \
+          | timeout 600 sh -s -- -y --profile minimal --default-toolchain stable; do
+        i=$((i + 1))
+        if [ "$i" -ge 5 ]; then echo "rustup install failed 5 times -- giving up" >&2; exit 1; fi
+        echo "rustup install attempt $i timed out or failed, retrying in 15s..." >&2
+        rm -rf "$HOME/.rustup" "$HOME/.cargo"
+        sleep 15
+      done
       . "$HOME/.cargo/env"
       cargo build --release -p skylight-ha \
         --no-default-features -F ui/backend-linuxkms
     '
   ```
+  This is also exactly the recipe `scripts/release.sh` automates (see
+  "Releasing a new version" below) -- this block is worth keeping in sync
+  with that script if either one changes, they're meant to behave
+  identically. `SKYLIGHT_GIT_SHA` is passed in because `build.rs` can't ask
+  git for it from inside the container: no `git` binary is installed there,
+  and a bind-mounted checkout would trip git's "dubious ownership" check
+  even if there were.
+
   Output lands directly at `target/release/skylight-ha` — no artifact
   upload, no quota, no waiting on GitHub's queue. `target/` and the cargo
   registry persist on disk between runs (unlike CI's cache, no

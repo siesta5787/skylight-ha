@@ -96,8 +96,23 @@ if [ "$SKIP_BUILD" = false ]; then
         alpine:3.20 sh -c '
             set -eu
             apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
-            curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | \
-                sh -s -- -y --profile minimal --default-toolchain stable
+            # rustup fetches its own toolchain components with its own HTTP client
+            # (separate from the curl above, which only fetches the installer
+            # script) and, observed repeatedly, can hang indefinitely on a stalled
+            # connection with no built-in timeout of its own. Bound each attempt
+            # and retry a few times rather than let one bad connection burn hours.
+            i=0
+            until curl --proto "=https" --tlsv1.2 -sSf --retry 3 --retry-delay 5 --max-time 120 https://sh.rustup.rs \
+                | timeout 600 sh -s -- -y --profile minimal --default-toolchain stable; do
+                i=$((i + 1))
+                if [ "$i" -ge 5 ]; then
+                    echo "rustup install timed out or failed 5 times in a row -- giving up" >&2
+                    exit 1
+                fi
+                echo "rustup install attempt $i timed out or failed, retrying in 15s..." >&2
+                rm -rf "$HOME/.rustup" "$HOME/.cargo"
+                sleep 15
+            done
             . "$HOME/.cargo/env"
             cargo build --release -p skylight-ha \
                 --no-default-features -F ui/backend-linuxkms
