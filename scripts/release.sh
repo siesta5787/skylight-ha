@@ -69,7 +69,7 @@ if [ "$ALLOW_DIRTY" = false ] && [ -n "$(git status --porcelain)" ]; then
     exit 1
 fi
 
-VERSION="$(cargo metadata --no-deps --format-version1 -q \
+VERSION="$(cargo metadata --no-deps --format-version 1 -q \
     | jq -r '.packages[] | select(.name == "skylight-ha") | .version')"
 TAG="v$VERSION"
 ASSET="skylight-ha-aarch64-linux-musl"
