@@ -134,7 +134,8 @@ untouched by local desktop work.
   docker -c "..."` rather than waiting for a fresh login):
   ```
   mkdir -p .cache/cargo-registry target
-  docker run --rm --platform linux/arm64 \
+  timeout --kill-after=30s 3h \
+  docker run --rm --platform linux/arm64 --network host \
     -v "$PWD":/workspace -w /workspace \
     -v "$PWD/.cache/cargo-registry":/root/.cargo/registry \
     -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
@@ -166,7 +167,22 @@ untouched by local desktop work.
   identically. `SKYLIGHT_GIT_SHA` is passed in because `build.rs` can't ask
   git for it from inside the container: no `git` binary is installed there,
   and a bind-mounted checkout would trip git's "dubious ownership" check
-  even if there were.
+  even if there were. `--network host` and the outer `timeout` wrapped
+  directly around `docker run` (not around some larger script) are both
+  scar tissue from cutting the first real release on 2026-09-28/29: the
+  default Docker bridge network was repeatedly causing connection resets/
+  hangs/IO errors *inside* the emulated container specifically (apk
+  extraction failures, rustup hangs) that never once reproduced testing
+  this host's own network directly, which pointed at Docker's NAT layer
+  fighting QEMU's syscall translation under load rather than a real
+  connectivity problem -- `--network host` sidesteps that layer entirely.
+  And a `timeout` wrapped around a whole *script* rather than the `docker
+  run` command itself doesn't actually kill the container on a hang (a
+  plain shell doesn't forward SIGTERM to a foregrounded child by default),
+  which left an orphaned container running for 6 hours undetected, once,
+  contending for resources with the next attempt. `docker run` attached in
+  the foreground does forward SIGTERM into a real container stop request,
+  so timing out `docker run` directly actually cleans up after itself.
 
   Output lands directly at `target/release/skylight-ha` — no artifact
   upload, no quota, no waiting on GitHub's queue. `target/` and the cargo
@@ -185,6 +201,42 @@ untouched by local desktop work.
   bottleneck (see `feedback_static_vs_dynamic_libs`-style reasoning: the
   emulated-native-build approach gets Alpine's own correctly-linked
   aarch64 packages "for free").
+
+## Releasing a new version
+
+As of `v0.2.0` (2026-09-29, the first real release), ordinary app changes
+no longer need a manual reflash at all -- see "In-app self-update" under
+App features below for how the device consumes this. Reflashing an SD
+card is now only needed for the very first device (already done) and for
+any future release that sets `requires_reflash: true`.
+
+1. Bump `version` under `[workspace.package]` in the root `Cargo.toml`,
+   run `cargo update --workspace` (updates `Cargo.lock`'s version fields
+   only, nothing else should change -- diff it to confirm), commit both.
+2. `sg docker -c scripts/release.sh -m "release notes here"` (add
+   `--requires-reflash` if this release needs more than a binary swap --
+   see the App features entry for exactly what that means and why; add
+   `--skip-build` if `target/release/skylight-ha` is already a fresh,
+   correct aarch64 build you just made).
+3. That one command does everything: builds aarch64 via the same local
+   Docker recipe documented above, runs the binary's own `--version`
+   inside a minimal emulated-aarch64 container as a preflight (catches a
+   forgotten version bump or a wrong-arch build before it ever reaches a
+   device), renders `manifest.json`, tags, pushes the tag, and publishes
+   the GitHub Release with both assets attached.
+4. Sanity-check it landed: `curl -sL https://github.com/siesta5787/
+   skylight-ha/releases/latest/download/manifest.json` should show the
+   new version; the device's own "Check for updates" button (Settings,
+   behind the PIN gate) or its background check (every ~6h) will find it
+   from there.
+
+**Deliberately local, not CI.** `build-pi.yml` no longer builds or
+publishes anything automatically (no `push:` trigger at all -- see
+`scripts/release.sh`'s own comments and the section above for why: the
+QEMU emulation tax is identical whether it runs on GitHub's runners or
+here, so routing releases through CI only added queue time and burned
+Actions minutes for zero speed benefit). It's `workflow_dispatch`-only
+now, kept as a fallback build path, not part of the release flow.
 
 ## App features built since the initial calendar/tasks MVP
 
@@ -326,6 +378,79 @@ entry covers "being in that area". One `PinFlow` state machine in main.rs
 (`pin_flow: Rc<RefCell<Option<PinFlow>>>`) drives every setup/change/
 disable/unlock flow, paired with a dedicated numeric `PinPad` component
 (`crates/ui/ui/pin-pad.slint`) -- not the general `VirtualKeyboard`.
+
+**In-app self-update** (`apps/skylight-ha/src/update.rs`, 2026-09-27/29):
+checks GitHub Releases for a newer version and installs it without a
+manual reflash. Full design writeup: `~/.claude/plans/
+skylight-self-update.md`. Confirmed working end-to-end on real hardware
+2026-09-29 (`v0.1.0` -> `v0.2.0` via the on-device button). Short version:
+
+- **Binary-only.** Only `/usr/bin/skylight-ha` gets replaced -- no kernel,
+  overlay, or `config.toml` changes ship this way. A release that needs
+  more than that sets `requires_reflash: true` in its manifest (via
+  `scripts/release.sh --requires-reflash`); the app reports it in Settings
+  but refuses to install it. **Corollary: never add a new `config.toml`
+  key without `#[serde(default)]`, unless the release is also marked
+  `requires_reflash`.** `dashboard-config::Config` has
+  `#[serde(deny_unknown_fields)]` and a parse failure is a hard `exit(1)`
+  before any UI exists -- a rollback (see below) to a binary that predates
+  a required new key would hit that wall with the rollback already spent.
+- **Version source of truth**: `https://github.com/siesta5787/skylight-ha/
+  releases/latest/download/{manifest.json,skylight-ha-aarch64-linux-musl}`
+  -- the plain stable redirect, not the GitHub API (no rate limit, no
+  required headers, and it auto-skips prereleases/drafts, which is the
+  whole test channel: tag `v0.3.0-rc1`, publish it as a prerelease, no
+  device ever sees it).
+- **Trigger**: periodic background check (~3min after startup, then every
+  ~6h + jitter) or the "Check for updates" button in the new Settings
+  card (behind the PIN gate). **Never auto-installs** -- a wall-mounted
+  display silently freezing for a few seconds to swap binaries would look
+  exactly like a crash, so install always requires an explicit tap.
+- **Install sequence**: stream download straight to `/usr/bin/
+  skylight-ha.new` (not `/tmp`, which is tmpfs -- see the `/var/log`
+  symlink note below, `rename` across filesystems would `EXDEV`), verify
+  SHA-256 against the manifest (`sha2`, already a dependency from the PIN
+  feature), run the new binary's own `--version` as a preflight (safe
+  because `--version` is handled as the literal first statement in
+  `main()`, before any Slint/DRM init -- this is the same check
+  `scripts/release.sh` runs before ever publishing a release, so a broken
+  build should never even get this far), save a rollback copy of the
+  currently-running binary, write a `pending` marker under `/var/lib/
+  skylight/update/`, `fsync`, then atomic `rename(2)` over `/usr/bin/
+  skylight-ha`, then `exit(0)`. `rename(2)` swaps the directory entry, not
+  the inode a still-running process has open, so this is safe to do while
+  the app is live -- never write in place over the running binary
+  (`ETXTBSY`, and non-atomic even if it somehow worked).
+- **Restart + rollback**: `skylight-supervise` (unchanged for the happy
+  path -- it just re-execs `$BIN` by path) picks up the new binary. It
+  also now arms itself when it sees `pending` at spawn time, and if the
+  child dies before the app clears that marker (a `slint::Timer::
+  single_shot(60s, ...)` fired only if the event loop is genuinely
+  running -- real proof of life, deliberately not gated on a successful
+  HA connection since that's routine and unrelated to binary health),
+  counts the failure. At 3 strikes it restores the saved rollback copy
+  and records the failed version to a `blocked` file so the same broken
+  release doesn't get reinstalled every 6 hours forever. All of this is
+  in `~/pizero2-buildroot/rootfs-overlay/usr/bin/skylight-supervise` --
+  boot-critical-script discipline applies (see Process gotchas below): no
+  new command dependencies beyond `cat`/`cp`/`mv`/`chmod`/`rm`/`sync`/
+  `logger`/`mkdir`, every addition inert if the state directory is
+  absent. **The rollback path itself is still unvalidated on real
+  hardware** -- everything up through a successful install/restart/commit
+  has been confirmed live, but nobody has yet published a deliberately
+  broken release to watch the 3-strike restore actually fire on the Pi.
+  Worth doing once, since an untested rollback is worse than none.
+- **Env var overrides** (`SKYLIGHT_UPDATE_BASE_URL`, `_STATE_DIR`,
+  `_BINARY`, `_FIRST_CHECK_SECS`, `_INTERVAL_SECS`, `_DISABLE`) make the
+  whole thing testable from `backend-winit` on the desktop against a
+  throwaway local HTTP server, without touching the real device or a
+  real GitHub release.
+- **Disk**: this is why the rootfs is 256M now, not the original 120M
+  (bumped in `pizero2-buildroot/defconfig`, applied to `~/buildroot/
+  .config` and baked into the image during the 2026-09-29 reflash) --
+  the live binary, a staged download, and a rollback copy need to
+  coexist briefly, roughly 3x the ~20MB binary, which didn't fit in the
+  original ~31MB free.
 
 ## Known app-level bugs (fixed or open)
 
@@ -489,7 +614,11 @@ disable/unlock flow, paired with a dedicated numeric `PinPad` component
   - `etc/modprobe.d/brcmfmac.conf` — `feature_disable=0x82000`, the
     permanent WiFi handshake fix; see below.
   - `usr/bin/skylight-supervise` + `etc/init.d/S99skylight` — crash-recovery
-    respawn wrapper around the app; see below.
+    respawn wrapper around the app (see below), **plus (2026-09-29) the
+    in-app self-updater's rollback logic** — arms itself when it sees a
+    `pending` update marker, restores the last-known-good binary after 3
+    failed spawns in a row. See "In-app self-update" under App features
+    above for the full design.
   - `usr/bin/skylight-ha` — the app binary.
   - `etc/skylight/config.toml` and `etc/skylight/ha-token.secret` — both
     baked into the overlay, but **`ha-token.secret` in the repo itself is
