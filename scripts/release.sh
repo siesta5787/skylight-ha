@@ -89,7 +89,22 @@ echo "== releasing $TAG =="
 if [ "$SKIP_BUILD" = false ]; then
     echo "-- building aarch64-unknown-linux-musl (QEMU-emulated Alpine, ~1-4h) --"
     mkdir -p .cache/cargo-registry target
-    docker run --rm --platform linux/arm64 \
+    # --network host, not the default bridge: repeated connection resets/
+    # hangs/IO errors inside the emulated container (never reproduced testing
+    # the host's own network directly -- checked every time this happened)
+    # point at Docker's NAT/bridge layer interacting badly with QEMU's
+    # syscall translation overhead under sustained load, not a real
+    # connectivity problem. Host networking sidesteps that layer entirely.
+    #
+    # `timeout` wraps `docker run` itself here, not just this whole script.
+    # `docker run` in the foreground forwards SIGTERM into a real stop
+    # request for its container, so this actually cleans up on a hang.
+    # Wrapping only the outer script (e.g. `timeout 3h scripts/release.sh`)
+    # kills the script but leaves the `docker run --rm` child running,
+    # orphaned, for however long it takes someone to notice -- happened for
+    # real, twice, one of them for 6 hours.
+    timeout --kill-after=30s 3h \
+    docker run --rm --platform linux/arm64 --network host \
         -v "$PWD":/workspace -w /workspace \
         -v "$PWD/.cache/cargo-registry":/root/.cargo/registry \
         -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
