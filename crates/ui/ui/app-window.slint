@@ -14,6 +14,7 @@ import { DashboardPage, DashboardCardData, DashboardRowData, ToggleEntityData, S
 import { PinPad } from "pin-pad.slint";
 import { SettingsPage } from "settings-view.slint";
 import { UpdateOverlay } from "update-overlay.slint";
+import { TimezonePicker } from "timezone-picker.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -188,6 +189,24 @@ export component AppWindow inherits Window {
     in property <bool> update-overlay-open: false;
     in property <string> update-overlay-title: "Updating...";
     in property <string> update-overlay-detail: "";
+
+    // Time zone. The picker is a dumb list: Rust owns which level of the
+    // continent -> country -> zone drill-down is showing and hands over
+    // already-labelled rows, so the grouping logic stays in timezone.rs where
+    // it is unit-tested rather than living in markup.
+    in property <string> timezone-name: "";
+    in property <string> timezone-detail: "";
+    in property <bool> tz-picker-open: false;
+    in property <string> tz-picker-title: "Time Zone";
+    in property <string> tz-picker-breadcrumb: "";
+    in property <[string]> tz-picker-rows: [];
+    in property <bool> tz-picker-leaf: false;
+    in property <int> tz-picker-selected-index: -1;
+    in property <bool> tz-picker-can-go-back: false;
+    callback timezone-change-requested();
+    callback tz-picker-row-selected(int);
+    callback tz-picker-back();
+    callback tz-picker-cancelled();
 
     // Kept out of layout entirely (not just dimmed) for whichever member a
     // top-bar chip tap has toggled off -- indexed the same as `members`.
@@ -487,6 +506,10 @@ export component AppWindow inherits Window {
                     update-busy: root.update-busy;
                     update-check-requested => { root.update-check-requested(); }
                     update-install-requested => { root.update-install-requested(); }
+
+                    timezone-name: root.timezone-name;
+                    timezone-detail: root.timezone-detail;
+                    timezone-change-requested => { root.timezone-change-requested(); }
                 }
             }
         }
@@ -544,5 +567,20 @@ export component AppWindow inherits Window {
         open: root.update-overlay-open;
         title: root.update-overlay-title;
         detail: root.update-overlay-detail;
+    }
+
+    // Same top-level-sibling shape as the three overlays above, for the same
+    // reason -- see the comment in timezone-picker.slint.
+    TimezonePicker {
+        open: root.tz-picker-open;
+        title: root.tz-picker-title;
+        breadcrumb: root.tz-picker-breadcrumb;
+        rows: root.tz-picker-rows;
+        leaf: root.tz-picker-leaf;
+        selected-index: root.tz-picker-selected-index;
+        can-go-back: root.tz-picker-can-go-back;
+        row-selected(i) => { root.tz-picker-row-selected(i); }
+        back => { root.tz-picker-back(); }
+        cancelled => { root.tz-picker-cancelled(); }
     }
 }

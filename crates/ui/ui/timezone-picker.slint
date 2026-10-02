@@ -1,0 +1,214 @@
+import { Theme } from "theme.slint";
+
+// One tappable row in the drill-down list.
+component PickerRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> leaf: false;
+    in property <bool> selected: false;
+    callback tapped();
+
+    height: 56px;
+    background: touch.pressed ? Theme.surface-alt : (root.selected ? Theme.surface-alt : transparent);
+    border-radius: Theme.radius;
+
+    // Sized explicitly rather than relying on Slint's implicit "sole child
+    // fills the parent" behaviour: there are sibling children below, and that
+    // implicit sizing is exactly what silently cost this project a whole
+    // non-responsive page once (see CLAUDE.md, the Settings -> Logs page).
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.tapped();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 12px;
+
+        Text {
+            text: root.label;
+            font-size: 16px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-alignment: left;
+            overflow: elide;
+        }
+
+        // Pushes the trailing marker to the right edge.
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        Text {
+            // A chevron means "this opens another list"; a check means "this
+            // is the zone currently in effect".
+            text: root.leaf ? (root.selected ? "✓" : "") : "›";
+            font-size: 20px;
+            color: root.selected ? Theme.accent : Theme.text-muted;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Full-screen timezone picker: continent -> country -> zone.
+//
+// Deliberately a *dumb* list. Rust owns which level is being shown and supplies
+// `rows` already labelled and ordered, the same way it owns the PIN and
+// keyboard buffers -- so the drill-down logic (which is the part worth testing)
+// lives in timezone.rs with unit tests rather than in markup.
+//
+// STRUCTURAL CONSTRAINT, load-bearing -- read before moving this:
+// instantiated as a *top-level sibling* in app-window.slint, always present,
+// sized unconditionally (width/height 100%), with only `visible: open`
+// toggling it. NOT a conditional `if` alternate nested inside SettingsPage.
+// That shape rendered fine but was completely dead to touch when it was tried
+// for a Settings -> Logs page; PinPad and UpdateOverlay are the shapes
+// confirmed to work on real hardware, and this mirrors them.
+export component TimezonePicker inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> title: "Time Zone";
+    // Breadcrumb of what's been drilled into so far, e.g. "America › United States".
+    in property <string> breadcrumb: "";
+    in property <[string]> rows: [];
+    // True when the rows are actual zones (final choices) rather than another
+    // level to drill into.
+    in property <bool> leaf: false;
+    // Row to tick, or -1. Only meaningful when `leaf`.
+    in property <int> selected-index: -1;
+    in property <bool> can-go-back: false;
+
+    callback row-selected(int);
+    callback back();
+    callback cancelled();
+
+    visible: open;
+    width: 100%;
+    height: 100%;
+    background: #14161fcc;
+    // Above the ordinary pages, below PinPad (3000) and UpdateOverlay (4000):
+    // if the device re-locks or an update lands while this is open, those
+    // should still come out on top.
+    z: 2500;
+
+    // Swallows taps that miss the card, so nothing reaches the page beneath.
+    TouchArea {
+        width: 100%;
+        height: 100%;
+    }
+
+    Rectangle {
+        width: 560px;
+        height: 80%;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+
+            // Header: back / titles / close.
+            HorizontalLayout {
+                spacing: 12px;
+                height: 40px;
+
+                Rectangle {
+                    width: 44px;
+                    visible: root.can-go-back;
+                    background: back-touch.pressed ? Theme.surface-alt : transparent;
+                    border-radius: Theme.radius;
+
+                    back-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.back();
+                        }
+                    }
+
+                    Text {
+                        text: "‹";
+                        font-size: 26px;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+
+                    Text {
+                        text: root.title;
+                        font-size: 19px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: root.breadcrumb;
+                        font-size: 13px;
+                        color: Theme.text-muted;
+                        visible: root.breadcrumb != "";
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle {
+                    width: 44px;
+                    background: close-touch.pressed ? Theme.surface-alt : transparent;
+                    border-radius: Theme.radius;
+
+                    close-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.cancelled();
+                        }
+                    }
+
+                    Text {
+                        text: "✕";
+                        font-size: 18px;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            Flickable {
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+
+                    for row[idx] in root.rows: PickerRow {
+                        label: row;
+                        leaf: root.leaf;
+                        // Tinted at every level (it marks the path to the zone
+                        // in effect); the check glyph itself is leaf-only.
+                        selected: idx == root.selected-index;
+                        tapped => {
+                            root.row-selected(idx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

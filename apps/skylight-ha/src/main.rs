@@ -1,3 +1,4 @@
+mod timezone;
 mod update;
 
 use std::cell::RefCell;
@@ -82,6 +83,29 @@ fn system_utc_offset(at: OffsetDateTime) -> Option<UtcOffset> {
     }
     // Offsets are bounded by +/-26h, so the i32 narrowing can't lose data.
     UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32).ok()
+}
+
+/// The zone's current abbreviation (`EDT`, `GMT`, `AEST`), for showing in
+/// Settings that daylight saving is being handled rather than ignored.
+///
+/// `tm_zone` points into libc's own static zone data, which stays valid until
+/// the zone is re-read -- and this app never re-reads it in-process (changing
+/// the zone restarts the app instead; see `timezone.rs`). The string is copied
+/// out immediately regardless rather than being held onto.
+fn system_timezone_abbreviation(at: OffsetDateTime) -> Option<String> {
+    let timestamp = at.unix_timestamp() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: same contract as `system_utc_offset` above -- valid `time_t`,
+    // valid writable `tm` outliving the call, and `localtime_r` is the
+    // thread-safe reentrant variant.
+    let result = unsafe { libc::localtime_r(&timestamp, &mut tm) };
+    if result.is_null() || tm.tm_zone.is_null() {
+        return None;
+    }
+    // SAFETY: non-null per the check above, and libc guarantees a
+    // NUL-terminated static string here.
+    let abbreviation = unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) };
+    abbreviation.to_str().ok().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
 /// Re-derives the local UTC offset and publishes it to
@@ -1155,6 +1179,115 @@ fn main() {
         });
     }
 
+    // --- Time zone ------------------------------------------------------
+    //
+    // Everything here is UI-thread-only (Rc/RefCell, no spawning): reading the
+    // tz database and rewriting a symlink are both local filesystem work that
+    // finishes in microseconds, unlike the update feature's network calls.
+    let timezone_settings = timezone::Settings::from_env();
+    // Loaded on first open rather than at startup -- ~40KB of tab files that
+    // nothing needs until someone actually taps "Change time zone".
+    let tz_catalog: Rc<RefCell<Option<timezone::Catalog>>> = Rc::new(RefCell::new(None));
+    let tz_level = Rc::new(RefCell::new(TzLevel::Continent));
+    // The selection each visible row maps to (a continent, a country code, or
+    // a zone name, depending on the level).
+    let tz_payloads: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+    apply_timezone_card(&app, &timezone_settings);
+
+    // Re-renders whichever level `tz_level` currently holds.
+    let show_tz_level = {
+        let timezone_settings = timezone_settings.clone();
+        let tz_catalog = tz_catalog.clone();
+        let tz_level = tz_level.clone();
+        let tz_payloads = tz_payloads.clone();
+        move |app: &AppWindow| {
+            let mut catalog_slot = tz_catalog.borrow_mut();
+            let catalog = catalog_slot.get_or_insert_with(|| {
+                timezone::Catalog::load(&timezone_settings)
+            });
+            let level = tz_level.borrow().clone();
+            let (labels, payloads) = tz_level_rows(catalog, &level);
+            let current = timezone::current_zone(&timezone_settings);
+            apply_tz_level(app, catalog, &level, current.as_deref(), &payloads, &labels);
+            *tz_payloads.borrow_mut() = payloads;
+        }
+    };
+
+    {
+        let show_tz_level = show_tz_level.clone();
+        let tz_level = tz_level.clone();
+        let app_weak = app.as_weak();
+        app.on_timezone_change_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *tz_level.borrow_mut() = TzLevel::Continent;
+            show_tz_level(&app);
+            app.set_tz_picker_open(true);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        app.on_tz_picker_cancelled(move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_tz_picker_open(false);
+            }
+        });
+    }
+    {
+        let show_tz_level = show_tz_level.clone();
+        let tz_level = tz_level.clone();
+        let app_weak = app.as_weak();
+        app.on_tz_picker_back(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            // Scoped so the borrow is released before `show_tz_level` takes
+            // its own -- the same RefCell-held-across-a-call hazard that once
+            // crashed the PIN pad on its fourth digit.
+            {
+                let mut level = tz_level.borrow_mut();
+                *level = tz_level_after_back(&level);
+            }
+            show_tz_level(&app);
+        });
+    }
+    {
+        let timezone_settings = timezone_settings.clone();
+        let show_tz_level = show_tz_level.clone();
+        let tz_catalog = tz_catalog.clone();
+        let tz_level = tz_level.clone();
+        let tz_payloads = tz_payloads.clone();
+        let app_weak = app.as_weak();
+        app.on_tz_picker_row_selected(move |index| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let Some(payload) = tz_payloads.borrow().get(index as usize).cloned() else {
+                tracing::warn!(index, "time zone row tapped with no payload; ignoring");
+                return;
+            };
+
+            // Decided with every borrow released before anything acts on it.
+            let next = {
+                let level = tz_level.borrow().clone();
+                let catalog_slot = tz_catalog.borrow();
+                match catalog_slot.as_ref() {
+                    Some(catalog) => tz_level_after_selection(catalog, &level, &payload),
+                    None => {
+                        tracing::warn!("time zone row tapped before the catalog loaded; ignoring");
+                        return;
+                    }
+                }
+            };
+
+            match next {
+                TzSelection::Descend(level) => {
+                    *tz_level.borrow_mut() = level;
+                    show_tz_level(&app);
+                }
+                TzSelection::Choose(zone) => {
+                    apply_timezone_and_restart(&app, &timezone_settings, &zone);
+                }
+            }
+        });
+    }
+
     // Proof of life, and the app's half of the rollback contract: the
     // supervisor treats a `pending` marker that is still present when the
     // child dies as a failed update, so something has to clear it once the
@@ -1495,6 +1628,202 @@ fn push_update_status(
             app.set_update_status_text(text.into());
         }
     });
+}
+
+/// Which level of the timezone drill-down is on screen.
+///
+/// Rust owns this rather than the markup so the grouping logic stays in
+/// `timezone.rs` where it is unit-tested, and the picker stays a dumb list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TzLevel {
+    Continent,
+    Country { continent: String },
+    Zone { continent: String, country_code: String, country_name: String },
+}
+
+/// The rows for a level: what to display, and the payload each row selects.
+///
+/// Returned as parallel vectors because the label and the thing it selects
+/// genuinely differ at every level -- "United States" selects `US`, "Eastern
+/// (most areas)" selects `America/New_York`.
+fn tz_level_rows(catalog: &timezone::Catalog, level: &TzLevel) -> (Vec<String>, Vec<String>) {
+    match level {
+        TzLevel::Continent => {
+            let continents = catalog.continents();
+            (continents.clone(), continents)
+        }
+        TzLevel::Country { continent } => {
+            let countries = catalog.countries(continent);
+            (
+                countries.iter().map(|c| c.name.clone()).collect(),
+                countries.iter().map(|c| c.code.clone()).collect(),
+            )
+        }
+        TzLevel::Zone { continent, country_code, .. } => {
+            let zones = catalog.zones(continent, country_code);
+            (
+                zones.iter().map(|z| z.label()).collect(),
+                zones.iter().map(|z| z.name.clone()).collect(),
+            )
+        }
+    }
+}
+
+/// What tapping a row should do next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TzSelection {
+    Descend(TzLevel),
+    Choose(String),
+}
+
+/// Where a tap on `payload` takes the drill-down from `level`.
+///
+/// Pure and separate from the callback so the two non-obvious rules here are
+/// actually testable: a country with exactly one zone is chosen immediately
+/// rather than making the user confirm a single-item list, and a tap on the
+/// leaf level is a choice rather than a descent.
+fn tz_level_after_selection(
+    catalog: &timezone::Catalog,
+    level: &TzLevel,
+    payload: &str,
+) -> TzSelection {
+    match level {
+        TzLevel::Continent => {
+            TzSelection::Descend(TzLevel::Country { continent: payload.to_string() })
+        }
+        TzLevel::Country { continent } => {
+            let zones = catalog.zones(continent, payload);
+            if let [only] = zones.as_slice() {
+                return TzSelection::Choose(only.name.clone());
+            }
+            let country_name = catalog
+                .countries(continent)
+                .into_iter()
+                .find(|c| c.code == payload)
+                .map(|c| c.name)
+                .unwrap_or_else(|| payload.to_string());
+            TzSelection::Descend(TzLevel::Zone {
+                continent: continent.clone(),
+                country_code: payload.to_string(),
+                country_name,
+            })
+        }
+        TzLevel::Zone { .. } => TzSelection::Choose(payload.to_string()),
+    }
+}
+
+/// One level up. The top level is its own parent, so a stray Back tap at the
+/// root is inert rather than closing the picker unexpectedly.
+fn tz_level_after_back(level: &TzLevel) -> TzLevel {
+    match level {
+        TzLevel::Continent => TzLevel::Continent,
+        TzLevel::Country { .. } => TzLevel::Continent,
+        TzLevel::Zone { continent, .. } => TzLevel::Country { continent: continent.clone() },
+    }
+}
+
+/// Pushes one level of the drill-down into the picker's properties.
+fn apply_tz_level(
+    app: &AppWindow,
+    catalog: &timezone::Catalog,
+    level: &TzLevel,
+    current_zone: Option<&str>,
+    payloads: &[String],
+    labels: &[String],
+) {
+    let (title, breadcrumb, leaf) = match level {
+        TzLevel::Continent => ("Select a region", String::new(), false),
+        TzLevel::Country { continent } => ("Select a country", continent.clone(), false),
+        TzLevel::Zone { continent, country_name, .. } => {
+            ("Select a time zone", format!("{continent} \u{203a} {country_name}"), true)
+        }
+    };
+
+    // Highlight the row that leads to (or is) the zone currently in effect, at
+    // every level -- so drilling down shows where you already are rather than
+    // only revealing it on the last screen. `locate` answers which continent
+    // and country the current zone lives under.
+    let located = current_zone.and_then(|zone| catalog.locate(zone));
+    let wanted: Option<String> = match level {
+        TzLevel::Continent => located.map(|(continent, _)| continent),
+        TzLevel::Country { .. } => located.map(|(_, country_code)| country_code),
+        TzLevel::Zone { .. } => current_zone.map(|zone| zone.to_string()),
+    };
+    let selected = wanted
+        .and_then(|wanted| payloads.iter().position(|p| *p == wanted))
+        .map(|i| i as i32)
+        .unwrap_or(-1);
+
+    app.set_tz_picker_title(title.into());
+    app.set_tz_picker_breadcrumb(breadcrumb.into());
+    app.set_tz_picker_leaf(leaf);
+    app.set_tz_picker_selected_index(selected);
+    app.set_tz_picker_can_go_back(!matches!(level, TzLevel::Continent));
+    app.set_tz_picker_rows(slint::ModelRc::new(slint::VecModel::from(
+        labels.iter().map(SharedString::from).collect::<Vec<_>>(),
+    )));
+}
+
+/// Fills the Settings card: which zone is set, and what it currently resolves
+/// to (abbreviation + offset), which is how the user can see DST being applied.
+fn apply_timezone_card(app: &AppWindow, settings: &timezone::Settings) {
+    let zone = timezone::current_zone(settings);
+    app.set_timezone_name(
+        zone.clone().unwrap_or_else(|| "System default".to_string()).into(),
+    );
+
+    let now = OffsetDateTime::now_utc();
+    let offset = local_offset();
+    let hours = i32::from(offset.whole_hours());
+    let minutes = (i32::from(offset.whole_minutes()) - hours * 60).abs();
+    let offset_text = if minutes == 0 {
+        format!("UTC{hours:+}")
+    } else {
+        format!("UTC{hours:+}:{minutes:02}")
+    };
+    let detail = match system_timezone_abbreviation(now) {
+        Some(abbreviation) => format!("{abbreviation} - {offset_text}"),
+        None => offset_text,
+    };
+    app.set_timezone_detail(detail.into());
+}
+
+/// Points the system at `zone`, then shows a curtain and exits so the
+/// supervisor restarts the app into it.
+///
+/// The restart is not laziness: musl caches the zone by the `TZ` *string* and
+/// never re-stats `/etc/localtime`, and the only in-process escape --
+/// `setenv` -- is unsound in a multithreaded process. See the header of
+/// `timezone.rs` for the full reasoning (and `system_utc_offset` above for the
+/// same hazard in its original form).
+///
+/// Reuses the update feature's overlay rather than adding a near-identical
+/// one: it is already exactly "a full-screen explanation shown for a beat
+/// before `exit(0)`", which is precisely this situation too.
+fn apply_timezone_and_restart(app: &AppWindow, settings: &timezone::Settings, zone: &str) {
+    match timezone::apply(settings, zone) {
+        Ok(()) => {
+            app.set_tz_picker_open(false);
+            app.set_update_overlay_title("Changing time zone...".into());
+            app.set_update_overlay_detail(
+                format!("Switching to {zone} and restarting. This takes a few seconds.").into(),
+            );
+            app.set_update_overlay_open(true);
+            // Same 1.5s as the updater, and for the same reason: a DRM/KMS
+            // process leaves its last frame on screen when it exits, so the
+            // explanation has to actually get painted first or the restart
+            // just looks like a freeze.
+            slint::Timer::single_shot(std::time::Duration::from_millis(1500), || {
+                tracing::info!("exiting so skylight-supervise respawns in the new time zone");
+                std::process::exit(0);
+            });
+        }
+        Err(err) => {
+            tracing::error!(%err, zone, "could not change the time zone");
+            app.set_tz_picker_open(false);
+            app.set_timezone_detail(format!("Could not change time zone: {err}").into());
+        }
+    }
 }
 
 /// Renders a persisted [`update::State`] into the Settings card's properties.
@@ -3435,6 +3764,107 @@ fn parse_ha_color_attribute(value: Option<&serde_json::Value>) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A miniature tz database shaped like the real `zone1970.tab`:
+    /// the US has several zones, Britain exactly one.
+    fn tz_catalog() -> timezone::Catalog {
+        timezone::parse(
+            "US\t+404251-0740023\tAmerica/New_York\tEastern (most areas)\n\
+             US\t+415100-0873900\tAmerica/Chicago\tCentral (most areas)\n\
+             GB\t+513030-0000731\tEurope/London\n",
+            "GB\tBritain (UK)\nUS\tUnited States\n",
+        )
+    }
+
+    #[test]
+    fn tapping_a_region_descends_to_its_countries() {
+        let next = tz_level_after_selection(&tz_catalog(), &TzLevel::Continent, "America");
+        assert_eq!(
+            next,
+            TzSelection::Descend(TzLevel::Country { continent: "America".into() })
+        );
+    }
+
+    /// The point of the shortcut: Britain has one zone, so picking the country
+    /// has already picked the zone. Making the user confirm a one-item list
+    /// would be a pure extra tap.
+    #[test]
+    fn a_country_with_a_single_zone_is_chosen_without_another_tap() {
+        let next = tz_level_after_selection(
+            &tz_catalog(),
+            &TzLevel::Country { continent: "Europe".into() },
+            "GB",
+        );
+        assert_eq!(next, TzSelection::Choose("Europe/London".into()));
+    }
+
+    #[test]
+    fn a_country_with_several_zones_descends_to_them() {
+        let next = tz_level_after_selection(
+            &tz_catalog(),
+            &TzLevel::Country { continent: "America".into() },
+            "US",
+        );
+        assert_eq!(
+            next,
+            TzSelection::Descend(TzLevel::Zone {
+                continent: "America".into(),
+                country_code: "US".into(),
+                country_name: "United States".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn tapping_a_zone_chooses_it() {
+        let level = TzLevel::Zone {
+            continent: "America".into(),
+            country_code: "US".into(),
+            country_name: "United States".into(),
+        };
+        let next = tz_level_after_selection(&tz_catalog(), &level, "America/New_York");
+        assert_eq!(next, TzSelection::Choose("America/New_York".into()));
+    }
+
+    #[test]
+    fn back_goes_up_one_level_and_the_top_level_is_its_own_parent() {
+        let zone = TzLevel::Zone {
+            continent: "America".into(),
+            country_code: "US".into(),
+            country_name: "United States".into(),
+        };
+        let country = tz_level_after_back(&zone);
+        assert_eq!(country, TzLevel::Country { continent: "America".into() });
+        assert_eq!(tz_level_after_back(&country), TzLevel::Continent);
+        // A stray Back at the root shouldn't close the picker or panic.
+        assert_eq!(tz_level_after_back(&TzLevel::Continent), TzLevel::Continent);
+    }
+
+    /// Rows and their payloads must stay index-aligned -- the callback looks
+    /// the tapped row's payload up positionally.
+    #[test]
+    fn row_labels_and_payloads_line_up_at_every_level() {
+        let catalog = tz_catalog();
+        let (labels, payloads) = tz_level_rows(&catalog, &TzLevel::Continent);
+        assert_eq!(labels, payloads, "regions select themselves");
+        assert_eq!(labels, vec!["America", "Europe"]);
+
+        let (labels, payloads) =
+            tz_level_rows(&catalog, &TzLevel::Country { continent: "America".into() });
+        assert_eq!(labels, vec!["United States"]);
+        assert_eq!(payloads, vec!["US"], "the country row selects its code, not its name");
+
+        let (labels, payloads) = tz_level_rows(
+            &catalog,
+            &TzLevel::Zone {
+                continent: "America".into(),
+                country_code: "US".into(),
+                country_name: "United States".into(),
+            },
+        );
+        assert_eq!(labels, vec!["Central (most areas)", "Eastern (most areas)"]);
+        assert_eq!(payloads, vec!["America/Chicago", "America/New_York"]);
+    }
 
     fn weather_state(state: &str, attributes: serde_json::Value) -> EntityState {
         EntityState { entity_id: "weather.home".into(), state: state.into(), attributes, last_updated: None }

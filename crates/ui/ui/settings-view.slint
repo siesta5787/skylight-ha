@@ -97,6 +97,11 @@ export component SettingsPage inherits Rectangle {
     callback update-check-requested();
     callback update-install-requested();
 
+    // e.g. "America/New_York" and "EDT - UTC-4".
+    in property <string> timezone-name: "";
+    in property <string> timezone-detail: "";
+    callback timezone-change-requested();
+
     background: Theme.surface;
     border-radius: Theme.radius;
     clip: true;
@@ -197,6 +202,41 @@ export component SettingsPage inherits Rectangle {
                     horizontal-stretch: 1;
                     tapped => { root.update-install-requested(); }
                 }
+            }
+        }
+
+        SettingsCard {
+            title: "Time Zone";
+
+            Text {
+                text: root.timezone-name;
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-primary;
+            }
+
+            // Shows the *current* abbreviation and offset (e.g. "EDT - UTC-4"),
+            // which is how the user can see that daylight saving is already
+            // being handled for them. There is deliberately no DST toggle:
+            // the tz database switches EST/EDT on the right dates by itself,
+            // and a manual override could only ever fight it.
+            Text {
+                text: root.timezone-detail;
+                font-size: 11px;
+                color: Theme.text-muted;
+            }
+
+            Text {
+                text: "Daylight saving time is applied automatically for the selected zone.";
+                font-size: 12px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            SettingsButton {
+                label: "Change time zone";
+                secondary: true;
+                tapped => { root.timezone-change-requested(); }
             }
         }
     }
