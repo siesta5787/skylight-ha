@@ -452,6 +452,78 @@ skylight-self-update.md`. Confirmed working end-to-end on real hardware
   coexist briefly, roughly 3x the ~20MB binary, which didn't fit in the
   original ~31MB free.
 
+**Wi-Fi management** (`apps/skylight-ha/src/wifi.rs`, 2026-10-01): Settings
+card showing the live connection (SSID, IP, signal) plus a full-screen manager
+to scan and join networks, with the passphrase typed on the existing
+`VirtualKeyboard`. Speaks the **wpa_ctrl protocol directly** over a Unix
+datagram socket -- no `wpa_cli` subprocess (though `wpa_cli` existing on the
+image still matters as *evidence* that the binary has `CONFIG_CTRL_IFACE`
+compiled in; see the Buildroot note below). Two control connections, as
+`wpa_cli` itself uses: one for commands, one `ATTACH`ed for events, so an
+event arriving mid-command can't be mistaken for that command's reply.
+- **Why the control socket and not rewriting `wpa_supplicant.conf`**: the
+  config-rewrite approach needs no Buildroot change and could have shipped via
+  the updater immediately, but it can only ever report "didn't connect".
+  `CTRL-EVENT-SSID-TEMP-DISABLED ... reason=WRONG_KEY` and
+  `CTRL-EVENT-AUTH-REJECT` let the UI say **"wrong password"** instead -- which
+  matters a great deal when the password was typed on a touchscreen keyboard.
+- **The safety property it's built around**: `SELECT_NETWORK` disables every
+  *other* configured network, so a typo would otherwise strand a wall-mounted
+  device with no keyboard. A failed attempt always does `REMOVE_NETWORK` +
+  `ENABLE_NETWORK all` + `RECONNECT`; only a *successful* one is persisted with
+  `SAVE_CONFIG`. Both halves have tests.
+- **This removes the "re-enter WiFi credentials on the SD card after every
+  reflash" ritual** -- `update_config=1` means a network joined on the
+  touchscreen is saved back to `/etc/wpa_supplicant.conf`. The overlay in git
+  still carries only placeholders; real credentials just get typed on the
+  device now instead of hand-edited onto the card.
+- Scanning collapses a mesh's BSSIDs into one row per SSID (this network has
+  three eero nodes on one SSID, which are one choice, not three).
+  WPA-Enterprise is shown but refused -- no UI collects EAP credentials. A
+  WPA2/WPA3-transition AP is deliberately treated as **PSK**, since SAE is a
+  genuine question mark on this chip (`brcmfmac.conf`'s
+  `feature_disable=0x82000` includes `BRCMF_FEAT_SAE`, pushing SAE out of
+  firmware into wpa_supplicant's userspace path as part of the eero handshake
+  fix) -- treat an SAE failure as expected-unknown, not a bug to chase.
+- Passphrases are never trimmed (surrounding whitespace is legal, and trimming
+  would silently produce an inexplicable "wrong password") and never logged.
+- Tested against a **fake wpa_supplicant** -- a real datagram socket serving
+  canned replies and pushing events to whichever client sent `ATTACH`. Worth
+  knowing if you extend it: a `connect`ed datagram socket only accepts packets
+  from its connected peer, so events must come from the daemon's own socket.
+
+**Time zone picker** (`apps/skylight-ha/src/timezone.rs`, 2026-10-01): replaces
+the hardcoded `BR2_TARGET_LOCALTIME` with a browsable **continent -> country ->
+zone** drill-down. Built from the full world list rather than a curated US one
+at the user's request, so the project is useful to someone elsewhere.
+- Driven by **`zone1970.tab` joined against `iso3166.tab`**, not a directory
+  walk: `/usr/share/zoneinfo` holds ~1200 files, but `posix/` and `right/` are
+  complete duplicate trees and there are many backward-compat aliases
+  (`US/Eastern`). The tab files list exactly the canonical zones, already
+  annotated with country codes and the human-readable disambiguations
+  ("Eastern (most areas)") the third level shows. A zone shared by several
+  countries is listed under each; a country with only one zone is selected
+  outright rather than making the user confirm a single-item list.
+- **Changing the zone rewrites `/etc/localtime` and then restarts the app**,
+  which is not laziness. musl caches the zone by the `TZ` *string* and never
+  re-stats the file -- verified in musl 1.2.6's own `src/time/__tz.c`, where
+  `do_tzset()` early-returns whenever `getenv("TZ")` matches its cached value,
+  and with `TZ` unset that value is the constant `"/etc/localtime"` forever.
+  So a symlink rewrite alone cannot affect a running process. The only
+  in-process escape is `setenv`, which is **unsound** once the process is
+  multithreaded -- exactly the hazard `system_utc_offset` was written to avoid
+  when it rejected `time::UtcOffset::current_local_offset()`, with musl's own
+  `do_tzset` calling `getenv("TZ")` once a second from our clock tick as the
+  other half of the race. Restarting reuses the updater's existing
+  exit-and-respawn path, overlay included.
+- The symlink *is* the persistence, so there's **no new state file and no new
+  `config.toml` key** -- the latter would have been a trap, since
+  `deny_unknown_fields` makes an update rollback to a binary predating the key
+  unbootable.
+- **There is deliberately no DST toggle.** tzdata switches EST/EDT on the right
+  dates by itself; a manual override could only fight it. The card shows the
+  current abbreviation and offset ("EDT - UTC-4") to make that visible instead.
+
 ## Known app-level bugs (fixed or open)
 
 - **Fixed — font panic on the real device**: Slint's software renderer
@@ -590,10 +662,16 @@ skylight-self-update.md`. Confirmed working end-to-end on real hardware
   from `.config` (**verify with `grep BR2_ROOTFS_OVERLAY .config`
   afterward** — same "menuconfig changes don't land" gotcha as everything
   else in this section). Contents as of 2026-09-27:
-  - `etc/wpa_supplicant.conf` — `country=US` + a placeholder network block
-    (`YourNetworkName`/`YourPassword`). **The real SSID/password only ever
-    exist hand-edited directly on the physical SD card**, never in this
-    overlay/repo — re-enter them after every single reflash.
+  - `etc/wpa_supplicant.conf` — `ctrl_interface=/var/run/wpa_supplicant`,
+    `update_config=1`, `country=US`, and a placeholder network block. **The
+    real SSID/password still never exist in this repo** — but as of 2026-10-01
+    they no longer have to be hand-edited onto the card either: join the
+    network from Settings → Wi-Fi on the device and `update_config=1` saves it
+    back here. **The `ctrl_interface=` line is the one that broke boot once**
+    (an unrecognised directive is a hard parse error, so wpa_supplicant simply
+    refuses to start, which presents exactly like a boot hang). It is only
+    valid because the package was rebuilt and verified by artifact — see the
+    Process gotcha below, and the comments in the file itself.
   - `etc/init.d/S39ethernet`, `etc/init.d/S40wifi` — bring up `eth0`/`wlan0`
     respectively: link up, (wlan0 only) `iw dev wlan0 set power_save off`
     (brcmfmac on this chip drops connections repeatedly without this —
