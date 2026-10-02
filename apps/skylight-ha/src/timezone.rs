@@ -116,23 +116,41 @@ fn env_string(key: &str) -> Option<String> {
 pub struct Zone {
     /// Canonical tz name, e.g. `America/New_York`.
     pub name: String,
-    /// The tz database's own human-readable disambiguation, e.g. "Eastern
-    /// (most areas)". Empty when the country has only one zone, which is
-    /// exactly when it isn't needed.
-    pub description: String,
+    /// What the picker shows, e.g. "Eastern - New York".
+    ///
+    /// Always names the city it will actually select. The raw tz comment
+    /// ("Eastern (most areas)") deliberately isn't shown: it says nothing
+    /// about *which* eastern zone you get, which was confusing in practice --
+    /// picking a row labelled "Eastern (most areas)" would then announce it
+    /// was switching to America/New_York, a city the row never mentioned.
+    pub label: String,
 }
 
-impl Zone {
-    /// What to show in a list row: the database's description when there is
-    /// one, otherwise the city component of the name (`Argentina/Buenos_Aires`
-    /// -> "Buenos Aires").
-    pub fn label(&self) -> String {
-        if !self.description.is_empty() {
-            return self.description.clone();
-        }
-        let tail = self.name.rsplit('/').next().unwrap_or(&self.name);
-        tail.replace('_', " ")
+/// The common name a tz comment starts with: "Eastern (most areas)" and
+/// "Eastern - IN (Pulaski)" both reduce to "Eastern".
+fn zone_family(comment: &str) -> &str {
+    let cut = comment.find(" - ").or_else(|| comment.find(" ("));
+    match cut {
+        Some(index) => comment[..index].trim(),
+        None => comment.trim(),
     }
+}
+
+/// `America/Indiana/Indianapolis` -> `Indianapolis`.
+fn city_of(name: &str) -> String {
+    name.rsplit('/').next().unwrap_or(name).replace('_', " ")
+}
+
+/// How good a candidate is at representing its family.
+///
+/// tzdata's primary zone for a family is the one with no sub-region qualifier
+/// ("Eastern (most areas)", not "Eastern - IN (Pulaski)"), and "most areas"
+/// breaks the remaining ties -- Alaska has both "Alaska (most areas)"
+/// (Anchorage) and "Alaska (west)" (Nome) with no qualifier.
+fn representative_score(comment: &str) -> u8 {
+    let no_subregion = if comment.contains(" - ") { 0 } else { 2 };
+    let most_areas = u8::from(comment.contains("most areas"));
+    no_subregion + most_areas
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +217,9 @@ impl Catalog {
                     name: "Other".to_string(),
                     zones: Vec::new(),
                 });
-            country.zones.push(Zone { name: (*name).to_string(), description: String::new() });
+            country
+                .zones
+                .push(Zone { name: (*name).to_string(), label: city_of(name) });
         }
         catalog
     }
@@ -265,6 +285,10 @@ fn continent_of(zone_name: &str) -> &str {
 pub fn parse(zone_tab: &str, iso3166: &str) -> Catalog {
     let country_names = parse_iso3166(iso3166);
     let mut catalog = Catalog::default();
+    // (continent, country code) -> (country name, its zones), accumulated
+    // before collapsing because a family is only visible once all of a
+    // country's rows have been read.
+    let mut raw: BTreeMap<(String, String), (String, Vec<RawZone>)> = BTreeMap::new();
 
     for line in zone_tab.lines() {
         let line = line.trim_end();
@@ -283,33 +307,104 @@ pub fn parse(zone_tab: &str, iso3166: &str) -> Catalog {
             continue;
         }
 
-        for code in codes.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        for (position, code) in
+            codes.split(',').map(str::trim).filter(|c| !c.is_empty()).enumerate()
+        {
             let country_name =
                 country_names.get(code).cloned().unwrap_or_else(|| code.to_string());
-            catalog
-                .by_continent
-                .entry(continent_of(name).to_string())
-                .or_default()
-                .entry(code.to_string())
-                .or_insert_with(|| Country {
-                    code: code.to_string(),
-                    name: country_name,
-                    zones: Vec::new(),
-                })
-                .zones
-                .push(Zone { name: name.to_string(), description: description.clone() });
+            raw.entry((continent_of(name).to_string(), code.to_string()))
+                .or_insert_with(|| (country_name, Vec::new()))
+                .1
+                .push(RawZone {
+                    name: name.to_string(),
+                    comment: description.clone(),
+                    primary: position == 0,
+                });
         }
     }
 
-    // Sorted by the label actually rendered, so the list reads alphabetically
-    // on screen rather than by the underlying tz name.
-    for countries in catalog.by_continent.values_mut() {
-        for country in countries.values_mut() {
-            country.zones.sort_by_key(|zone| zone.label());
-            country.zones.dedup_by(|a, b| a.name == b.name);
-        }
+    for ((continent, code), (country_name, zones)) in raw {
+        let zones = collapse_families(zones);
+        catalog
+            .by_continent
+            .entry(continent)
+            .or_default()
+            .insert(code.clone(), Country { code, name: country_name, zones });
     }
     catalog
+}
+
+/// A row of `zone1970.tab` before its family has been collapsed.
+struct RawZone {
+    name: String,
+    comment: String,
+    /// Whether the country being listed under is the *first* code on the row.
+    ///
+    /// A zone shared between countries has one canonical name, and that name's
+    /// city belongs to whichever country tzdata lists first:
+    /// `PA,CA,KY  America/Panama  EST - ON (Atikokan), NU (Coral H)` is the
+    /// zone Atikokan, Ontario uses, but calling it "Panama" to a Canadian is
+    /// nonsense. So only the primary country gets the city label; everyone else
+    /// gets tzdata's own description of what the zone covers *for them*.
+    primary: bool,
+}
+
+/// Reduces a country's zones to one row per *time zone*, not one per tzdata
+/// entry.
+///
+/// The US alone lists ten "Eastern" zones -- Detroit, two in Kentucky, six in
+/// Indiana -- which differ only in *historical* DST rules and are identical for
+/// telling the current time. Showing all of them (and "Central" x7, "Alaska"
+/// x7) made the picker unusable, so each family collapses to its primary zone,
+/// labelled with the city it actually selects: "Eastern - New York".
+///
+/// The trade-off, accepted deliberately: a timestamp from decades ago in, say,
+/// Pulaski County, Indiana would now resolve against America/New_York's history
+/// rather than America/Indiana/Winamac's. This is a wall clock showing the
+/// current time, so that difference is unobservable here.
+fn collapse_families(zones: Vec<RawZone>) -> Vec<Zone> {
+    // Insertion-ordered grouping, so the result is deterministic rather than
+    // dependent on hash order.
+    let mut groups: Vec<(String, Vec<RawZone>)> = Vec::new();
+    for zone in zones {
+        let family = zone_family(&zone.comment);
+        // A zone with no comment has no family to be grouped into -- key it by
+        // its own name so it stays a row of its own.
+        let key =
+            if family.is_empty() { zone.name.clone() } else { family.to_string() };
+        match groups.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, members)) => members.push(zone),
+            None => groups.push((key, vec![zone])),
+        }
+    }
+
+    let mut collapsed: Vec<Zone> = groups
+        .into_iter()
+        .map(|(_, members)| {
+            // Strictly-greater keeps the first on a tie, so ordering stays the
+            // file's rather than depending on which `max` variant is used.
+            let mut best = &members[0];
+            for candidate in &members[1..] {
+                if representative_score(&candidate.comment) > representative_score(&best.comment) {
+                    best = candidate;
+                }
+            }
+            let family = zone_family(&best.comment);
+            let label = if !best.primary && !best.comment.is_empty() {
+                // Borrowed zone: tzdata's own wording describes what it covers
+                // here, which beats naming a city in someone else's country.
+                best.comment.clone()
+            } else {
+                let city = city_of(&best.name);
+                if family.is_empty() { city } else { format!("{family} - {city}") }
+            };
+            Zone { name: best.name.clone(), label }
+        })
+        .collect();
+
+    collapsed.sort_by(|a, b| a.label.cmp(&b.label));
+    collapsed.dedup_by(|a, b| a.name == b.name);
+    collapsed
 }
 
 /// `iso3166.tab` is `code <TAB> name`, with `#` comments.
@@ -449,8 +544,8 @@ US\tUnited States
     #[test]
     fn a_country_keeps_all_of_its_zones_with_their_descriptions() {
         let zones = catalog().zones("America", "US");
-        let labels: Vec<String> = zones.iter().map(|z| z.label()).collect();
-        assert_eq!(labels, vec!["Central (most areas)", "Eastern (most areas)"]);
+        let labels: Vec<&str> = zones.iter().map(|z| z.label.as_str()).collect();
+        assert_eq!(labels, vec!["Central - Chicago", "Eastern - New York"]);
     }
 
     /// A zone genuinely belongs to several countries at once, and has to be
@@ -481,10 +576,9 @@ US\tUnited States
     #[test]
     fn a_zone_without_a_description_is_labelled_by_its_city() {
         let zones = catalog().zones("Europe", "GB");
-        assert_eq!(zones[0].label(), "London");
-        // Nested names keep only the city, underscores and all.
-        let nested = Zone { name: "America/Argentina/Buenos_Aires".into(), description: String::new() };
-        assert_eq!(nested.label(), "Buenos Aires");
+        assert_eq!(zones[0].label, "London");
+        // Nested names keep only the city, underscores turned back into spaces.
+        assert_eq!(city_of("America/Argentina/Buenos_Aires"), "Buenos Aires");
     }
 
     #[test]
@@ -511,6 +605,66 @@ US\tUnited States
         let countries = catalog.countries("Europe");
         assert_eq!(countries.len(), 1);
         assert_eq!(countries[0].name, "ZZ");
+    }
+
+    /// The real shape of the problem: tzdata lists ten US "Eastern" zones that
+    /// differ only in historical DST rules, which made the picker unusable.
+    #[test]
+    fn a_countrys_duplicate_zones_collapse_to_one_row_per_family() {
+        let zone_tab = "\
+US\t+404251-0740023\tAmerica/New_York\tEastern (most areas)
+US\t+421953-0830245\tAmerica/Detroit\tEastern - MI (most areas)
+US\t+381515-0854534\tAmerica/Kentucky/Louisville\tEastern - KY (Louisville area)
+US\t+394606-0860929\tAmerica/Indiana/Indianapolis\tEastern - IN (most areas)
+US\t+410305-0863611\tAmerica/Indiana/Winamac\tEastern - IN (Pulaski)
+US\t+415100-0873900\tAmerica/Chicago\tCentral (most areas)
+US\t+394421-1045903\tAmerica/Denver\tMountain (most areas)
+US\t+332654-1120424\tAmerica/Phoenix\tMST - AZ (most areas), Creston BC
+";
+        let zones = parse(zone_tab, ISO3166).zones("America", "US");
+        let labels: Vec<&str> = zones.iter().map(|z| z.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["Central - Chicago", "Eastern - New York", "MST - Phoenix", "Mountain - Denver"],
+            "five Eastern entries should become one, named for the city it selects"
+        );
+    }
+
+    /// Alaska is the awkward case: two of its entries have no sub-region
+    /// qualifier ("Alaska (most areas)" and "Alaska (west)"), so "has no
+    /// qualifier" alone doesn't pick a winner.
+    #[test]
+    fn the_primary_zone_of_a_family_wins_even_when_several_look_primary() {
+        let zone_tab = "\
+US\t+611305-1495401\tAmerica/Anchorage\tAlaska (most areas)
+US\t+643004-1652423\tAmerica/Nome\tAlaska (west)
+US\t+581807-1342511\tAmerica/Juneau\tAlaska - Juneau area
+";
+        let zones = parse(zone_tab, ISO3166).zones("America", "US");
+        assert_eq!(zones.len(), 1);
+        assert_eq!(zones[0].name, "America/Anchorage");
+        assert_eq!(zones[0].label, "Alaska - Anchorage");
+    }
+
+    #[test]
+    fn zone_families_are_read_off_the_comment() {
+        assert_eq!(zone_family("Eastern (most areas)"), "Eastern");
+        assert_eq!(zone_family("Eastern - IN (Pulaski)"), "Eastern");
+        assert_eq!(zone_family("MST - AZ (most areas), Creston BC"), "MST");
+        assert_eq!(zone_family("Pacific"), "Pacific");
+        assert_eq!(zone_family(""), "");
+    }
+
+    /// Zones with no comment at all can't share a family, so they must stay
+    /// separate rather than all collapsing into one unnamed group.
+    #[test]
+    fn uncommented_zones_are_not_collapsed_together() {
+        let zone_tab = "\
+GB\t+513030-0000731\tEurope/London
+GB\t+0000-00000\tEurope/Elsewhere
+";
+        let zones = parse(zone_tab, ISO3166).zones("Europe", "GB");
+        assert_eq!(zones.len(), 2, "two uncommented zones are two choices");
     }
 
     fn scratch(name: &str) -> Settings {
@@ -588,7 +742,17 @@ US\tUnited States
             Some(("America".to_string(), "US".to_string())),
         );
         let us = catalog.zones("America", "US");
-        assert!(us.len() > 5, "the US has more than five zones; got {}", us.len());
-        assert!(us.iter().all(|z| !z.label().is_empty()));
+        // Collapsed: Eastern/Central/Mountain/MST/Pacific/Alaska/Hawaii, not
+        // the 29 rows the file actually lists for the US.
+        assert!(
+            (5..=12).contains(&us.len()),
+            "expected the US collapsed to a handful of zones, got {}: {:?}",
+            us.len(),
+            us.iter().map(|z| &z.label).collect::<Vec<_>>()
+        );
+        assert!(us.iter().all(|z| !z.label.is_empty()));
+        let eastern = us.iter().find(|z| z.label.starts_with("Eastern")).expect("an Eastern row");
+        assert_eq!(eastern.name, "America/New_York");
+        assert_eq!(eastern.label, "Eastern - New York", "the row must name the city it selects");
     }
 }

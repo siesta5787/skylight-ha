@@ -1424,8 +1424,8 @@ fn main() {
                     *tz_level.borrow_mut() = level;
                     show_tz_level(&app);
                 }
-                TzSelection::Choose(zone) => {
-                    apply_timezone_and_restart(&app, &timezone_settings, &zone);
+                TzSelection::Choose { zone, label } => {
+                    apply_timezone_and_restart(&app, &timezone_settings, &zone, &label);
                 }
             }
         });
@@ -1805,7 +1805,7 @@ fn tz_level_rows(catalog: &timezone::Catalog, level: &TzLevel) -> (Vec<String>, 
         TzLevel::Zone { continent, country_code, .. } => {
             let zones = catalog.zones(continent, country_code);
             (
-                zones.iter().map(|z| z.label()).collect(),
+                zones.iter().map(|z| z.label.clone()).collect(),
                 zones.iter().map(|z| z.name.clone()).collect(),
             )
         }
@@ -1816,7 +1816,10 @@ fn tz_level_rows(catalog: &timezone::Catalog, level: &TzLevel) -> (Vec<String>, 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TzSelection {
     Descend(TzLevel),
-    Choose(String),
+    /// The zone to apply, plus the label the user actually tapped -- so the
+    /// confirmation can say "Eastern - New York" rather than surprising them
+    /// with a tz name the row never mentioned.
+    Choose { zone: String, label: String },
 }
 
 /// Where a tap on `payload` takes the drill-down from `level`.
@@ -1837,7 +1840,10 @@ fn tz_level_after_selection(
         TzLevel::Country { continent } => {
             let zones = catalog.zones(continent, payload);
             if let [only] = zones.as_slice() {
-                return TzSelection::Choose(only.name.clone());
+                return TzSelection::Choose {
+                    zone: only.name.clone(),
+                    label: only.label.clone(),
+                };
             }
             let country_name = catalog
                 .countries(continent)
@@ -1851,7 +1857,15 @@ fn tz_level_after_selection(
                 country_name,
             })
         }
-        TzLevel::Zone { .. } => TzSelection::Choose(payload.to_string()),
+        TzLevel::Zone { continent, country_code, .. } => {
+            let label = catalog
+                .zones(continent, country_code)
+                .into_iter()
+                .find(|zone| zone.name == payload)
+                .map(|zone| zone.label)
+                .unwrap_or_else(|| payload.to_string());
+            TzSelection::Choose { zone: payload.to_string(), label }
+        }
     }
 }
 
@@ -2146,13 +2160,18 @@ fn run_wifi_connect(
 /// Reuses the update feature's overlay rather than adding a near-identical
 /// one: it is already exactly "a full-screen explanation shown for a beat
 /// before `exit(0)`", which is precisely this situation too.
-fn apply_timezone_and_restart(app: &AppWindow, settings: &timezone::Settings, zone: &str) {
+fn apply_timezone_and_restart(
+    app: &AppWindow,
+    settings: &timezone::Settings,
+    zone: &str,
+    label: &str,
+) {
     match timezone::apply(settings, zone) {
         Ok(()) => {
             app.set_tz_picker_open(false);
             app.set_update_overlay_title("Changing time zone...".into());
             app.set_update_overlay_detail(
-                format!("Switching to {zone} and restarting. This takes a few seconds.").into(),
+                format!("Switching to {label} and restarting. This takes a few seconds.").into(),
             );
             app.set_update_overlay_open(true);
             // Same 1.5s as the updater, and for the same reason: a DRM/KMS
@@ -4120,6 +4139,7 @@ mod tests {
         timezone::parse(
             "US\t+404251-0740023\tAmerica/New_York\tEastern (most areas)\n\
              US\t+415100-0873900\tAmerica/Chicago\tCentral (most areas)\n\
+             US\t+394606-0860929\tAmerica/Indiana/Indianapolis\tEastern - IN (most areas)\n\
              GB\t+513030-0000731\tEurope/London\n",
             "GB\tBritain (UK)\nUS\tUnited States\n",
         )
@@ -4144,7 +4164,10 @@ mod tests {
             &TzLevel::Country { continent: "Europe".into() },
             "GB",
         );
-        assert_eq!(next, TzSelection::Choose("Europe/London".into()));
+        assert_eq!(
+            next,
+            TzSelection::Choose { zone: "Europe/London".into(), label: "London".into() }
+        );
     }
 
     #[test]
@@ -4172,7 +4195,15 @@ mod tests {
             country_name: "United States".into(),
         };
         let next = tz_level_after_selection(&tz_catalog(), &level, "America/New_York");
-        assert_eq!(next, TzSelection::Choose("America/New_York".into()));
+        assert_eq!(
+            next,
+            TzSelection::Choose {
+                zone: "America/New_York".into(),
+                // The label follows the tap, so the restart message names the
+                // same thing the row did.
+                label: "Eastern - New York".into(),
+            }
+        );
     }
 
     #[test]
@@ -4211,7 +4242,9 @@ mod tests {
                 country_name: "United States".into(),
             },
         );
-        assert_eq!(labels, vec!["Central (most areas)", "Eastern (most areas)"]);
+        // The extra Indiana row in the fixture collapses into Eastern rather
+        // than becoming a second, indistinguishable "Eastern" choice.
+        assert_eq!(labels, vec!["Central - Chicago", "Eastern - New York"]);
         assert_eq!(payloads, vec!["America/Chicago", "America/New_York"]);
     }
 
