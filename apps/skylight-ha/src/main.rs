@@ -1,4 +1,5 @@
 mod timezone;
+mod wifi;
 mod update;
 
 use std::cell::RefCell;
@@ -15,7 +16,7 @@ use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Wee
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
     DashboardRowData, EventFormMember, MemberChipData, SensorRowData, TodoColumnData,
-    TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
+    TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData, WifiNetworkData,
 };
 
 /// The local UTC offset in whole seconds east of UTC, re-derived once per
@@ -312,6 +313,13 @@ fn main() {
     // component itself.
     let keyboard_buffer: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     let keyboard_target: Rc<RefCell<Option<KeyboardTarget>>> = Rc::new(RefCell::new(None));
+
+    // Declared here rather than beside the Wi-Fi callbacks further down
+    // because the keyboard's Done handler needs them: a passphrase typed on
+    // the on-screen keyboard is what completes a join.
+    let wifi_settings = wifi::Settings::from_env();
+    let wifi_networks: Arc<Mutex<Vec<wifi::Network>>> = Arc::new(Mutex::new(Vec::new()));
+    let wifi_busy = Arc::new(AtomicBool::new(false));
     // The event-creation form's title, edited via the keyboard (a separate
     // modal on top of the form) -- reset to the default each time a new
     // slot/day/"+" is tapped, in `open_event_form`.
@@ -622,6 +630,9 @@ fn main() {
         let todo_uids = todo_uids.clone();
         let keyboard_buffer = keyboard_buffer.clone();
         let keyboard_target = keyboard_target.clone();
+        let wifi_settings = wifi_settings.clone();
+        let wifi_networks = wifi_networks.clone();
+        let wifi_busy = wifi_busy.clone();
         let event_form_title = event_form_title.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
@@ -630,15 +641,42 @@ fn main() {
         app.on_keyboard_done(move || {
             let Some(app) = app_weak.upgrade() else { return };
             app.set_keyboard_open(false);
-            let text = keyboard_buffer.borrow().trim().to_string();
+            let raw = keyboard_buffer.borrow().clone();
+            let text = raw.trim().to_string();
             *keyboard_buffer.borrow_mut() = String::new();
             app.set_keyboard_text("".into());
             let Some(target) = keyboard_target.borrow_mut().take() else { return };
-            if text.is_empty() {
-                return;
+
+            match target {
+                // Handled before the emptiness check below because a Wi-Fi
+                // passphrase is the one target where surrounding whitespace is
+                // legal and has to survive -- trimming it would silently turn a
+                // correct password into an inexplicable "wrong password".
+                KeyboardTarget::WifiPassword { ssid, security } => {
+                    if raw.is_empty() {
+                        return;
+                    }
+                    run_wifi_connect(
+                        &rt_handle,
+                        &app_weak,
+                        &wifi_settings,
+                        &wifi_networks,
+                        &wifi_busy,
+                        ssid,
+                        Some(raw),
+                        security,
+                    );
+                    return;
+                }
+                _ if text.is_empty() => return,
+                _ => {}
             }
 
             match target {
+                // Already handled above, which returns for this variant.
+                KeyboardTarget::WifiPassword { .. } => {
+                    unreachable!("Wi-Fi passphrases are handled before this match")
+                }
                 KeyboardTarget::NewTaskSummary { column } => {
                     let Some(entity_id) =
                         todo_uids.lock().unwrap().get(column as usize).map(|(id, _)| id.clone())
@@ -1177,6 +1215,111 @@ fn main() {
                 run_update_install(&update_settings, &app_weak, &update_busy, manifest).await;
             });
         });
+    }
+
+    // --- Wi-Fi ----------------------------------------------------------
+    refresh_wifi_status(&rt_handle, &app.as_weak(), &wifi_settings);
+
+    {
+        let wifi_settings = wifi_settings.clone();
+        let wifi_networks = wifi_networks.clone();
+        let wifi_busy = wifi_busy.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_wifi_manage_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_wifi_message("".into());
+            app.set_wifi_view_open(true);
+            // Scan straight away: opening the manager is itself the request to
+            // see what's nearby.
+            run_wifi_scan(&rt_handle, &app_weak, &wifi_settings, &wifi_networks, &wifi_busy);
+        });
+    }
+    {
+        let wifi_settings = wifi_settings.clone();
+        let wifi_networks = wifi_networks.clone();
+        let wifi_busy = wifi_busy.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_wifi_rescan(move || {
+            run_wifi_scan(&rt_handle, &app_weak, &wifi_settings, &wifi_networks, &wifi_busy);
+        });
+    }
+    {
+        let app_weak = app.as_weak();
+        app.on_wifi_view_closed(move || {
+            if let Some(app) = app_weak.upgrade() {
+                app.set_wifi_view_open(false);
+                app.set_wifi_message("".into());
+            }
+        });
+    }
+    {
+        let wifi_settings = wifi_settings.clone();
+        let wifi_networks = wifi_networks.clone();
+        let wifi_busy = wifi_busy.clone();
+        let keyboard_target = keyboard_target.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_wifi_network_selected(move |index| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let Some(network) = wifi_networks.lock().unwrap().get(index as usize).cloned() else {
+                return;
+            };
+            if !network.security.supported() {
+                app.set_wifi_message(
+                    "WPA-Enterprise networks need credentials this screen can't collect.".into(),
+                );
+                return;
+            }
+            if !network.security.needs_password() {
+                run_wifi_connect(
+                    &rt_handle,
+                    &app_weak,
+                    &wifi_settings,
+                    &wifi_networks,
+                    &wifi_busy,
+                    network.ssid,
+                    None,
+                    network.security,
+                );
+                return;
+            }
+            // Secured: collect the passphrase on the existing on-screen
+            // keyboard, and finish the job in `on_keyboard_done`.
+            *keyboard_buffer.borrow_mut() = String::new();
+            *keyboard_target.borrow_mut() = Some(KeyboardTarget::WifiPassword {
+                ssid: network.ssid.clone(),
+                security: network.security,
+            });
+            app.set_keyboard_text("".into());
+            app.set_keyboard_prompt(format!("Password for {}", network.ssid).into());
+            app.set_keyboard_open(true);
+        });
+    }
+
+    // Keeps the Settings card and the Wi-Fi header honest without polling the
+    // control socket when nobody is looking at either.
+    // Function-scoped, like `clock_timer` further down: a dropped Slint timer
+    // stops, and this has to keep ticking for the life of the window.
+    let wifi_status_timer = slint::Timer::default();
+    {
+        let wifi_settings = wifi_settings.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        wifi_status_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(5),
+            move || {
+                let Some(app) = app_weak.upgrade() else { return };
+                let watching =
+                    app.get_wifi_view_open() || app.get_current_page() == ui::Page::Settings;
+                if watching {
+                    refresh_wifi_status(&rt_handle, &app_weak, &wifi_settings);
+                }
+            },
+        );
     }
 
     // --- Time zone ------------------------------------------------------
@@ -1788,6 +1931,209 @@ fn apply_timezone_card(app: &AppWindow, settings: &timezone::Settings) {
     app.set_timezone_detail(detail.into());
 }
 
+/// Renders scan results for the list, marking whichever one is in use.
+fn wifi_network_model(
+    networks: &[wifi::Network],
+    connected_ssid: Option<&str>,
+) -> Vec<WifiNetworkData> {
+    networks
+        .iter()
+        .map(|network| WifiNetworkData {
+            ssid: network.ssid.clone().into(),
+            bars: i32::from(network.bars()),
+            secured: network.security.needs_password(),
+            supported: network.security.supported(),
+            connected: connected_ssid == Some(network.ssid.as_str()),
+        })
+        .collect()
+}
+
+fn set_wifi_networks(app: &AppWindow, networks: &[wifi::Network], connected_ssid: Option<&str>) {
+    app.set_wifi_networks(slint::ModelRc::new(slint::VecModel::from(wifi_network_model(
+        networks,
+        connected_ssid,
+    ))));
+}
+
+/// Opens both control connections: one for commands, one attached for events.
+///
+/// Separate because an event arriving mid-command would otherwise be read as
+/// that command's reply -- the same split `wpa_cli` uses.
+fn wifi_connect_ctrl(settings: &wifi::Settings) -> wifi::Result<(wifi::Ctrl, wifi::Ctrl)> {
+    let commands = wifi::Ctrl::connect(settings)?;
+    let events = wifi::Ctrl::connect(settings)?;
+    events.attach()?;
+    Ok((commands, events))
+}
+
+/// Pushes the current connection state into the Settings card and the Wi-Fi
+/// view's header.
+fn refresh_wifi_status(rt_handle: &tokio::runtime::Handle, app_weak: &slint::Weak<AppWindow>, settings: &wifi::Settings) {
+    let settings = settings.clone();
+    let app_weak = app_weak.clone();
+    rt_handle.spawn_blocking(move || {
+        let status = wifi::Ctrl::connect(&settings).and_then(|ctrl| wifi::status(&ctrl));
+        let (line, ssid) = match status {
+            Ok(status) => (status.summary(), status.ssid.clone()),
+            // Not an error worth shouting about: on the dev machine there is
+            // no control socket at all, and on the device wpa_supplicant may
+            // simply not be up yet.
+            Err(err) => {
+                tracing::debug!(%err, "wifi status unavailable");
+                ("Wi-Fi status unavailable".to_string(), None)
+            }
+        };
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_wifi_status(line.into());
+            // Re-mark the connected row without re-scanning.
+            let networks = app.get_wifi_networks();
+            let refreshed: Vec<WifiNetworkData> = networks
+                .iter()
+                .map(|mut row| {
+                    row.connected = ssid.as_deref() == Some(row.ssid.as_str());
+                    row
+                })
+                .collect();
+            app.set_wifi_networks(slint::ModelRc::new(slint::VecModel::from(refreshed)));
+        });
+    });
+}
+
+/// Scans for networks and publishes the results.
+fn run_wifi_scan(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    settings: &wifi::Settings,
+    networks: &Arc<Mutex<Vec<wifi::Network>>>,
+    busy: &Arc<AtomicBool>,
+) {
+    // `swap` not load-then-store: double taps are routine on a touchscreen and
+    // the second one must lose, same as the update buttons.
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(app) = app_weak.upgrade() {
+        app.set_wifi_busy(true);
+        app.set_wifi_message("".into());
+    }
+
+    let settings = settings.clone();
+    let networks = networks.clone();
+    let busy = busy.clone();
+    let app_weak = app_weak.clone();
+    // spawn_blocking, not spawn: these are synchronous socket round trips that
+    // wait seconds for a scan, and they must not sit on a tokio worker that
+    // the HA client also needs.
+    rt_handle.spawn_blocking(move || {
+        let result = wifi_connect_ctrl(&settings).and_then(|(ctrl, events)| {
+            let found = wifi::scan(&ctrl, &events, wifi::SCAN_TIMEOUT)?;
+            let status = wifi::status(&ctrl).unwrap_or_default();
+            Ok((found, status))
+        });
+        busy.store(false, Ordering::SeqCst);
+
+        match result {
+            Ok((found, status)) => {
+                *networks.lock().unwrap() = found.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = app_weak.upgrade() else { return };
+                    app.set_wifi_busy(false);
+                    app.set_wifi_status(status.summary().into());
+                    set_wifi_networks(&app, &found, status.ssid.as_deref());
+                    if found.is_empty() {
+                        app.set_wifi_message("No networks found nearby.".into());
+                    }
+                });
+            }
+            Err(err) => {
+                tracing::warn!(%err, "wifi scan failed");
+                let message = format!("Could not scan: {err}");
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = app_weak.upgrade() else { return };
+                    app.set_wifi_busy(false);
+                    app.set_wifi_message(message.into());
+                });
+            }
+        }
+    });
+}
+
+/// Joins a network, reporting precisely why if it doesn't work.
+///
+/// The password is never logged, here or in `wifi.rs`.
+fn run_wifi_connect(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    settings: &wifi::Settings,
+    networks: &Arc<Mutex<Vec<wifi::Network>>>,
+    busy: &Arc<AtomicBool>,
+    ssid: String,
+    password: Option<String>,
+    security: wifi::Security,
+) {
+    if busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(app) = app_weak.upgrade() {
+        app.set_wifi_busy(true);
+        app.set_wifi_message(format!("Connecting to {ssid}...").into());
+    }
+
+    let settings = settings.clone();
+    let networks = networks.clone();
+    let busy = busy.clone();
+    let app_weak = app_weak.clone();
+    rt_handle.spawn_blocking(move || {
+        let result = wifi_connect_ctrl(&settings).and_then(|(ctrl, events)| {
+            wifi::connect(
+                &ctrl,
+                &events,
+                &ssid,
+                password.as_deref(),
+                security,
+                wifi::CONNECT_TIMEOUT,
+            )?;
+            Ok(wifi::status(&ctrl).unwrap_or_default())
+        });
+        busy.store(false, Ordering::SeqCst);
+
+        let known = networks.lock().unwrap().clone();
+        match result {
+            Ok(status) => {
+                tracing::info!(%ssid, "joined wifi network");
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = app_weak.upgrade() else { return };
+                    app.set_wifi_busy(false);
+                    app.set_wifi_message(format!("Connected to {ssid}.").into());
+                    app.set_wifi_status(status.summary().into());
+                    set_wifi_networks(&app, &known, status.ssid.as_deref());
+                });
+            }
+            Err(err) => {
+                // Deliberately specific: telling a typo apart from an
+                // out-of-range AP is the entire reason this talks to the
+                // control socket rather than rewriting wpa_supplicant.conf.
+                let message = match err {
+                    wifi::Error::WrongPassword => {
+                        format!("Wrong password for {ssid}. The previous network has been restored.")
+                    }
+                    wifi::Error::ConnectTimeout => format!(
+                        "Could not connect to {ssid} in time. The previous network has been restored."
+                    ),
+                    other => format!("Could not connect to {ssid}: {other}"),
+                };
+                tracing::warn!(%ssid, "wifi connect failed: {message}");
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = app_weak.upgrade() else { return };
+                    app.set_wifi_busy(false);
+                    app.set_wifi_message(message.into());
+                });
+            }
+        }
+    });
+}
+
 /// Points the system at `zone`, then shows a curtain and exits so the
 /// supervisor restarts the app into it.
 ///
@@ -2009,6 +2355,9 @@ fn open_event_form(
 enum KeyboardTarget {
     NewTaskSummary { column: i32 },
     EventTitle,
+    /// Joining a secured network. Carries what the password is *for*, since
+    /// the scan list can be rescanned (and reordered) while the keyboard is up.
+    WifiPassword { ssid: String, security: wifi::Security },
 }
 
 /// Drives the parental PIN pad's multi-step flows -- see `pin_flow` in

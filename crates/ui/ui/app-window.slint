@@ -15,6 +15,7 @@ import { PinPad } from "pin-pad.slint";
 import { SettingsPage } from "settings-view.slint";
 import { UpdateOverlay } from "update-overlay.slint";
 import { TimezonePicker } from "timezone-picker.slint";
+import { WifiView, WifiNetworkData } from "wifi-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -23,7 +24,7 @@ import "../assets/fonts/Inter-Regular.ttf";
 export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
     AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, DashboardRowData,
-    ToggleEntityData, SensorRowData, Page,
+    ToggleEntityData, SensorRowData, Page, WifiNetworkData,
 }
 
 component NavArrow inherits Rectangle {
@@ -189,6 +190,18 @@ export component AppWindow inherits Window {
     in property <bool> update-overlay-open: false;
     in property <string> update-overlay-title: "Updating...";
     in property <string> update-overlay-detail: "";
+
+    // Wi-Fi. Scanning and connecting are blocking control-socket calls run off
+    // the UI thread; everything here is the result they publish back.
+    in property <string> wifi-status: "";
+    in property <bool> wifi-view-open: false;
+    in property <string> wifi-message: "";
+    in property <bool> wifi-busy: false;
+    in property <[WifiNetworkData]> wifi-networks: [];
+    callback wifi-manage-requested();
+    callback wifi-network-selected(int);
+    callback wifi-rescan();
+    callback wifi-view-closed();
 
     // Time zone. The picker is a dumb list: Rust owns which level of the
     // continent -> country -> zone drill-down is showing and hands over
@@ -507,6 +520,9 @@ export component AppWindow inherits Window {
                     update-check-requested => { root.update-check-requested(); }
                     update-install-requested => { root.update-install-requested(); }
 
+                    wifi-status: root.wifi-status;
+                    wifi-manage-requested => { root.wifi-manage-requested(); }
+
                     timezone-name: root.timezone-name;
                     timezone-detail: root.timezone-detail;
                     timezone-change-requested => { root.timezone-change-requested(); }
@@ -567,6 +583,17 @@ export component AppWindow inherits Window {
         open: root.update-overlay-open;
         title: root.update-overlay-title;
         detail: root.update-overlay-detail;
+    }
+
+    WifiView {
+        open: root.wifi-view-open;
+        status-line: root.wifi-status;
+        message: root.wifi-message;
+        busy: root.wifi-busy;
+        networks: root.wifi-networks;
+        network-selected(i) => { root.wifi-network-selected(i); }
+        rescan => { root.wifi-rescan(); }
+        closed => { root.wifi-view-closed(); }
     }
 
     // Same top-level-sibling shape as the three overlays above, for the same

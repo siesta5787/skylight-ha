@@ -1,0 +1,239 @@
+import { Theme } from "theme.slint";
+
+export struct WifiNetworkData {
+    ssid: string,
+    // 0-4, from the scan's RSSI.
+    bars: int,
+    secured: bool,
+    // False for WPA-Enterprise, which needs credentials this UI can't collect.
+    supported: bool,
+    connected: bool,
+}
+
+// Four bars, drawn as plain rectangles rather than glyphs: the target device
+// has exactly one embedded font and no fallback, so anything relying on a
+// signal-strength glyph existing would render as tofu there.
+component SignalBars inherits HorizontalLayout {
+    in property <int> bars;
+
+    spacing: 2px;
+    alignment: end;
+
+    for index in [1, 2, 3, 4]: Rectangle {
+        width: 4px;
+        height: 4px + index * 3px;
+        y: parent.height - self.height;
+        border-radius: 1px;
+        background: index <= root.bars ? Theme.accent : Theme.border;
+    }
+}
+
+component NetworkRow inherits Rectangle {
+    in property <WifiNetworkData> network;
+    callback tapped();
+
+    height: 56px;
+    border-radius: Theme.radius;
+    background: touch.pressed ? Theme.surface-alt : (network.connected ? Theme.surface-alt : transparent);
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.tapped(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 16px;
+        padding-right: 16px;
+        spacing: 10px;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+
+            Text {
+                text: root.network.ssid;
+                font-size: 16px;
+                color: root.network.supported ? Theme.text-primary : Theme.text-muted;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.network.connected
+                    ? "Connected"
+                    : (root.network.supported
+                        ? (root.network.secured ? "Secured" : "Open")
+                        : "Enterprise - not supported");
+                font-size: 11px;
+                color: root.network.connected ? Theme.accent : Theme.text-muted;
+            }
+        }
+
+        // A plain word rather than a padlock glyph, for the same font reason
+        // as the bars above.
+        Text {
+            text: root.network.secured ? "LOCK" : "";
+            font-size: 9px;
+            font-weight: 700;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+
+        SignalBars {
+            bars: root.network.bars;
+            width: 22px;
+        }
+    }
+}
+
+// Full-screen Wi-Fi manager: current status, nearby networks, and joining one.
+//
+// STRUCTURAL CONSTRAINT, load-bearing -- read before moving this:
+// instantiated as a *top-level sibling* in app-window.slint, always present,
+// sized unconditionally, toggled only by `visible: open`. NOT a conditional
+// `if` nested inside SettingsPage -- that shape rendered correctly but was
+// entirely dead to touch when it was tried for a Settings -> Logs page. See
+// CLAUDE.md; PinPad/UpdateOverlay/TimezonePicker are the shapes confirmed to
+// work on hardware.
+export component WifiView inherits Rectangle {
+    in property <bool> open: false;
+    in property <string> status-line: "";
+    // Scanning/connecting progress, or why something failed.
+    in property <string> message: "";
+    in property <bool> busy: false;
+    in property <[WifiNetworkData]> networks: [];
+
+    callback network-selected(int);
+    callback rescan();
+    callback closed();
+
+    visible: open;
+    width: 100%;
+    height: 100%;
+    background: #14161fcc;
+    z: 2500;
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+    }
+
+    Rectangle {
+        width: 560px;
+        height: 80%;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        background: Theme.surface;
+        border-radius: Theme.radius;
+        border-width: 1px;
+        border-color: Theme.border;
+        clip: true;
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+
+            HorizontalLayout {
+                spacing: 12px;
+                height: 40px;
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+
+                    Text {
+                        text: "Wi-Fi";
+                        font-size: 19px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                    }
+
+                    Text {
+                        text: root.status-line;
+                        font-size: 12px;
+                        color: Theme.text-muted;
+                        overflow: elide;
+                    }
+                }
+
+                Rectangle {
+                    width: 44px;
+                    background: close-touch.pressed ? Theme.surface-alt : transparent;
+                    border-radius: Theme.radius;
+
+                    close-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.closed(); }
+                    }
+
+                    Text {
+                        text: "✕";
+                        font-size: 18px;
+                        color: Theme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            if root.message != "": Text {
+                text: root.message;
+                font-size: 13px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            Flickable {
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: start;
+
+                    if root.networks.length == 0: Text {
+                        text: root.busy ? "Looking for networks..." : "No networks found.";
+                        font-size: 13px;
+                        color: Theme.text-muted;
+                    }
+
+                    for network[idx] in root.networks: NetworkRow {
+                        network: network;
+                        tapped => { root.network-selected(idx); }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 44px;
+                border-radius: Theme.radius;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: rescan-touch.pressed ? Theme.surface-alt : transparent;
+                opacity: root.busy ? 0.5 : 1.0;
+
+                rescan-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        if (!root.busy) { root.rescan(); }
+                    }
+                }
+
+                Text {
+                    text: root.busy ? "Scanning..." : "Scan again";
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

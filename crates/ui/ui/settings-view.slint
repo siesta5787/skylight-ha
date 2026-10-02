@@ -97,6 +97,9 @@ export component SettingsPage inherits Rectangle {
     callback update-check-requested();
     callback update-install-requested();
 
+    in property <string> wifi-status: "";
+    callback wifi-manage-requested();
+
     // e.g. "America/New_York" and "EDT - UTC-4".
     in property <string> timezone-name: "";
     in property <string> timezone-detail: "";
@@ -202,6 +205,23 @@ export component SettingsPage inherits Rectangle {
                     horizontal-stretch: 1;
                     tapped => { root.update-install-requested(); }
                 }
+            }
+        }
+
+        SettingsCard {
+            title: "Wi-Fi";
+
+            Text {
+                text: root.wifi-status;
+                font-size: 13px;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+            }
+
+            SettingsButton {
+                label: "Manage Wi-Fi";
+                secondary: true;
+                tapped => { root.wifi-manage-requested(); }
             }
         }
 
