@@ -618,7 +618,31 @@ skylight-self-update.md`. Confirmed working end-to-end on real hardware
     in-app self-updater's rollback logic** — arms itself when it sees a
     `pending` update marker, restores the last-known-good binary after 3
     failed spawns in a row. See "In-app self-update" under App features
-    above for the full design.
+    above for the full design. `S99skylight` also (2026-09-30) silences the
+    framebuffer console before handing over the display — see the next
+    bullet.
+  - **Kernel console no longer paints over the app — fix verified live
+    2026-09-30, but NOT on the device yet.** Symptom: plugging or unplugging
+    any USB device made `fbcon` repaint the *entire* retained console (the
+    whole boot log, down to the login prompt) straight over the running
+    dashboard — one `usb 1-1: USB disconnect` printk was enough, because
+    fbcon redraws everything it has retained, not just the new line. Fixed
+    in `S99skylight`'s `start()` by setting `console_loglevel` to 1 and
+    unbinding fbcon from the VT layer (`/sys/class/vtconsole/*/bind`,
+    matched on the `name` file rather than assuming `vtcon1`; kernel has
+    `CONFIG_VT_HW_CONSOLE_BINDING=y`, verified in the built kernel's own
+    `.config`). `stop()` restores both, so `/etc/init.d/S99skylight stop`
+    hands the console back over SSH. Deliberately NOT done via
+    `quiet`/`loglevel=` on the kernel cmdline, so console output *during*
+    boot — the main way boot hangs have actually been diagnosed here, twice
+    — stays fully intact; only the post-boot window goes quiet. Nothing is
+    lost for diagnostics: syslogd still writes `/var/log/messages` and
+    `dmesg` reads the ring buffer, neither of which console loglevel
+    affects. **Confirmed working on real hardware by testing the two writes
+    live over SSH** (no reboot needed — both are instantly reversible),
+    but it's an overlay change, so **the in-app updater cannot deliver it**
+    — it lands on the device at the next image build + reflash. Anything
+    else needing a reflash should be bundled into that same build.
   - `usr/bin/skylight-ha` — the app binary.
   - `etc/skylight/config.toml` and `etc/skylight/ha-token.secret` — both
     baked into the overlay, but **`ha-token.secret` in the repo itself is
