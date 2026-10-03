@@ -110,7 +110,20 @@ if [ "$SKIP_BUILD" = false ]; then
         -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
         alpine:3.20 sh -c '
             set -eu
-            apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
+            # Bounded and retried for the same reason as rustup below: apk has
+            # no timeout of its own, so a connection dropping mid-fetch leaves
+            # it blocked on a dead socket indefinitely. Seen twice -- once as a
+            # 22-minute silent hang, once as "Connection aborted"/"BAD archive".
+            i=0
+            until timeout 420 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
+                i=$((i + 1))
+                if [ "$i" -ge 5 ]; then
+                    echo "apk install failed 5 times in a row -- giving up" >&2
+                    exit 1
+                fi
+                echo "apk install attempt $i timed out or failed, retrying in 10s..." >&2
+                sleep 10
+            done
             # rustup fetches its own toolchain components with its own HTTP client
             # (separate from the curl above, which only fetches the installer
             # script) and, observed repeatedly, can hang indefinitely on a stalled

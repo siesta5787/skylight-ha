@@ -141,7 +141,15 @@ untouched by local desktop work.
     -e SKYLIGHT_GIT_SHA="$(git rev-parse --short=12 HEAD)" \
     alpine:3.20 sh -c '
       set -eu
-      apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers
+      # Bounded and retried like rustup below -- apk has no timeout of its own,
+      # so a connection dropping mid-fetch wedges it on a dead socket.
+      i=0
+      until timeout 420 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
+        i=$((i + 1))
+        if [ "$i" -ge 5 ]; then echo "apk install failed 5 times -- giving up" >&2; exit 1; fi
+        echo "apk install attempt $i failed, retrying in 10s..." >&2
+        sleep 10
+      done
       # rustup'"'"'s own toolchain-component download (separate HTTP client from
       # the curl below, which only fetches the installer script) has hung
       # indefinitely on a stalled connection multiple times in practice, with no
