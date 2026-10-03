@@ -1,0 +1,412 @@
+import { Theme } from "theme.slint";
+
+export struct MusicRowData {
+    title: string,
+    subtitle: string,
+    // Right-hand detail: a track's duration, or an album count.
+    trailing: string,
+    // Tracks start playback; everything else drills in. Drives the chevron.
+    playable: bool,
+}
+
+component SectionChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback tapped();
+
+    height: 34px;
+    border-radius: 17px;
+    background: root.active ? Theme.accent : (touch.pressed ? Theme.surface-alt : transparent);
+    border-width: 1px;
+    border-color: root.active ? Theme.accent : Theme.border;
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.tapped(); }
+    }
+
+    Text {
+        text: root.label;
+        font-size: 13px;
+        font-weight: 600;
+        color: root.active ? white : Theme.text-primary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component TransportButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> prominent: false;
+    callback tapped();
+
+    width: root.prominent ? 48px : 40px;
+    height: root.prominent ? 48px : 40px;
+    border-radius: self.width / 2;
+    background: root.prominent
+        ? (touch.pressed ? Theme.accent.darker(0.15) : Theme.accent)
+        : (touch.pressed ? Theme.border : transparent);
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.tapped(); }
+    }
+
+    Text {
+        text: root.glyph;
+        font-size: root.prominent ? 17px : 15px;
+        font-weight: 700;
+        color: root.prominent ? white : Theme.text-primary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component MusicRow inherits Rectangle {
+    // Named `data`, not `row`: `row` is reserved (GridLayout placement).
+    in property <MusicRowData> data;
+    callback tapped();
+
+    height: 58px;
+    border-radius: Theme.radius;
+    background: touch.pressed ? Theme.surface-alt : transparent;
+
+    // Explicitly sized rather than relying on "sole child fills parent" --
+    // there are siblings, and that implicit sizing is what once cost this
+    // project an entirely touch-dead page (see CLAUDE.md).
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.tapped(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        spacing: 12px;
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+
+            Text {
+                text: root.data.title;
+                font-size: 15px;
+                color: Theme.text-primary;
+                overflow: elide;
+            }
+
+            Text {
+                text: root.data.subtitle;
+                font-size: 11px;
+                color: Theme.text-muted;
+                visible: root.data.subtitle != "";
+                overflow: elide;
+            }
+        }
+
+        Text {
+            text: root.data.trailing;
+            font-size: 12px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+
+        Text {
+            // "Play" rather than a triangle glyph: one embedded font, no
+            // fallback, so an unavailable glyph renders as tofu.
+            text: root.data.playable ? "Play" : "›";
+            font-size: root.data.playable ? 11px : 20px;
+            font-weight: root.data.playable ? 700 : 400;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The Music tab: browse a Navidrome library, play it on a Home Assistant
+// media_player.
+//
+// Deliberately a dumb renderer. Rust owns which level of the browse hierarchy
+// is showing and hands over already-labelled rows, exactly as the time zone
+// picker does, so the navigation rules stay in testable Rust rather than in
+// markup.
+export component MusicPage inherits Rectangle {
+    // False until a server has been set up; drives the connect prompt.
+    in property <bool> configured: false;
+    // Progress, or why something failed.
+    in property <string> message: "";
+    in property <bool> busy: false;
+
+    // Now playing, read from the target media_player's own HA state.
+    in property <bool> player-configured: false;
+    in property <string> player-name: "";
+    in property <string> now-playing-title: "";
+    in property <string> now-playing-artist: "";
+    in property <bool> now-playing-active: false;
+
+    in property <[string]> sections: [];
+    in property <int> selected-section: 0;
+    in property <string> heading: "";
+    in property <bool> can-go-back: false;
+    in property <[MusicRowData]> rows: [];
+
+    callback setup-requested();
+    callback forget-requested();
+    callback section-selected(int);
+    callback row-selected(int);
+    callback back();
+    callback choose-player();
+    callback play-pause();
+    callback next-track();
+    callback previous-track();
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    // --- Not set up yet -------------------------------------------------
+    if !root.configured: VerticalLayout {
+        padding: 28px;
+        spacing: 14px;
+        alignment: center;
+
+        Text {
+            text: "Music";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+        }
+
+        Text {
+            text: "Connect your music library to browse it here and play it on a speaker.";
+            font-size: 14px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        if root.message != "": Text {
+            text: root.message;
+            font-size: 13px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+
+        Rectangle {
+            height: 46px;
+            width: 240px;
+            x: (parent.width - self.width) / 2;
+            border-radius: 10px;
+            background: connect-touch.pressed ? Theme.accent.darker(0.15) : Theme.accent;
+
+            connect-touch := TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.setup-requested(); }
+            }
+
+            Text {
+                text: root.busy ? "Connecting..." : "Set up music server";
+                font-size: 14px;
+                font-weight: 700;
+                color: white;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // --- Set up ---------------------------------------------------------
+    if root.configured: VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        // Now playing / transport.
+        Rectangle {
+            height: 72px;
+            border-radius: Theme.radius;
+            background: Theme.surface-alt;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            HorizontalLayout {
+                padding-left: 16px;
+                padding-right: 16px;
+                spacing: 10px;
+
+                VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 1;
+                    spacing: 2px;
+
+                    Text {
+                        text: root.player-configured
+                            ? (root.now-playing-title != "" ? root.now-playing-title : "Nothing playing")
+                            : "No speaker chosen";
+                        font-size: 15px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: root.player-configured
+                            ? (root.now-playing-artist != ""
+                                ? root.now-playing-artist + " - " + root.player-name
+                                : root.player-name)
+                            : "Pick where music should play";
+                        font-size: 11px;
+                        color: Theme.text-muted;
+                        overflow: elide;
+                    }
+                }
+
+                if !root.player-configured: Rectangle {
+                    width: 128px;
+                    height: 38px;
+                    border-radius: 10px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: pick-touch.pressed ? Theme.border : transparent;
+
+                    pick-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.choose-player(); }
+                    }
+
+                    Text {
+                        text: "Choose speaker";
+                        font-size: 12px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if root.player-configured: HorizontalLayout {
+                    spacing: 6px;
+                    TransportButton {
+                        glyph: "|<";
+                        tapped => { root.previous-track(); }
+                    }
+                    TransportButton {
+                        glyph: root.now-playing-active ? "||" : ">";
+                        prominent: true;
+                        tapped => { root.play-pause(); }
+                    }
+                    TransportButton {
+                        glyph: ">|";
+                        tapped => { root.next-track(); }
+                    }
+                }
+            }
+        }
+
+        // Section chips.
+        HorizontalLayout {
+            spacing: 8px;
+            height: 34px;
+
+            for section[idx] in root.sections: SectionChip {
+                label: section;
+                active: idx == root.selected-section;
+                tapped => { root.section-selected(idx); }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            // Reachable from every level, so a wrong server or a changed
+            // password is recoverable without SSH.
+            Rectangle {
+                width: 96px;
+                border-radius: 17px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: forget-touch.pressed ? Theme.surface-alt : transparent;
+
+                forget-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.forget-requested(); }
+                }
+
+                Text {
+                    text: "Disconnect";
+                    font-size: 11px;
+                    color: Theme.text-muted;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // Heading + back.
+        HorizontalLayout {
+            height: 30px;
+            spacing: 10px;
+
+            if root.can-go-back: Rectangle {
+                width: 38px;
+                border-radius: 8px;
+                background: back-touch.pressed ? Theme.surface-alt : transparent;
+
+                back-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.back(); }
+                }
+
+                Text {
+                    text: "‹";
+                    font-size: 22px;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Text {
+                text: root.heading;
+                font-size: 16px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+        }
+
+        if root.message != "": Text {
+            text: root.message;
+            font-size: 12px;
+            color: Theme.text-muted;
+            wrap: word-wrap;
+        }
+
+        Flickable {
+            VerticalLayout {
+                spacing: 2px;
+                alignment: start;
+
+                if root.rows.length == 0: Text {
+                    text: root.busy ? "Loading..." : "Nothing here.";
+                    font-size: 13px;
+                    color: Theme.text-muted;
+                }
+
+                for entry[idx] in root.rows: MusicRow {
+                    data: entry;
+                    tapped => { root.row-selected(idx); }
+                }
+            }
+        }
+    }
+}

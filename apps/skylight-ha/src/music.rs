@@ -54,8 +54,6 @@ pub enum Error {
     Server { code: i64, message: String },
     #[error("unexpected reply from the music server: {0}")]
     Malformed(String),
-    #[error("no music server is configured yet")]
-    NotConfigured,
     #[error("could not read or write the saved music settings: {0}")]
     Storage(#[from] io::Error),
 }
@@ -123,10 +121,6 @@ impl Credentials {
     /// Home Assistant.
     pub fn stream_url(&self, track_id: &str) -> String {
         self.endpoint("stream", &[("id", track_id)])
-    }
-
-    pub fn cover_art_url(&self, cover_art_id: &str, size: u32) -> String {
-        self.endpoint("getCoverArt", &[("id", cover_art_id), ("size", &size.to_string())])
     }
 }
 
@@ -272,35 +266,21 @@ pub struct Playlist {
     pub song_count: u32,
 }
 
-/// Which list the Albums view is showing.
+/// How the album list is ordered.
+///
+/// Subsonic's `getAlbumList2` supports several (`recent`, `frequent`,
+/// `random`, `alphabeticalByName`); only the one the UI offers is modelled, so
+/// there's no dead surface. Adding a sort picker means adding variants here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlbumSort {
+    /// Recently added, which is the useful default for a wall display.
     Newest,
-    Recent,
-    Frequent,
-    Random,
-    Alphabetical,
 }
 
 impl AlbumSort {
-    /// Subsonic's `getAlbumList2` type parameter.
     pub fn as_type(self) -> &'static str {
         match self {
             AlbumSort::Newest => "newest",
-            AlbumSort::Recent => "recent",
-            AlbumSort::Frequent => "frequent",
-            AlbumSort::Random => "random",
-            AlbumSort::Alphabetical => "alphabeticalByName",
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            AlbumSort::Newest => "Recently added",
-            AlbumSort::Recent => "Recently played",
-            AlbumSort::Frequent => "Most played",
-            AlbumSort::Random => "Random",
-            AlbumSort::Alphabetical => "A-Z",
         }
     }
 }
@@ -400,12 +380,6 @@ pub struct SearchResults {
     pub tracks: Vec<Track>,
 }
 
-impl SearchResults {
-    pub fn is_empty(&self) -> bool {
-        self.artists.is_empty() && self.albums.is_empty() && self.tracks.is_empty()
-    }
-}
-
 pub fn parse_search(response: &serde_json::Value) -> Result<SearchResults> {
     Ok(SearchResults {
         artists: list_at(response, "searchResult3", "artist")?,
@@ -433,10 +407,6 @@ impl Client {
             .build()
             .unwrap_or_default();
         Self { http, credentials }
-    }
-
-    pub fn credentials(&self) -> &Credentials {
-        &self.credentials
     }
 
     async fn get(&self, method: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
@@ -633,13 +603,15 @@ mod tests {
         assert!(parse_albums(&ok).unwrap().is_empty());
         assert!(parse_artists(&ok).unwrap().is_empty());
         assert!(parse_playlists(&ok).unwrap().is_empty());
-        assert!(parse_search(&ok).unwrap().is_empty());
+        let empty = parse_search(&ok).unwrap();
+        assert!(empty.artists.is_empty() && empty.albums.is_empty() && empty.tracks.is_empty());
 
         let empty_search = unwrap_response(
             r#"{"subsonic-response":{"status":"ok","searchResult3":{}}}"#,
         )
         .unwrap();
-        assert!(parse_search(&empty_search).unwrap().is_empty());
+        let empty = parse_search(&empty_search).unwrap();
+        assert!(empty.artists.is_empty() && empty.albums.is_empty() && empty.tracks.is_empty());
     }
 
     #[test]
@@ -652,7 +624,6 @@ mod tests {
         assert_eq!(results.artists[0].name, "Portishead");
         assert_eq!(results.albums[0].name, "Dummy");
         assert_eq!(results.tracks[0].duration_label(), "5:02");
-        assert!(!results.is_empty());
     }
 
     #[test]
@@ -679,9 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn album_sorts_map_to_the_types_subsonic_expects() {
+    fn the_album_sort_maps_to_the_type_subsonic_expects() {
         assert_eq!(AlbumSort::Newest.as_type(), "newest");
-        assert_eq!(AlbumSort::Alphabetical.as_type(), "alphabeticalByName");
-        assert_eq!(AlbumSort::Frequent.label(), "Most played");
     }
 }

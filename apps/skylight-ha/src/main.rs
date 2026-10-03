@@ -17,7 +17,8 @@ use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Wee
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
     DashboardRowData, EventFormMember, MemberChipData, SensorRowData, TodoColumnData,
-    TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData, WifiNetworkData,
+    MusicRowData, TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
+    WifiNetworkData,
 };
 
 /// The local UTC offset in whole seconds east of UTC, re-derived once per
@@ -318,6 +319,13 @@ fn main() {
     // Declared here rather than beside the Wi-Fi callbacks further down
     // because the keyboard's Done handler needs them: a passphrase typed on
     // the on-screen keyboard is what completes a join.
+    // Loaded at startup so the tab knows whether to show the connect prompt
+    // or the library without waiting on a network round trip.
+    let music_state: Arc<Mutex<MusicUi>> = Arc::new(Mutex::new(MusicUi {
+        credentials: music::load_credentials(),
+        ..MusicUi::default()
+    }));
+
     let wifi_settings = wifi::Settings::from_env();
     let wifi_networks: Arc<Mutex<Vec<wifi::Network>>> = Arc::new(Mutex::new(Vec::new()));
     let wifi_busy = Arc::new(AtomicBool::new(false));
@@ -634,6 +642,7 @@ fn main() {
         let wifi_settings = wifi_settings.clone();
         let wifi_networks = wifi_networks.clone();
         let wifi_busy = wifi_busy.clone();
+        let music_state = music_state.clone();
         let event_form_title = event_form_title.clone();
         let reference_date = reference_date.clone();
         let family_state = family_state.clone();
@@ -669,14 +678,55 @@ fn main() {
                     );
                     return;
                 }
+                // Same reasoning as the Wi-Fi passphrase: a password's
+                // surrounding whitespace is legal, so it must not be trimmed.
+                KeyboardTarget::MusicPassword { server_url, username } => {
+                    if raw.is_empty() {
+                        return;
+                    }
+                    finish_music_setup(
+                        &rt_handle,
+                        &app_weak,
+                        &music_state,
+                        &live_client,
+                        server_url,
+                        username,
+                        raw,
+                    );
+                    return;
+                }
                 _ if text.is_empty() => return,
                 _ => {}
             }
 
             match target {
-                // Already handled above, which returns for this variant.
-                KeyboardTarget::WifiPassword { .. } => {
-                    unreachable!("Wi-Fi passphrases are handled before this match")
+                // Already handled above, which returns for these variants.
+                KeyboardTarget::WifiPassword { .. } | KeyboardTarget::MusicPassword { .. } => {
+                    unreachable!("passwords are handled before this match")
+                }
+                KeyboardTarget::MusicServerUrl => {
+                    let server_url = normalise_music_server_url(&text);
+                    *keyboard_target.borrow_mut() =
+                        Some(KeyboardTarget::MusicUsername { server_url });
+                    app.set_keyboard_prompt("Music server username".into());
+                    app.set_keyboard_open(true);
+                }
+                KeyboardTarget::MusicUsername { server_url } => {
+                    *keyboard_target.borrow_mut() = Some(KeyboardTarget::MusicPassword {
+                        server_url,
+                        username: text.clone(),
+                    });
+                    app.set_keyboard_prompt("Music server password".into());
+                    app.set_keyboard_open(true);
+                }
+                KeyboardTarget::MusicSearch => {
+                    music_show(
+                        &rt_handle,
+                        &app_weak,
+                        &music_state,
+                        &live_client,
+                        vec![MusicLevel::Search { query: text.clone() }],
+                    );
                 }
                 KeyboardTarget::NewTaskSummary { column } => {
                     let Some(entity_id) =
@@ -1215,6 +1265,251 @@ fn main() {
             rt_handle.spawn(async move {
                 run_update_install(&update_settings, &app_weak, &update_busy, manifest).await;
             });
+        });
+    }
+
+    // --- Music ----------------------------------------------------------
+    app.set_music_sections(slint::ModelRc::new(slint::VecModel::from(
+        MUSIC_SECTIONS.iter().map(|s| SharedString::from(*s)).collect::<Vec<_>>(),
+    )));
+    {
+        let state = music_state.lock().unwrap();
+        apply_music_chrome(&app, &state);
+    }
+    // Load the library straight away when it's already set up, so the tab is
+    // populated before it's first opened rather than after.
+    if music_state.lock().unwrap().credentials.is_some() {
+        music_show(
+            &rt_handle,
+            &app.as_weak(),
+            &music_state,
+            &live_client,
+            vec![MusicLevel::Albums],
+        );
+    }
+
+    {
+        let keyboard_target = keyboard_target.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let app_weak = app.as_weak();
+        app.on_music_setup_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            *keyboard_buffer.borrow_mut() = String::new();
+            *keyboard_target.borrow_mut() = Some(KeyboardTarget::MusicServerUrl);
+            app.set_keyboard_text("".into());
+            app.set_keyboard_prompt("Music server address (e.g. 192.168.0.5:4533)".into());
+            app.set_keyboard_open(true);
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let app_weak = app.as_weak();
+        app.on_music_forget_requested(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            if let Err(err) = music::forget_credentials() {
+                tracing::warn!(%err, "could not remove the saved music settings");
+            }
+            let mut state = music_state.lock().unwrap();
+            *state = MusicUi::default();
+            apply_music_chrome(&app, &state);
+            set_music_rows(&app, Vec::new());
+            app.set_music_message("".into());
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let keyboard_target = keyboard_target.clone();
+        let keyboard_buffer = keyboard_buffer.clone();
+        let app_weak = app.as_weak();
+        app.on_music_section_selected(move |index| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let level = match index {
+                0 => MusicLevel::Albums,
+                1 => MusicLevel::Artists,
+                2 => MusicLevel::Playlists,
+                _ => {
+                    // Search needs a query before there's anything to show.
+                    *keyboard_buffer.borrow_mut() = String::new();
+                    *keyboard_target.borrow_mut() = Some(KeyboardTarget::MusicSearch);
+                    app.set_keyboard_text("".into());
+                    app.set_keyboard_prompt("Search your music".into());
+                    app.set_keyboard_open(true);
+                    return;
+                }
+            };
+            music_show(&rt_handle, &app_weak, &music_state, &live_client, vec![level]);
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_back(move || {
+            let stack = {
+                let state = music_state.lock().unwrap();
+                let mut stack = state.stack.clone();
+                stack.pop();
+                stack
+            };
+            if !stack.is_empty() {
+                music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+            }
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_choose_player(move || {
+            let mut stack = music_state.lock().unwrap().stack.clone();
+            stack.push(MusicLevel::ChoosePlayer);
+            music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_row_selected(move |index| {
+            let Some(app) = app_weak.upgrade() else { return };
+            let action = music_state.lock().unwrap().actions.get(index as usize).cloned();
+            let Some(action) = action else { return };
+
+            match action {
+                MusicRowAction::Open(level) => {
+                    let mut stack = music_state.lock().unwrap().stack.clone();
+                    stack.push(level);
+                    music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+                }
+                MusicRowAction::SelectPlayer { entity_id, name } => {
+                    // Persist alongside the server credentials so the choice
+                    // survives a restart.
+                    let stack = {
+                        let mut state = music_state.lock().unwrap();
+                        if let Some(credentials) = state.credentials.as_mut() {
+                            credentials.player_entity_id = Some(entity_id.clone());
+                            if let Err(err) = music::save_credentials(credentials) {
+                                tracing::warn!(%err, "could not save the chosen speaker");
+                            }
+                        }
+                        state.player_name = name;
+                        apply_music_chrome(&app, &state);
+                        let mut stack = state.stack.clone();
+                        stack.pop();
+                        stack
+                    };
+                    let stack = if stack.is_empty() { vec![MusicLevel::Albums] } else { stack };
+                    music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+                }
+                MusicRowAction::PlayTrack(start) => {
+                    let (credentials, player, tracks) = {
+                        let state = music_state.lock().unwrap();
+                        (state.credentials.clone(), state.player_entity_id(), state.tracks.clone())
+                    };
+                    let (Some(credentials), Some(tracks_head)) =
+                        (credentials, tracks.get(start).cloned())
+                    else {
+                        return;
+                    };
+                    let Some(player) = player else {
+                        // Nothing to play to yet -- say so and go straight to
+                        // picking one rather than failing silently.
+                        app.set_music_message("Choose a speaker first.".into());
+                        let mut stack = music_state.lock().unwrap().stack.clone();
+                        stack.push(MusicLevel::ChoosePlayer);
+                        music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+                        return;
+                    };
+
+                    app.set_music_message(format!("Playing {}...", tracks_head.title).into());
+                    let live_client = live_client.clone();
+                    let app_weak = app_weak.clone();
+                    rt_handle.spawn(async move {
+                        let ha = live_client.lock().unwrap().clone();
+                        let Some(ha) = ha else { return };
+                        let result =
+                            play_music_tracks(&ha, &credentials, &player, &tracks, start).await;
+                        if let Err(err) = result {
+                            tracing::warn!(%err, "could not start playback");
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(app) = app_weak.upgrade() {
+                                    app.set_music_message(
+                                        format!("Could not start playback: {err}").into(),
+                                    );
+                                }
+                            });
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    // Transport controls: three identical shapes sharing one helper.
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        app.on_music_play_pause(move || {
+            music_transport(&rt_handle, &music_state, &live_client, "media_play_pause");
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        app.on_music_next_track(move || {
+            music_transport(&rt_handle, &music_state, &live_client, "media_next_track");
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        app.on_music_previous_track(move || {
+            music_transport(&rt_handle, &music_state, &live_client, "media_previous_track");
+        });
+    }
+
+    // Now playing, driven by the target player's own state_changed events
+    // rather than polling: get_states has been measured at 17s+ on this
+    // instance, which is no way to drive a transport bar.
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let app_weak = app.as_weak();
+        rt_handle.spawn(async move {
+            loop {
+                let client = { live_client.lock().unwrap().clone() };
+                let Some(client) = client else {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                };
+                let mut events = client.subscribe_state_changed();
+                while let Ok(state) = events.recv().await {
+                    let target = music_state.lock().unwrap().player_entity_id();
+                    if target.as_deref() != Some(state.entity_id.as_str()) {
+                        continue;
+                    }
+                    let (title, artist, playing) = now_playing_from(&state);
+                    let app_weak = app_weak.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = app_weak.upgrade() {
+                            app.set_music_now_playing_title(title.into());
+                            app.set_music_now_playing_artist(artist.into());
+                            app.set_music_now_playing_active(playing);
+                        }
+                    });
+                }
+                // The broadcast ended, which means the HA connection went
+                // away; wait for `run_ha_sync` to publish a new one.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         });
     }
 
@@ -1774,6 +2069,491 @@ fn push_update_status(
     });
 }
 
+// --- Music tab -----------------------------------------------------------
+
+const MUSIC_SECTIONS: [&str; 4] = ["Albums", "Artists", "Playlists", "Search"];
+
+/// One level of the browse hierarchy. Held as a stack so Back returns to
+/// wherever you actually came from -- an album opened from an artist goes back
+/// to that artist, not to the album list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MusicLevel {
+    Albums,
+    Artists,
+    Playlists,
+    Album { id: String, name: String },
+    Artist { id: String, name: String },
+    Playlist { id: String, name: String },
+    Search { query: String },
+    /// Picking which HA `media_player` playback goes to.
+    ChoosePlayer,
+}
+
+impl MusicLevel {
+    fn heading(&self) -> String {
+        match self {
+            MusicLevel::Albums => "Albums".into(),
+            MusicLevel::Artists => "Artists".into(),
+            MusicLevel::Playlists => "Playlists".into(),
+            MusicLevel::Album { name, .. } | MusicLevel::Artist { name, .. } => name.clone(),
+            MusicLevel::Playlist { name, .. } => name.clone(),
+            MusicLevel::Search { query } => format!("Results for \"{query}\""),
+            MusicLevel::ChoosePlayer => "Where should music play?".into(),
+        }
+    }
+
+    /// Which section chip to highlight, or -1 where none applies.
+    fn section_index(&self) -> i32 {
+        match self {
+            MusicLevel::Albums | MusicLevel::Album { .. } => 0,
+            MusicLevel::Artists | MusicLevel::Artist { .. } => 1,
+            MusicLevel::Playlists | MusicLevel::Playlist { .. } => 2,
+            MusicLevel::Search { .. } => 3,
+            MusicLevel::ChoosePlayer => -1,
+        }
+    }
+}
+
+/// What tapping a row does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MusicRowAction {
+    Open(MusicLevel),
+    /// Index into the level's track list; playing starts there and queues the
+    /// rest, so tapping track 4 of an album plays 4 onward rather than just 4.
+    PlayTrack(usize),
+    SelectPlayer { entity_id: String, name: String },
+}
+
+fn music_row(title: &str, subtitle: &str, trailing: &str, playable: bool) -> MusicRowData {
+    MusicRowData {
+        title: title.into(),
+        subtitle: subtitle.into(),
+        trailing: trailing.into(),
+        playable,
+    }
+}
+
+fn album_rows(albums: &[music::Album]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    albums
+        .iter()
+        .map(|album| {
+            let subtitle = match (&album.artist, album.year) {
+                (Some(artist), Some(year)) => format!("{artist} - {year}"),
+                (Some(artist), None) => artist.clone(),
+                (None, Some(year)) => year.to_string(),
+                (None, None) => String::new(),
+            };
+            (
+                music_row(&album.name, &subtitle, "", false),
+                MusicRowAction::Open(MusicLevel::Album {
+                    id: album.id.clone(),
+                    name: album.name.clone(),
+                }),
+            )
+        })
+        .unzip()
+}
+
+fn artist_rows(artists: &[music::Artist]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    artists
+        .iter()
+        .map(|artist| {
+            let trailing = match artist.album_count {
+                0 => String::new(),
+                1 => "1 album".into(),
+                n => format!("{n} albums"),
+            };
+            (
+                music_row(&artist.name, "", &trailing, false),
+                MusicRowAction::Open(MusicLevel::Artist {
+                    id: artist.id.clone(),
+                    name: artist.name.clone(),
+                }),
+            )
+        })
+        .unzip()
+}
+
+fn playlist_rows(playlists: &[music::Playlist]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    playlists
+        .iter()
+        .map(|playlist| {
+            let trailing = match playlist.song_count {
+                1 => "1 track".to_string(),
+                n => format!("{n} tracks"),
+            };
+            (
+                music_row(&playlist.name, "", &trailing, false),
+                MusicRowAction::Open(MusicLevel::Playlist {
+                    id: playlist.id.clone(),
+                    name: playlist.name.clone(),
+                }),
+            )
+        })
+        .unzip()
+}
+
+fn track_rows(tracks: &[music::Track]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(index, track)| {
+            (
+                music_row(
+                    &track.title,
+                    track.artist.as_deref().unwrap_or(""),
+                    &track.duration_label(),
+                    true,
+                ),
+                MusicRowAction::PlayTrack(index),
+            )
+        })
+        .unzip()
+}
+
+/// Search returns three kinds at once; they're concatenated with the tracks
+/// last so the playable rows sit together at the bottom.
+fn search_rows(results: &music::SearchResults) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    let (mut rows, mut actions) = artist_rows(&results.artists);
+    let (album_rows_, album_actions) = album_rows(&results.albums);
+    rows.extend(album_rows_);
+    actions.extend(album_actions);
+    let (track_rows_, track_actions) = track_rows(&results.tracks);
+    rows.extend(track_rows_);
+    actions.extend(track_actions);
+    (rows, actions)
+}
+
+/// Candidate playback targets, from HA's own entity list.
+///
+/// Everything in the `media_player` domain is offered rather than trying to
+/// guess which ones accept a URL: that varies by integration and by firmware,
+/// and a wrong guess hiding the right speaker is worse than listing one that
+/// turns out not to work.
+fn player_rows(states: &[EntityState]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+    let mut players: Vec<(String, String)> = states
+        .iter()
+        .filter(|state| state.entity_id.starts_with("media_player."))
+        .map(|state| {
+            let name = state
+                .attributes
+                .get("friendly_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or(&state.entity_id)
+                .to_string();
+            (state.entity_id.clone(), name)
+        })
+        .collect();
+    players.sort_by(|a, b| a.1.cmp(&b.1));
+
+    players
+        .into_iter()
+        .map(|(entity_id, name)| {
+            (
+                music_row(&name, &entity_id, "", false),
+                MusicRowAction::SelectPlayer { entity_id, name },
+            )
+        })
+        .unzip()
+}
+
+/// Pulls now-playing out of a `media_player` entity's state.
+fn now_playing_from(state: &EntityState) -> (String, String, bool) {
+    let attribute = |key: &str| {
+        state.attributes.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+    };
+    (attribute("media_title"), attribute("media_artist"), state.state == "playing")
+}
+
+/// What a level's rows are, fetched from the server.
+async fn load_music_level(
+    client: &music::Client,
+    level: &MusicLevel,
+) -> music::Result<(Vec<MusicRowData>, Vec<MusicRowAction>, Vec<music::Track>)> {
+    Ok(match level {
+        MusicLevel::Albums => {
+            let albums = client.albums(music::AlbumSort::Newest, 100).await?;
+            let (rows, actions) = album_rows(&albums);
+            (rows, actions, Vec::new())
+        }
+        MusicLevel::Artists => {
+            let artists = client.artists().await?;
+            let (rows, actions) = artist_rows(&artists);
+            (rows, actions, Vec::new())
+        }
+        MusicLevel::Playlists => {
+            let playlists = client.playlists().await?;
+            let (rows, actions) = playlist_rows(&playlists);
+            (rows, actions, Vec::new())
+        }
+        MusicLevel::Album { id, .. } => {
+            let tracks = client.album_tracks(id).await?;
+            let (rows, actions) = track_rows(&tracks);
+            (rows, actions, tracks)
+        }
+        MusicLevel::Artist { id, .. } => {
+            let albums = client.artist_albums(id).await?;
+            let (rows, actions) = album_rows(&albums);
+            (rows, actions, Vec::new())
+        }
+        MusicLevel::Playlist { id, .. } => {
+            let tracks = client.playlist_tracks(id).await?;
+            let (rows, actions) = track_rows(&tracks);
+            (rows, actions, tracks)
+        }
+        MusicLevel::Search { query } => {
+            let results = client.search(query).await?;
+            let (rows, actions) = search_rows(&results);
+            (rows, actions, results.tracks)
+        }
+        // Filled from HA's entity list, not the music server.
+        MusicLevel::ChoosePlayer => (Vec::new(), Vec::new(), Vec::new()),
+    })
+}
+
+/// Sends a queue to a Home Assistant `media_player`.
+///
+/// The first track replaces whatever was playing and the rest are appended, so
+/// tapping a track plays from there to the end of the album rather than
+/// stopping after one. Each URL is a plain authenticated GET, which is what
+/// lets any player that can fetch a URL handle it.
+async fn play_music_tracks(
+    ha: &Client,
+    credentials: &music::Credentials,
+    player_entity_id: &str,
+    tracks: &[music::Track],
+    start: usize,
+) -> std::result::Result<(), ha_client::connection::Error> {
+    let players = [player_entity_id.to_string()];
+    for (offset, track) in tracks.iter().skip(start).enumerate() {
+        let enqueue = if offset == 0 { "replace" } else { "add" };
+        ha.call_service(
+            "media_player",
+            "play_media",
+            &players,
+            serde_json::json!({
+                "media_content_id": credentials.stream_url(&track.id),
+                "media_content_type": "music",
+                "enqueue": enqueue,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Everything the Music tab needs that outlives a single callback.
+#[derive(Debug, Default)]
+struct MusicUi {
+    credentials: Option<music::Credentials>,
+    /// Browse history; the last entry is what's on screen. A stack rather than
+    /// a single level so Back returns where you actually came from -- an album
+    /// opened from an artist goes back to that artist.
+    stack: Vec<MusicLevel>,
+    /// Parallel to the rows currently displayed.
+    actions: Vec<MusicRowAction>,
+    /// The track list behind the current level, for playback.
+    tracks: Vec<music::Track>,
+    player_name: String,
+}
+
+impl MusicUi {
+    fn player_entity_id(&self) -> Option<String> {
+        self.credentials.as_ref().and_then(|c| c.player_entity_id.clone())
+    }
+}
+
+/// Pushes the non-row parts of the Music tab into the UI.
+fn apply_music_chrome(app: &AppWindow, state: &MusicUi) {
+    app.set_music_configured(state.credentials.is_some());
+    app.set_music_player_configured(state.player_entity_id().is_some());
+    app.set_music_player_name(state.player_name.clone().into());
+    let level = state.stack.last();
+    app.set_music_heading(level.map(|l| l.heading()).unwrap_or_default().into());
+    app.set_music_can_go_back(state.stack.len() > 1);
+    app.set_music_selected_section(level.map(|l| l.section_index()).unwrap_or(0));
+}
+
+fn set_music_rows(app: &AppWindow, rows: Vec<MusicRowData>) {
+    app.set_music_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+}
+
+/// Navigates to `stack`, fetching whatever the new top level needs.
+///
+/// Always takes a whole stack rather than a push/pop flag, so "open this",
+/// "go back" and "switch section" are all the same operation with a different
+/// stack -- there's no second code path to keep consistent.
+fn music_show(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    stack: Vec<MusicLevel>,
+) {
+    let Some(level) = stack.last().cloned() else { return };
+    if let Some(app) = app_weak.upgrade() {
+        app.set_music_busy(true);
+        app.set_music_message("".into());
+    }
+
+    let app_weak = app_weak.clone();
+    let music_state = music_state.clone();
+    let live_client = live_client.clone();
+    rt_handle.spawn(async move {
+        let credentials = music_state.lock().unwrap().credentials.clone();
+
+        let loaded = match &level {
+            // The player list comes from Home Assistant, not the music server.
+            MusicLevel::ChoosePlayer => {
+                let ha = live_client.lock().unwrap().clone();
+                match ha {
+                    Some(ha) => match ha.get_states().await {
+                        Ok(states) => {
+                            let (rows, actions) = player_rows(&states);
+                            Ok((rows, actions, Vec::new()))
+                        }
+                        Err(err) => Err(format!("Could not ask Home Assistant for speakers: {err}")),
+                    },
+                    None => Err("Not connected to Home Assistant yet.".to_string()),
+                }
+            }
+            level => match credentials {
+                Some(credentials) => {
+                    let client = music::Client::new(credentials);
+                    load_music_level(&client, level)
+                        .await
+                        .map_err(|err| format!("{err}"))
+                }
+                None => Err("No music server is set up yet.".to_string()),
+            },
+        };
+
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_music_busy(false);
+            match loaded {
+                Ok((rows, actions, tracks)) => {
+                    {
+                        let mut state = music_state.lock().unwrap();
+                        state.stack = stack;
+                        state.actions = actions;
+                        state.tracks = tracks;
+                        apply_music_chrome(&app, &state);
+                    }
+                    set_music_rows(&app, rows);
+                }
+                Err(message) => {
+                    tracing::warn!(%message, "music browse failed");
+                    app.set_music_message(message.into());
+                }
+            }
+        });
+    });
+}
+
+/// Accepts what someone actually types for a server address.
+///
+/// A bare host or `host:port` is far likelier to be typed on a touchscreen
+/// than a full URL, and silently failing to connect because the scheme was
+/// missing would be a miserable first experience.
+fn normalise_music_server_url(typed: &str) -> String {
+    let trimmed = typed.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+/// Validates typed credentials against the server, and only saves them if they
+/// work.
+///
+/// `ping` first so a typo surfaces at setup with the server's own wording
+/// ("Wrong username or password") instead of as an unexplained empty library
+/// later.
+fn finish_music_setup(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    server_url: String,
+    username: String,
+    password: String,
+) {
+    if let Some(app) = app_weak.upgrade() {
+        app.set_music_busy(true);
+        app.set_music_message(format!("Connecting to {server_url}...").into());
+    }
+
+    let app_weak = app_weak.clone();
+    let music_state = music_state.clone();
+    let live_client = live_client.clone();
+    let rt_for_browse = rt_handle.clone();
+    rt_handle.spawn(async move {
+        // The password is used here and then dropped: only the derived
+        // salt/token pair is ever persisted. See music.rs.
+        let credentials = music::Credentials::new(&server_url, &username, &password);
+        let result = music::Client::new(credentials.clone()).ping().await;
+
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_music_busy(false);
+            match result {
+                Ok(()) => {
+                    if let Err(err) = music::save_credentials(&credentials) {
+                        tracing::error!(%err, "could not save music settings");
+                        app.set_music_message(
+                            format!("Connected, but could not save the settings: {err}").into(),
+                        );
+                        return;
+                    }
+                    tracing::info!(server = %credentials.server_url, "music server configured");
+                    {
+                        let mut state = music_state.lock().unwrap();
+                        state.credentials = Some(credentials);
+                        apply_music_chrome(&app, &state);
+                    }
+                    app.set_music_message("".into());
+                    music_show(
+                        &rt_for_browse,
+                        &app.as_weak(),
+                        &music_state,
+                        &live_client,
+                        vec![MusicLevel::Albums],
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "music server rejected the credentials");
+                    app.set_music_message(format!("{err}").into());
+                }
+            }
+        });
+    });
+}
+
+/// Sends a `media_player` transport service to the configured speaker.
+fn music_transport(
+    rt_handle: &tokio::runtime::Handle,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    service: &'static str,
+) {
+    let Some(player) = music_state.lock().unwrap().player_entity_id() else {
+        return;
+    };
+    let live_client = live_client.clone();
+    rt_handle.spawn(async move {
+        let ha = live_client.lock().unwrap().clone();
+        let Some(ha) = ha else { return };
+        if let Err(err) = ha
+            .call_service("media_player", service, &[player], serde_json::json!({}))
+            .await
+        {
+            tracing::warn!(%err, service, "media_player transport call failed");
+        }
+    });
+}
+
 /// Which level of the timezone drill-down is on screen.
 ///
 /// Rust owns this rather than the markup so the grouping logic stays in
@@ -2077,6 +2857,10 @@ fn run_wifi_scan(
 /// Joins a network, reporting precisely why if it doesn't work.
 ///
 /// The password is never logged, here or in `wifi.rs`.
+// Same reasoning as `wifi::configure_and_select`: these are genuinely
+// independent inputs, and bundling them into a struct used once would obscure
+// more than it saved.
+#[allow(clippy::too_many_arguments)]
 fn run_wifi_connect(
     rt_handle: &tokio::runtime::Handle,
     app_weak: &slint::Weak<AppWindow>,
@@ -2378,6 +3162,12 @@ enum KeyboardTarget {
     /// Joining a secured network. Carries what the password is *for*, since
     /// the scan list can be rescanned (and reordered) while the keyboard is up.
     WifiPassword { ssid: String, security: wifi::Security },
+    /// The three steps of music-server setup. Each carries what the previous
+    /// steps collected, so the flow needs no separate state machine.
+    MusicServerUrl,
+    MusicUsername { server_url: String },
+    MusicPassword { server_url: String, username: String },
+    MusicSearch,
 }
 
 /// Drives the parental PIN pad's multi-step flows -- see `pin_flow` in
@@ -4247,6 +5037,193 @@ mod tests {
         // than becoming a second, indistinguishable "Eastern" choice.
         assert_eq!(labels, vec!["Central - Chicago", "Eastern - New York"]);
         assert_eq!(payloads, vec!["America/Chicago", "America/New_York"]);
+    }
+
+    fn album(id: &str, name: &str, artist: Option<&str>, year: Option<u32>) -> music::Album {
+        music::Album {
+            id: id.into(),
+            name: name.into(),
+            artist: artist.map(Into::into),
+            year,
+            song_count: 0,
+            cover_art: None,
+        }
+    }
+
+    fn track(id: &str, title: &str, artist: Option<&str>, duration: Option<u32>) -> music::Track {
+        music::Track {
+            id: id.into(),
+            title: title.into(),
+            artist: artist.map(Into::into),
+            album: None,
+            duration,
+            track: None,
+            cover_art: None,
+        }
+    }
+
+    #[test]
+    fn album_rows_read_as_name_then_artist_and_year() {
+        let (rows, actions) = album_rows(&[
+            album("al-1", "Kind of Blue", Some("Miles Davis"), Some(1959)),
+            album("al-2", "Untitled", None, None),
+        ]);
+        assert_eq!(rows[0].title, "Kind of Blue");
+        assert_eq!(rows[0].subtitle, "Miles Davis - 1959");
+        assert_eq!(rows[1].subtitle, "", "nothing to say is better than 'None'");
+        assert!(!rows[0].playable, "an album drills in; it isn't a track");
+        assert_eq!(
+            actions[0],
+            MusicRowAction::Open(MusicLevel::Album {
+                id: "al-1".into(),
+                name: "Kind of Blue".into()
+            })
+        );
+    }
+
+    /// Tapping a track plays from there to the end rather than playing one
+    /// song and stopping, so each row carries its index.
+    #[test]
+    fn track_rows_are_playable_and_carry_their_position() {
+        let (rows, actions) = track_rows(&[
+            track("tr-1", "So What", Some("Miles Davis"), Some(545)),
+            track("tr-2", "Blue in Green", Some("Miles Davis"), None),
+        ]);
+        assert!(rows[0].playable);
+        assert_eq!(rows[0].trailing, "9:05");
+        assert_eq!(rows[1].trailing, "", "no duration is blank, not '0:00'");
+        assert_eq!(actions[1], MusicRowAction::PlayTrack(1));
+    }
+
+    #[test]
+    fn artist_and_playlist_counts_are_pluralised() {
+        let (rows, _) = artist_rows(&[
+            music::Artist { id: "ar-1".into(), name: "Mogwai".into(), album_count: 1 },
+            music::Artist { id: "ar-2".into(), name: "Portishead".into(), album_count: 3 },
+            music::Artist { id: "ar-3".into(), name: "Nobody".into(), album_count: 0 },
+        ]);
+        assert_eq!(rows[0].trailing, "1 album");
+        assert_eq!(rows[1].trailing, "3 albums");
+        assert_eq!(rows[2].trailing, "", "zero reads better as nothing");
+
+        let (rows, _) = playlist_rows(&[music::Playlist {
+            id: "pl-1".into(),
+            name: "Dinner".into(),
+            song_count: 1,
+        }]);
+        assert_eq!(rows[0].trailing, "1 track");
+    }
+
+    /// Search mixes three kinds; the playable rows must end up last so they
+    /// group together, and the actions must stay index-aligned with the rows.
+    #[test]
+    fn search_rows_put_playable_tracks_last_and_stay_aligned() {
+        let results = music::SearchResults {
+            artists: vec![music::Artist {
+                id: "ar-1".into(),
+                name: "Portishead".into(),
+                album_count: 3,
+            }],
+            albums: vec![album("al-9", "Dummy", Some("Portishead"), None)],
+            tracks: vec![track("tr-9", "Roads", Some("Portishead"), Some(302))],
+        };
+        let (rows, actions) = search_rows(&results);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(actions.len(), rows.len(), "a tap looks its action up by index");
+        assert!(!rows[0].playable && !rows[1].playable);
+        assert!(rows[2].playable);
+        assert_eq!(actions[2], MusicRowAction::PlayTrack(0));
+    }
+
+    /// Every media_player is offered rather than guessing which accept a URL:
+    /// that varies by integration, and hiding the right speaker is worse than
+    /// listing one that turns out not to work.
+    #[test]
+    fn every_media_player_is_offered_sorted_by_friendly_name() {
+        let states = vec![
+            EntityState {
+                entity_id: "media_player.lounge".into(),
+                state: "idle".into(),
+                attributes: serde_json::json!({ "friendly_name": "Lounge" }),
+                last_updated: None,
+            },
+            EntityState {
+                entity_id: "light.kitchen".into(),
+                state: "on".into(),
+                attributes: serde_json::json!({}),
+                last_updated: None,
+            },
+            EntityState {
+                entity_id: "media_player.attic".into(),
+                state: "off".into(),
+                attributes: serde_json::json!({}),
+                last_updated: None,
+            },
+        ];
+        let (rows, actions) = player_rows(&states);
+        assert_eq!(rows.len(), 2, "lights are not speakers");
+        // Falls back to the entity id when there's no friendly name, and that
+        // sorts before "Lounge".
+        assert_eq!(rows[0].title, "Lounge");
+        assert_eq!(rows[1].title, "media_player.attic");
+        assert_eq!(
+            actions[0],
+            MusicRowAction::SelectPlayer {
+                entity_id: "media_player.lounge".into(),
+                name: "Lounge".into()
+            }
+        );
+    }
+
+    #[test]
+    fn now_playing_comes_off_the_media_player_state() {
+        let state = EntityState {
+            entity_id: "media_player.lounge".into(),
+            state: "playing".into(),
+            attributes: serde_json::json!({
+                "media_title": "Roads", "media_artist": "Portishead"
+            }),
+            last_updated: None,
+        };
+        assert_eq!(now_playing_from(&state), ("Roads".into(), "Portishead".into(), true));
+
+        let paused = EntityState { state: "paused".into(), ..state.clone() };
+        assert!(!now_playing_from(&paused).2);
+
+        let idle = EntityState {
+            entity_id: "media_player.lounge".into(),
+            state: "idle".into(),
+            attributes: serde_json::json!({}),
+            last_updated: None,
+        };
+        assert_eq!(now_playing_from(&idle), (String::new(), String::new(), false));
+    }
+
+    /// A bare host is far likelier to be typed on a touchscreen than a full
+    /// URL, and silently failing for a missing scheme would be miserable.
+    #[test]
+    fn a_typed_server_address_gets_a_scheme_if_it_needs_one() {
+        assert_eq!(normalise_music_server_url("192.168.0.5:4533"), "http://192.168.0.5:4533");
+        assert_eq!(normalise_music_server_url("  music.local  "), "http://music.local");
+        assert_eq!(
+            normalise_music_server_url("https://music.example.com/"),
+            "https://music.example.com"
+        );
+        assert_eq!(normalise_music_server_url("http://x:4533"), "http://x:4533");
+    }
+
+    #[test]
+    fn levels_name_themselves_and_light_the_right_section() {
+        assert_eq!(MusicLevel::Albums.heading(), "Albums");
+        assert_eq!(
+            MusicLevel::Album { id: "a".into(), name: "Dummy".into() }.heading(),
+            "Dummy"
+        );
+        assert_eq!(MusicLevel::Search { query: "roads".into() }.heading(), "Results for \"roads\"");
+        // An album drilled into from the album list keeps Albums highlighted.
+        assert_eq!(MusicLevel::Album { id: "a".into(), name: "b".into() }.section_index(), 0);
+        assert_eq!(MusicLevel::Artist { id: "a".into(), name: "b".into() }.section_index(), 1);
+        assert_eq!(MusicLevel::ChoosePlayer.section_index(), -1, "not a browse section");
     }
 
     fn weather_state(state: &str, attributes: serde_json::Value) -> EntityState {

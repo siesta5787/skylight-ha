@@ -7,6 +7,7 @@ export enum Page {
     Calendar,
     Tasks,
     Photos,
+    Music,
     Settings,
 }
 
@@ -84,6 +85,43 @@ component TasksIcon inherits Rectangle {
         stroke: icon-color;
         stroke-width: 2.4px;
         commands: "M4 13 L9.5 18.5 L20 6";
+    }
+}
+
+// A quaver: note head plus stem. Straight lines and a rounded rectangle only,
+// for the same reason as the other icons here -- no icon font or asset
+// pipeline exists, and curves are hard to get right without a live preview.
+component MusicIcon inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    // Note head.
+    Rectangle {
+        x: 2px;
+        y: 12px;
+        width: 7px;
+        height: 6px;
+        border-radius: 3px;
+        background: icon-color;
+    }
+
+    // Stem.
+    Rectangle {
+        x: 7.6px;
+        y: 2px;
+        width: 1.8px;
+        height: 13px;
+        background: icon-color;
+    }
+
+    // Flag.
+    Rectangle {
+        x: 9.4px;
+        y: 2px;
+        width: 6px;
+        height: 1.8px;
+        background: icon-color;
     }
 }
 
@@ -209,6 +247,7 @@ export component Sidebar inherits Rectangle {
     property <color> calendar-color: root.active-page == Page.Calendar ? Theme.accent : Theme.text-muted;
     property <color> tasks-color: root.active-page == Page.Tasks ? Theme.accent : Theme.text-muted;
     property <color> photos-color: root.active-page == Page.Photos ? Theme.accent : Theme.text-muted;
+    property <color> music-color: root.active-page == Page.Music ? Theme.accent : Theme.text-muted;
     property <color> settings-color: root.active-page == Page.Settings ? Theme.accent : Theme.text-muted;
 
     VerticalLayout {
@@ -240,8 +279,15 @@ export component Sidebar inherits Rectangle {
             PhotosIcon { icon-color: root.photos-color; }
         }
 
+        NavItem {
+            label: "Music";
+            active: root.active-page == Page.Music;
+            tapped => { root.page-selected(Page.Music); }
+            MusicIcon { icon-color: root.music-color; }
+        }
+
         // Pushes Settings to the bottom of the rail rather than packing
-        // directly under Photos.
+        // directly under Music.
         Rectangle { vertical-stretch: 1; }
 
         NavItem {

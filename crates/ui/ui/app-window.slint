@@ -16,6 +16,7 @@ import { SettingsPage } from "settings-view.slint";
 import { UpdateOverlay } from "update-overlay.slint";
 import { TimezonePicker } from "timezone-picker.slint";
 import { WifiView, WifiNetworkData } from "wifi-view.slint";
+import { MusicPage, MusicRowData } from "music-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -24,7 +25,7 @@ import "../assets/fonts/Inter-Regular.ttf";
 export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
     AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, DashboardRowData,
-    ToggleEntityData, SensorRowData, Page, WifiNetworkData,
+    ToggleEntityData, SensorRowData, Page, WifiNetworkData, MusicRowData,
 }
 
 component NavArrow inherits Rectangle {
@@ -190,6 +191,32 @@ export component AppWindow inherits Window {
     in property <bool> update-overlay-open: false;
     in property <string> update-overlay-title: "Updating...";
     in property <string> update-overlay-detail: "";
+
+    // Music (Navidrome via Subsonic, played on an HA media_player). Rust owns
+    // which level of the browse hierarchy is showing and supplies labelled
+    // rows, so the navigation rules stay testable rather than living in markup.
+    in property <bool> music-configured: false;
+    in property <string> music-message: "";
+    in property <bool> music-busy: false;
+    in property <bool> music-player-configured: false;
+    in property <string> music-player-name: "";
+    in property <string> music-now-playing-title: "";
+    in property <string> music-now-playing-artist: "";
+    in property <bool> music-now-playing-active: false;
+    in property <[string]> music-sections: [];
+    in property <int> music-selected-section: 0;
+    in property <string> music-heading: "";
+    in property <bool> music-can-go-back: false;
+    in property <[MusicRowData]> music-rows: [];
+    callback music-setup-requested();
+    callback music-forget-requested();
+    callback music-section-selected(int);
+    callback music-row-selected(int);
+    callback music-back();
+    callback music-choose-player();
+    callback music-play-pause();
+    callback music-next-track();
+    callback music-previous-track();
 
     // Wi-Fi. Scanning and connecting are blocking control-socket calls run off
     // the UI thread; everything here is the result they publish back.
@@ -495,6 +522,32 @@ export component AppWindow inherits Window {
                     group-toggled(ids, on) => { root.dashboard-group-toggled(ids, on); }
                     climate-mode-selected(id, mode) => { root.dashboard-climate-mode-selected(id, mode); }
                     climate-temp-delta(id, delta) => { root.dashboard-climate-temp-delta(id, delta); }
+                }
+
+                if root.current-page == Page.Music: MusicPage {
+                    vertical-stretch: 1;
+                    configured: root.music-configured;
+                    message: root.music-message;
+                    busy: root.music-busy;
+                    player-configured: root.music-player-configured;
+                    player-name: root.music-player-name;
+                    now-playing-title: root.music-now-playing-title;
+                    now-playing-artist: root.music-now-playing-artist;
+                    now-playing-active: root.music-now-playing-active;
+                    sections: root.music-sections;
+                    selected-section: root.music-selected-section;
+                    heading: root.music-heading;
+                    can-go-back: root.music-can-go-back;
+                    rows: root.music-rows;
+                    setup-requested => { root.music-setup-requested(); }
+                    forget-requested => { root.music-forget-requested(); }
+                    section-selected(i) => { root.music-section-selected(i); }
+                    row-selected(i) => { root.music-row-selected(i); }
+                    back => { root.music-back(); }
+                    choose-player => { root.music-choose-player(); }
+                    play-pause => { root.music-play-pause(); }
+                    next-track => { root.music-next-track(); }
+                    previous-track => { root.music-previous-track(); }
                 }
 
                 if root.current-page == Page.Photos: PlaceholderView {
