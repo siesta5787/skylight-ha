@@ -125,7 +125,9 @@ if [ "$SKIP_BUILD" = false ]; then
                     exit 1
                 fi
                 echo "rustup install attempt $i timed out or failed, retrying in 15s..." >&2
-                rm -rf "$HOME/.rustup" "$HOME/.cargo"
+                # NOT $HOME/.cargo wholesale: /root/.cargo/registry is a bind
+                # mount, and rm failing on it would abort the build under set -e.
+                rm -rf "$HOME/.rustup" "$HOME/.cargo/bin" "$HOME/.cargo/env" || true
                 sleep 15
             done
             . "$HOME/.cargo/env"
