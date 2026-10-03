@@ -112,11 +112,19 @@ export component WifiView inherits Rectangle {
     width: 100%;
     height: 100%;
     background: #14161fcc;
-    z: 2500;
+    // Below VirtualKeyboard (2000) on purpose: this panel can ask for text, and
+    // at 2500 it covered the keyboard it had just opened -- you could see the
+    // keys but not reach them. Order is EventDetail 1000 < page overlays 1500 <
+    // VirtualKeyboard 2000 < PinPad 3000 < UpdateOverlay 4000.
+    z: 1500;
 
+    // Tapping outside the panel closes it. The ✕ in the corner is easy to miss
+    // on a wall-mounted screen, and being unable to back out of a full-screen
+    // overlay means a reboot.
     TouchArea {
         width: 100%;
         height: 100%;
+        clicked => { root.closed(); }
     }
 
     Rectangle {
@@ -209,29 +217,59 @@ export component WifiView inherits Rectangle {
                 }
             }
 
-            Rectangle {
+            HorizontalLayout {
+                spacing: 10px;
                 height: 44px;
-                border-radius: Theme.radius;
-                border-width: 1px;
-                border-color: Theme.border;
-                background: rescan-touch.pressed ? Theme.surface-alt : transparent;
-                opacity: root.busy ? 0.5 : 1.0;
 
-                rescan-touch := TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => {
-                        if (!root.busy) { root.rescan(); }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: rescan-touch.pressed ? Theme.surface-alt : transparent;
+                    opacity: root.busy ? 0.5 : 1.0;
+
+                    rescan-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (!root.busy) { root.rescan(); }
+                        }
+                    }
+
+                    Text {
+                        text: root.busy ? "Scanning..." : "Scan again";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
                     }
                 }
 
-                Text {
-                    text: root.busy ? "Scanning..." : "Scan again";
-                    font-size: 14px;
-                    font-weight: 600;
-                    color: Theme.text-primary;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                // Spelled out next to Scan again, not just the ✕ in the corner:
+                // a full-screen overlay with no obvious exit is a reboot.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: done-touch.pressed ? Theme.surface-alt : transparent;
+
+                    done-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.closed(); }
+                    }
+
+                    Text {
+                        text: "Close";
+                        font-size: 14px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }

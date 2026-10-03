@@ -258,6 +258,53 @@ pub fn security_from_flags(flags: &str) -> Security {
     }
 }
 
+/// Turns wpa_supplicant's escaped SSID into something displayable, or `None`
+/// if there is nothing a user could meaningfully pick.
+///
+/// wpa_supplicant `printf_encode`s the SSID, so any non-printable byte arrives
+/// as `\xNN`. Hidden networks in particular come back as a run of `\x00`
+/// rather than as an empty field -- which is why a plain is-empty check wasn't
+/// enough, and real scans showed rows of literal
+/// `\x00\x00\x00\x00\x00\x00`. Decoding also makes non-ASCII SSIDs
+/// (`\xc3\xa9` -> `é`) render as themselves instead of as mojibake.
+pub fn decode_ssid(raw: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            let mut buffer = [0u8; 4];
+            bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
+            continue;
+        }
+        match chars.next() {
+            Some('x') => {
+                let hi = chars.next()?.to_digit(16)?;
+                let lo = chars.next()?.to_digit(16)?;
+                bytes.push((hi * 16 + lo) as u8);
+            }
+            Some('n') => bytes.push(b'\n'),
+            Some('r') => bytes.push(b'\r'),
+            Some('t') => bytes.push(b'\t'),
+            Some('e') => bytes.push(0x1b),
+            // Covers the escaped backslash and quote, and anything else is
+            // taken literally rather than dropped.
+            Some(other) => {
+                let mut buffer = [0u8; 4];
+                bytes.extend_from_slice(other.encode_utf8(&mut buffer).as_bytes());
+            }
+            None => return None,
+        }
+    }
+
+    // A NUL anywhere means a hidden or otherwise unusable SSID: there is no
+    // name to show and tapping it couldn't do anything useful.
+    if bytes.is_empty() || bytes.contains(&0) {
+        return None;
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    (!decoded.trim().is_empty()).then_some(decoded)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Network {
     pub ssid: String,
@@ -297,10 +344,9 @@ pub fn parse_scan_results(output: &str) -> Vec<Network> {
         if fields.len() < 5 {
             continue;
         }
-        let ssid = fields[4].trim();
-        if ssid.is_empty() {
+        let Some(ssid) = decode_ssid(fields[4]) else {
             continue;
-        }
+        };
         let Ok(signal_dbm) = fields[2].trim().parse::<i32>() else {
             continue;
         };
@@ -313,9 +359,7 @@ pub fn parse_scan_results(output: &str) -> Vec<Network> {
                     existing.security = security;
                 }
             }
-            None => {
-                networks.push(Network { ssid: ssid.to_string(), signal_dbm, security })
-            }
+            None => networks.push(Network { ssid, signal_dbm, security }),
         }
     }
 
@@ -591,6 +635,25 @@ aa:bb:cc:dd:ee:06\t2412\t-66\t[WPA2-PSK-CCMP][ESS]\t
     #[test]
     fn a_mixed_wpa2_wpa3_network_is_treated_as_psk() {
         assert_eq!(security_from_flags("[WPA2-PSK+SAE-CCMP][ESS]"), Security::Psk);
+    }
+
+    /// Seen on a real scan: hidden networks arrive as runs of escaped NULs, not
+    /// as an empty field, and showed up in the list as literal "\x00\x00...".
+    #[test]
+    fn hidden_networks_are_dropped_however_they_are_spelled() {
+        assert_eq!(decode_ssid(""), None);
+        assert_eq!(decode_ssid("\\x00\\x00\\x00\\x00\\x00\\x00"), None);
+        assert_eq!(decode_ssid("   "), None);
+        let scan = "header\naa\t2412\t-50\t[WPA2-PSK-CCMP][ESS]\t\\x00\\x00\\x00\n";
+        assert!(parse_scan_results(scan).is_empty(), "a NUL SSID is not a choice");
+    }
+
+    #[test]
+    fn escaped_ssids_decode_to_what_they_actually_say() {
+        assert_eq!(decode_ssid("HomeNet").as_deref(), Some("HomeNet"));
+        // wpa_supplicant printf-encodes non-ASCII bytes.
+        assert_eq!(decode_ssid("Caf\\xc3\\xa9").as_deref(), Some("Café"));
+        assert_eq!(decode_ssid("My\\\\Net").as_deref(), Some("My\\Net"));
     }
 
     #[test]
