@@ -194,6 +194,15 @@ untouched by local desktop work.
   relink (`[profile.release]` has `lto = true, codegen-units = 1` —
   deliberate, for a smaller/faster binary on the Pi's weak CPU) which has
   to redo its whole-program pass regardless of how small the change was.
+  **These builds are memory-hungry near the end**: the whole-program LTO link
+  is the peak, and on 2026-10-02 the host OOM killer fired during one. It
+  happened to kill the `docker run` *client* rather than `rustc`, which made
+  the log stream stop and the task report exit 137 -- while dockerd kept the
+  container running and the build finished correctly (`target/` is a bind
+  mount, so the output landed anyway). Two lessons: don't trust "the build
+  died" without checking `docker ps` and the container's own process list
+  first, and keep other heavy work off this machine while one is running,
+  because a kill landing on `rustc` instead would have lost the ~80 minutes.
   True cross-compilation (no QEMU at all) would eliminate that tax
   entirely but needs a hand-assembled aarch64-musl sysroot with
   `libinput`/`libudev`/`libxkbcommon` built for that arch — a real
@@ -203,6 +212,14 @@ untouched by local desktop work.
   aarch64 packages "for free").
 
 ## Releasing a new version
+
+**Where things stand (2026-10-02):** the device runs an image carrying the
+console fix, the Wi-Fi control socket and quiet wpa_supplicant logging, on a
+256M rootfs, with app `v0.4.0` installed **over the air**. Four releases have
+shipped (`v0.2.0` manually flashed to bootstrap the updater, then `v0.3.0`
+and `v0.4.0` over the air), and the OTA path -- check, download, verify,
+preflight, swap, restart, commit -- has worked every time. The automatic
+*rollback* path is the one thing still unexercised on hardware.
 
 As of `v0.2.0` (2026-09-29, the first real release), ordinary app changes
 no longer need a manual reflash at all -- see "In-app self-update" under
@@ -452,7 +469,8 @@ skylight-self-update.md`. Confirmed working end-to-end on real hardware
   coexist briefly, roughly 3x the ~20MB binary, which didn't fit in the
   original ~31MB free.
 
-**Wi-Fi management** (`apps/skylight-ha/src/wifi.rs`, 2026-10-01): Settings
+**Wi-Fi management** (`apps/skylight-ha/src/wifi.rs`, 2026-10-01, **confirmed
+working on hardware 2026-10-02**): Settings
 card showing the live connection (SSID, IP, signal) plus a full-screen manager
 to scan and join networks, with the passphrase typed on the existing
 `VirtualKeyboard`. Speaks the **wpa_ctrl protocol directly** over a Unix
@@ -491,11 +509,44 @@ event arriving mid-command can't be mistaken for that command's reply.
   canned replies and pushing events to whichever client sent `ATTACH`. Worth
   knowing if you extend it: a `connect`ed datagram socket only accepts packets
   from its connected peer, so events must come from the daemon's own socket.
+- **Three things the fake could never have caught, all found within a minute
+  of real use** (fixed in 0.4.0 -- see "Overlay z-order" under Known bugs
+  below, which is the generalisable one):
+  - The password keyboard rendered *underneath* the panel that opened it.
+  - There was no reachable way out of the panel, so the device needed a
+    reboot. Full-screen overlays now close on a tap outside, plus an explicit
+    Close button -- a ✕ in the corner is not enough on a wall display.
+  - Hidden networks listed as rows of literal `\x00\x00\x00\x00`.
+    wpa_supplicant `printf_encode`s SSIDs, so hidden ones arrive as *escaped
+    NULs*, not as the empty string an is-empty check would catch.
+    `decode_ssid` now unescapes properly, which also makes non-ASCII SSIDs
+    (`\xc3\xa9` -> `é`) render as themselves.
 
 **Time zone picker** (`apps/skylight-ha/src/timezone.rs`, 2026-10-01): replaces
 the hardcoded `BR2_TARGET_LOCALTIME` with a browsable **continent -> country ->
 zone** drill-down. Built from the full world list rather than a curated US one
 at the user's request, so the project is useful to someone elsewhere.
+- **One row per actual time zone, named for its city** ("Eastern - New
+  York"). tzdata lists ten US "Eastern" zones -- Detroit, two in Kentucky,
+  six in Indiana -- plus seven "Central" and seven "Alaska", differing only
+  in *historical* DST rules, so the US showed 29 rows where it needed six.
+  Each family collapses to its primary zone (the one with no sub-region
+  qualifier; "most areas" breaks ties, which Alaska needs). Accepted
+  trade-off: a decades-old timestamp in Pulaski County, Indiana now resolves
+  against New York's history -- unobservable on a wall clock. Labelling the
+  city also fixed a real confusion: a row reading "Eastern (most areas)"
+  would then announce it was switching to America/New_York, a place the row
+  never mentioned.
+  - A zone *shared* between countries has one canonical name whose city
+    belongs to whichever country tzdata lists first, so only that country
+    gets the city label; the others get tzdata's own description ("EST - ON
+    (Atikokan), NU (Coral H)") rather than Canada being told to pick
+    "Panama".
+  - **Not a bug on our side**: tzdata itself labels `America/Vancouver` as
+    "MST - BC (most areas)" in both 2025 and 2026b, which is wrong (Vancouver
+    is Pacific). Its leading token is sometimes a standard-time abbreviation
+    rather than a zone name. The code reproduces the database faithfully;
+    don't "fix" it by second-guessing tzdata.
 - Driven by **`zone1970.tab` joined against `iso3166.tab`**, not a directory
   walk: `/usr/share/zoneinfo` holds ~1200 files, but `posix/` and `right/` are
   complete duplicate trees and there are many backward-compat aliases
@@ -577,7 +628,25 @@ at the user's request, so the project is useful to someone elsewhere.
   debug scaffolding once the full sidebar/calendar/dashboard redesign gave
   the app plenty of real tappable surface -- confirmed working via touch
   on real hardware multiple times since via `backend-linuxkms` on this dev
-  machine's USB touchscreen; not yet validated on the actual Pi).
+  machine's USB touchscreen, and -- as of the 2026-09/10 deployments --
+  extensively on the actual Pi too, including the Settings, update, Wi-Fi and
+  time zone surfaces).
+- **Overlay z-order: anything that can ask for text must sit BELOW the
+  keyboard** (learned 2026-10-02, the hard way). `WifiView` and
+  `TimezonePicker` shipped at `z: 2500` against `VirtualKeyboard`'s 2000, so
+  tapping a secured network showed a password keyboard you could see but not
+  touch -- and with no reachable way out of the panel either, the only exit
+  was a reboot. The stack, which new overlays should slot into deliberately:
+  `EventDetailView` 1000 < page-level overlays (`WifiView`,
+  `TimezonePicker`) 1500 < `VirtualKeyboard` 2000 < `PinPad` 3000 <
+  `UpdateOverlay` 4000. Two rules fall out of it: a panel that *collects*
+  input outranks the panel that *requested* it, and anything shown
+  immediately before `exit(0)` outranks everything.
+- **A full-screen overlay needs an obvious exit, not just a ✕.** Same
+  incident: on a wall-mounted screen with no keyboard and no window manager,
+  an overlay whose only dismissal is a small corner glyph is a reboot waiting
+  to happen. Close on a tap outside the panel *and* give it a spelled-out
+  button.
 - **`backend-linuxkms-noseat` doesn't cooperate with VT switching** --
   confirmed live: with the app running from a raw VT (Dev loop #2 above),
   Ctrl+Alt+F1 does *nothing* (not frozen -- the app keeps running fine,
@@ -672,7 +741,11 @@ at the user's request, so the project is useful to someone elsewhere.
     refuses to start, which presents exactly like a boot hang). It is only
     valid because the package was rebuilt and verified by artifact — see the
     Process gotcha below, and the comments in the file itself.
-  - `etc/init.d/S39ethernet`, `etc/init.d/S40wifi` — bring up `eth0`/`wlan0`
+  - `etc/init.d/S39ethernet`, `etc/init.d/S40wifi` — (`S40wifi` runs
+    wpa_supplicant with `-q` as of 2026-10-01; it spent the eero-bug
+    investigation on `-dd -t -f /var/log/wpa_supplicant.log`, which is worth
+    restoring for a future WiFi dig but is pure noise otherwise, and `/var/log`
+    is tmpfs so it never survived a reboot anyway) — bring up `eth0`/`wlan0`
     respectively: link up, (wlan0 only) `iw dev wlan0 set power_save off`
     (brcmfmac on this chip drops connections repeatedly without this —
     confirmed root cause, not a hypothesis) + `wpa_supplicant`, then in
