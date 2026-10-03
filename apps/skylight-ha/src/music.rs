@@ -1,0 +1,687 @@
+//! A Subsonic-API client, aimed at Navidrome.
+//!
+//! # What this is and isn't responsible for
+//!
+//! Subsonic is a *library* API: it browses, searches, serves cover art, and
+//! hands out a streamable URL per track. It has no notion of telling another
+//! device to play something -- the client does the playing. Since this app is a
+//! remote control and the Pi deliberately has no audio stack at all (no ALSA,
+//! no decoder, no `/dev/snd`, and no headphone jack on a Zero 2 W), playback is
+//! Home Assistant's job: hand [`Credentials::stream_url`] to
+//! `media_player.play_media` and let a real player deal with it.
+//!
+//! So this module answers "what do I want to hear"; `main.rs` wires the answer
+//! to "where does it come out".
+//!
+//! # Why the password is never stored
+//!
+//! Subsonic authenticates with `t = md5(password + salt)` for a caller-chosen
+//! salt, and a fixed salt/token pair keeps working indefinitely. So setup
+//! generates one random salt, derives the token, and persists only those --
+//! functionally the same as storing the password for this API, but without
+//! writing the user's actual password to disk, which matters when it's reused
+//! elsewhere.
+//!
+//! The stream URL necessarily embeds `u`/`t`/`s`, so that token does travel to
+//! HA and on to the player, in the clear over plain HTTP on the LAN. That's
+//! inherent to Subsonic streaming rather than something this design adds, and
+//! it is a LAN-scoped credential to a music library -- proportionate, in the
+//! same spirit as the parental PIN's plain SHA-256.
+
+use std::io;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use md5::{Digest, Md5};
+use serde::{Deserialize, Serialize};
+
+pub const DEFAULT_CREDENTIALS_PATH: &str = "/etc/skylight/music.secret";
+
+/// What this client reports itself as. Navidrome shows it in its activity log.
+const CLIENT_NAME: &str = "skylight";
+/// The API level we code against. 1.16.1 is what Navidrome implements and is
+/// what `search3`/`getArtists`/`getAlbumList2` require.
+const API_VERSION: &str = "1.16.1";
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("could not reach the music server: {0}")]
+    Unreachable(#[source] reqwest::Error),
+    #[error("the music server rejected the request: {message} (code {code})")]
+    Server { code: i64, message: String },
+    #[error("unexpected reply from the music server: {0}")]
+    Malformed(String),
+    #[error("no music server is configured yet")]
+    NotConfigured,
+    #[error("could not read or write the saved music settings: {0}")]
+    Storage(#[from] io::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Everything needed to talk to the server, and where to play.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Credentials {
+    /// Base URL with no trailing slash, e.g. `http://192.168.0.5:4533`.
+    pub server_url: String,
+    pub username: String,
+    /// Random per-install salt; see the module header for why this and `token`
+    /// are stored instead of the password.
+    pub salt: String,
+    /// `md5(password + salt)`, hex.
+    pub token: String,
+    /// The HA `media_player` entity playback is sent to. `None` until the user
+    /// picks one -- browsing works without it.
+    #[serde(default)]
+    pub player_entity_id: Option<String>,
+}
+
+impl Credentials {
+    /// Derives a fresh salt/token pair from a password typed at setup.
+    pub fn new(server_url: &str, username: &str, password: &str) -> Self {
+        let salt = random_salt();
+        let token = md5_hex(&format!("{password}{salt}"));
+        Self {
+            server_url: server_url.trim().trim_end_matches('/').to_string(),
+            username: username.trim().to_string(),
+            salt,
+            token,
+            player_entity_id: None,
+        }
+    }
+
+    /// The query string every request needs.
+    fn auth_query(&self) -> String {
+        format!(
+            "u={}&t={}&s={}&v={}&c={}&f=json",
+            urlencode(&self.username),
+            self.token,
+            self.salt,
+            API_VERSION,
+            CLIENT_NAME,
+        )
+    }
+
+    pub fn endpoint(&self, method: &str, params: &[(&str, &str)]) -> String {
+        let mut url = format!("{}/rest/{}?{}", self.server_url, method, self.auth_query());
+        for (key, value) in params {
+            url.push('&');
+            url.push_str(key);
+            url.push('=');
+            url.push_str(&urlencode(value));
+        }
+        url
+    }
+
+    /// The URL handed to `media_player.play_media`.
+    ///
+    /// Deliberately a plain authenticated GET: every player that can fetch a
+    /// URL can play this, which is the whole point of pushing playback out to
+    /// Home Assistant.
+    pub fn stream_url(&self, track_id: &str) -> String {
+        self.endpoint("stream", &[("id", track_id)])
+    }
+
+    pub fn cover_art_url(&self, cover_art_id: &str, size: u32) -> String {
+        self.endpoint("getCoverArt", &[("id", cover_art_id), ("size", &size.to_string())])
+    }
+}
+
+fn md5_hex(input: &str) -> String {
+    let digest = Md5::digest(input.as_bytes());
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A salt only has to be unguessable-per-install, not cryptographically
+/// precious -- it exists so the stored token isn't a bare password hash. Built
+/// from the system clock plus the process id rather than pulling in an RNG
+/// crate for one 16-character string.
+fn random_salt() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    md5_hex(&format!("{nanos}-{}", std::process::id()))[..16].to_string()
+}
+
+/// Percent-encodes the characters that would otherwise break a query string.
+///
+/// Deliberately minimal rather than a dependency: usernames and search terms
+/// are the only user-controlled values that reach here.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push_str("%20"),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Where the credentials file lives. Overridable so the whole feature can be
+/// exercised against a scratch path on the dev machine.
+pub fn credentials_path() -> PathBuf {
+    std::env::var("SKYLIGHT_MUSIC_CREDENTIALS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CREDENTIALS_PATH))
+}
+
+pub fn load_credentials() -> Option<Credentials> {
+    let path = credentials_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str(&raw) {
+        Ok(credentials) => Some(credentials),
+        Err(err) => {
+            tracing::warn!(%err, path = %path.display(), "music settings file is unreadable; ignoring it");
+            None
+        }
+    }
+}
+
+/// Writes credentials, replacing any previous ones.
+///
+/// Temp-then-rename so a crash mid-write can't leave a half-file that would
+/// then be silently ignored on next boot.
+pub fn save_credentials(credentials: &Credentials) -> io::Result<()> {
+    let path = credentials_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staging = path.with_extension("new");
+    let body = serde_json::to_string_pretty(credentials)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    std::fs::write(&staging, body)?;
+    std::fs::rename(&staging, &path)
+}
+
+pub fn forget_credentials() -> io::Result<()> {
+    match std::fs::remove_file(credentials_path()) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+// --- Library model -------------------------------------------------------
+//
+// Only the fields the UI actually shows. Subsonic returns a great deal more,
+// and `serde` ignores the rest.
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Artist {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "albumCount")]
+    pub album_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Album {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub year: Option<u32>,
+    #[serde(default, rename = "songCount")]
+    pub song_count: u32,
+    #[serde(default, rename = "coverArt")]
+    pub cover_art: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Track {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub album: Option<String>,
+    /// Seconds. Absent on some servers for some formats.
+    #[serde(default)]
+    pub duration: Option<u32>,
+    #[serde(default)]
+    pub track: Option<u32>,
+    #[serde(default, rename = "coverArt")]
+    pub cover_art: Option<String>,
+}
+
+impl Track {
+    /// `3:07`, or empty when the server didn't say.
+    pub fn duration_label(&self) -> String {
+        match self.duration {
+            Some(seconds) => format!("{}:{:02}", seconds / 60, seconds % 60),
+            None => String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Playlist {
+    pub id: String,
+    pub name: String,
+    #[serde(default, rename = "songCount")]
+    pub song_count: u32,
+}
+
+/// Which list the Albums view is showing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlbumSort {
+    Newest,
+    Recent,
+    Frequent,
+    Random,
+    Alphabetical,
+}
+
+impl AlbumSort {
+    /// Subsonic's `getAlbumList2` type parameter.
+    pub fn as_type(self) -> &'static str {
+        match self {
+            AlbumSort::Newest => "newest",
+            AlbumSort::Recent => "recent",
+            AlbumSort::Frequent => "frequent",
+            AlbumSort::Random => "random",
+            AlbumSort::Alphabetical => "alphabeticalByName",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AlbumSort::Newest => "Recently added",
+            AlbumSort::Recent => "Recently played",
+            AlbumSort::Frequent => "Most played",
+            AlbumSort::Random => "Random",
+            AlbumSort::Alphabetical => "A-Z",
+        }
+    }
+}
+
+// --- Response envelope ---------------------------------------------------
+
+/// Pulls the `subsonic-response` object out, turning a server-reported failure
+/// into an [`Error::Server`] carrying the server's own wording -- which is far
+/// more useful at setup time than "login failed" ("Wrong username or
+/// password", "Incompatible Subsonic REST protocol version").
+pub fn unwrap_response(body: &str) -> Result<serde_json::Value> {
+    let parsed: serde_json::Value = serde_json::from_str(body)
+        .map_err(|err| Error::Malformed(format!("not JSON: {err}")))?;
+    let response = parsed
+        .get("subsonic-response")
+        .ok_or_else(|| Error::Malformed("no subsonic-response object".into()))?;
+
+    if response.get("status").and_then(|s| s.as_str()) == Some("failed") {
+        let error = response.get("error");
+        return Err(Error::Server {
+            code: error.and_then(|e| e.get("code")).and_then(|c| c.as_i64()).unwrap_or(0),
+            message: error
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("unknown error")
+                .to_string(),
+        });
+    }
+    Ok(response.clone())
+}
+
+/// Reads a list out of a response, tolerating the two shapes Subsonic uses.
+///
+/// Servers omit the inner array entirely when a collection is empty (rather
+/// than sending `[]`), so a missing key is an empty list, not an error. Getting
+/// this wrong would turn "no results" into a parse failure.
+fn list_at<T: for<'de> Deserialize<'de>>(
+    response: &serde_json::Value,
+    outer: &str,
+    inner: &str,
+) -> Result<Vec<T>> {
+    let Some(container) = response.get(outer) else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = container.get(inner) else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(items.clone())
+        .map_err(|err| Error::Malformed(format!("could not read {outer}.{inner}: {err}")))
+}
+
+pub fn parse_albums(response: &serde_json::Value) -> Result<Vec<Album>> {
+    list_at(response, "albumList2", "album")
+}
+
+pub fn parse_album_tracks(response: &serde_json::Value) -> Result<Vec<Track>> {
+    list_at(response, "album", "song")
+}
+
+pub fn parse_playlists(response: &serde_json::Value) -> Result<Vec<Playlist>> {
+    list_at(response, "playlists", "playlist")
+}
+
+pub fn parse_playlist_tracks(response: &serde_json::Value) -> Result<Vec<Track>> {
+    list_at(response, "playlist", "entry")
+}
+
+pub fn parse_artist_albums(response: &serde_json::Value) -> Result<Vec<Album>> {
+    list_at(response, "artist", "album")
+}
+
+/// `getArtists` nests artists under index buckets (`A`, `B`, ...), so this
+/// flattens them rather than exposing the alphabet to the UI.
+pub fn parse_artists(response: &serde_json::Value) -> Result<Vec<Artist>> {
+    let Some(index) = response.get("artists").and_then(|a| a.get("index")) else {
+        return Ok(Vec::new());
+    };
+    let Some(buckets) = index.as_array() else {
+        return Ok(Vec::new());
+    };
+    let mut artists = Vec::new();
+    for bucket in buckets {
+        if let Some(items) = bucket.get("artist") {
+            let parsed: Vec<Artist> = serde_json::from_value(items.clone())
+                .map_err(|err| Error::Malformed(format!("could not read artists: {err}")))?;
+            artists.extend(parsed);
+        }
+    }
+    Ok(artists)
+}
+
+/// `search3` returns whichever of the three kinds matched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchResults {
+    pub artists: Vec<Artist>,
+    pub albums: Vec<Album>,
+    pub tracks: Vec<Track>,
+}
+
+impl SearchResults {
+    pub fn is_empty(&self) -> bool {
+        self.artists.is_empty() && self.albums.is_empty() && self.tracks.is_empty()
+    }
+}
+
+pub fn parse_search(response: &serde_json::Value) -> Result<SearchResults> {
+    Ok(SearchResults {
+        artists: list_at(response, "searchResult3", "artist")?,
+        albums: list_at(response, "searchResult3", "album")?,
+        tracks: list_at(response, "searchResult3", "song")?,
+    })
+}
+
+// --- The client ----------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Client {
+    http: reqwest::Client,
+    credentials: Credentials,
+}
+
+impl Client {
+    pub fn new(credentials: Credentials) -> Self {
+        let http = reqwest::Client::builder()
+            // Bounded for the same reason every other network call in this app
+            // is: a wall display must never wedge on a server that stopped
+            // answering. See the connection-resilience notes in CLAUDE.md.
+            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()
+            .unwrap_or_default();
+        Self { http, credentials }
+    }
+
+    pub fn credentials(&self) -> &Credentials {
+        &self.credentials
+    }
+
+    async fn get(&self, method: &str, params: &[(&str, &str)]) -> Result<serde_json::Value> {
+        let url = self.credentials.endpoint(method, params);
+        let body = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(Error::Unreachable)?
+            .text()
+            .await
+            .map_err(Error::Unreachable)?;
+        unwrap_response(&body)
+    }
+
+    /// Validates credentials. Run at setup so a typo surfaces immediately,
+    /// with the server's own message, instead of on every later request.
+    pub async fn ping(&self) -> Result<()> {
+        self.get("ping", &[]).await.map(|_| ())
+    }
+
+    pub async fn albums(&self, sort: AlbumSort, size: u32) -> Result<Vec<Album>> {
+        let response = self
+            .get("getAlbumList2", &[("type", sort.as_type()), ("size", &size.to_string())])
+            .await?;
+        parse_albums(&response)
+    }
+
+    pub async fn album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
+        let response = self.get("getAlbum", &[("id", album_id)]).await?;
+        parse_album_tracks(&response)
+    }
+
+    pub async fn artists(&self) -> Result<Vec<Artist>> {
+        let response = self.get("getArtists", &[]).await?;
+        parse_artists(&response)
+    }
+
+    pub async fn artist_albums(&self, artist_id: &str) -> Result<Vec<Album>> {
+        let response = self.get("getArtist", &[("id", artist_id)]).await?;
+        parse_artist_albums(&response)
+    }
+
+    pub async fn playlists(&self) -> Result<Vec<Playlist>> {
+        let response = self.get("getPlaylists", &[]).await?;
+        parse_playlists(&response)
+    }
+
+    pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
+        let response = self.get("getPlaylist", &[("id", playlist_id)]).await?;
+        parse_playlist_tracks(&response)
+    }
+
+    pub async fn search(&self, query: &str) -> Result<SearchResults> {
+        let response = self
+            .get(
+                "search3",
+                &[
+                    ("query", query),
+                    ("artistCount", "20"),
+                    ("albumCount", "20"),
+                    ("songCount", "50"),
+                ],
+            )
+            .await?;
+        parse_search(&response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn credentials() -> Credentials {
+        Credentials {
+            server_url: "http://music.local:4533".into(),
+            username: "me".into(),
+            salt: "abcdef0123456789".into(),
+            token: "0123456789abcdef0123456789abcdef".into(),
+            player_entity_id: None,
+        }
+    }
+
+    /// Interop, not taste: Subsonic specifies this digest, so getting it wrong
+    /// means every request is rejected.
+    ///
+    /// Both expectations were computed independently (`md5sum` and Python's
+    /// hashlib) rather than by running this code and pasting what it produced
+    /// -- a self-blessed "known answer" would pass no matter how wrong the
+    /// implementation was.
+    #[test]
+    fn the_auth_token_is_md5_of_password_then_salt() {
+        assert_eq!(md5_hex("sesameabc"), "ab3c35d2e29e863dbdd0df5bf3ec081f");
+        // The shape the API actually uses: md5(password + salt).
+        assert_eq!(md5_hex("hunter2c19b2d"), "1b41ecef65ff7799cf7a84cf2d505e08");
+        let credentials = Credentials {
+            salt: "c19b2d".into(),
+            ..Credentials::new("http://x", "me", "hunter2")
+        };
+        assert_eq!(
+            md5_hex(&format!("hunter2{}", credentials.salt)),
+            "1b41ecef65ff7799cf7a84cf2d505e08"
+        );
+    }
+
+    #[test]
+    fn setup_derives_a_token_and_never_keeps_the_password() {
+        let created = Credentials::new("http://music.local:4533/", "me", "hunter2");
+        assert_eq!(created.server_url, "http://music.local:4533", "trailing slash trimmed");
+        assert_eq!(created.token, md5_hex(&format!("hunter2{}", created.salt)));
+        let stored = serde_json::to_string(&created).unwrap();
+        assert!(!stored.contains("hunter2"), "the password must not reach disk: {stored}");
+    }
+
+    #[test]
+    fn two_installs_do_not_share_a_salt() {
+        let a = Credentials::new("http://x", "me", "pw");
+        std::thread::sleep(Duration::from_millis(2));
+        let b = Credentials::new("http://x", "me", "pw");
+        assert_ne!(a.salt, b.salt);
+    }
+
+    #[test]
+    fn urls_carry_auth_and_escape_their_parameters() {
+        let url = credentials().endpoint("search3", &[("query", "the beatles & co")]);
+        assert!(url.starts_with("http://music.local:4533/rest/search3?"));
+        assert!(url.contains("u=me") && url.contains("s=abcdef0123456789") && url.contains("f=json"));
+        assert!(url.contains("query=the%20beatles%20%26%20co"), "got {url}");
+    }
+
+    #[test]
+    fn a_stream_url_is_a_plain_authenticated_get_any_player_can_fetch() {
+        let url = credentials().stream_url("tr-1");
+        assert!(url.contains("/rest/stream?"));
+        assert!(url.contains("id=tr-1"));
+        assert!(url.contains("u=me"));
+    }
+
+    /// The server's own wording is far more useful than "login failed".
+    #[test]
+    fn a_failed_response_surfaces_the_servers_message() {
+        let body = r#"{"subsonic-response":{"status":"failed","version":"1.16.1",
+            "error":{"code":40,"message":"Wrong username or password"}}}"#;
+        match unwrap_response(body) {
+            Err(Error::Server { code, message }) => {
+                assert_eq!(code, 40);
+                assert_eq!(message, "Wrong username or password");
+            }
+            other => panic!("expected a server error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_non_json_reply_is_reported_rather_than_panicking() {
+        assert!(matches!(unwrap_response("<html>nope</html>"), Err(Error::Malformed(_))));
+        assert!(matches!(unwrap_response("{}"), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn albums_and_their_tracks_parse() {
+        let body = r#"{"subsonic-response":{"status":"ok","albumList2":{"album":[
+            {"id":"al-1","name":"Kind of Blue","artist":"Miles Davis","year":1959,
+             "songCount":5,"coverArt":"al-1"}]}}}"#;
+        let albums = parse_albums(&unwrap_response(body).unwrap()).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].name, "Kind of Blue");
+        assert_eq!(albums[0].artist.as_deref(), Some("Miles Davis"));
+
+        let body = r#"{"subsonic-response":{"status":"ok","album":{"id":"al-1","song":[
+            {"id":"tr-1","title":"So What","artist":"Miles Davis","duration":545,"track":1}]}}}"#;
+        let tracks = parse_album_tracks(&unwrap_response(body).unwrap()).unwrap();
+        assert_eq!(tracks[0].title, "So What");
+        assert_eq!(tracks[0].duration_label(), "9:05");
+    }
+
+    /// Subsonic buckets artists under index letters; the UI wants a flat list.
+    #[test]
+    fn artists_are_flattened_out_of_their_alphabet_buckets() {
+        let body = r#"{"subsonic-response":{"status":"ok","artists":{"index":[
+            {"name":"A","artist":[{"id":"ar-1","name":"Aphex Twin","albumCount":9}]},
+            {"name":"M","artist":[{"id":"ar-2","name":"Miles Davis","albumCount":40},
+                                  {"id":"ar-3","name":"Mogwai","albumCount":11}]}]}}}"#;
+        let artists = parse_artists(&unwrap_response(body).unwrap()).unwrap();
+        let names: Vec<&str> = artists.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["Aphex Twin", "Miles Davis", "Mogwai"]);
+    }
+
+    /// Subsonic omits the array entirely when a collection is empty rather than
+    /// sending `[]`, so "no results" must not look like a parse failure.
+    #[test]
+    fn an_empty_collection_is_an_empty_list_not_an_error() {
+        let ok = unwrap_response(r#"{"subsonic-response":{"status":"ok"}}"#).unwrap();
+        assert!(parse_albums(&ok).unwrap().is_empty());
+        assert!(parse_artists(&ok).unwrap().is_empty());
+        assert!(parse_playlists(&ok).unwrap().is_empty());
+        assert!(parse_search(&ok).unwrap().is_empty());
+
+        let empty_search = unwrap_response(
+            r#"{"subsonic-response":{"status":"ok","searchResult3":{}}}"#,
+        )
+        .unwrap();
+        assert!(parse_search(&empty_search).unwrap().is_empty());
+    }
+
+    #[test]
+    fn search_splits_its_three_kinds_of_hit() {
+        let body = r#"{"subsonic-response":{"status":"ok","searchResult3":{
+            "artist":[{"id":"ar-1","name":"Portishead","albumCount":3}],
+            "album":[{"id":"al-9","name":"Dummy","artist":"Portishead","songCount":11}],
+            "song":[{"id":"tr-9","title":"Roads","artist":"Portishead","duration":302}]}}}"#;
+        let results = parse_search(&unwrap_response(body).unwrap()).unwrap();
+        assert_eq!(results.artists[0].name, "Portishead");
+        assert_eq!(results.albums[0].name, "Dummy");
+        assert_eq!(results.tracks[0].duration_label(), "5:02");
+        assert!(!results.is_empty());
+    }
+
+    #[test]
+    fn credentials_round_trip_through_disk() {
+        let path = std::env::temp_dir()
+            .join(format!("skylight-music-test-{}.secret", std::process::id()));
+        // SAFETY-ish: single-threaded test process section; this mirrors how the
+        // other feature tests point at scratch paths.
+        std::env::set_var("SKYLIGHT_MUSIC_CREDENTIALS", &path);
+        let _ = forget_credentials();
+
+        assert!(load_credentials().is_none(), "nothing saved yet");
+        let mut credentials = credentials();
+        credentials.player_entity_id = Some("media_player.kitchen".into());
+        save_credentials(&credentials).unwrap();
+        assert_eq!(load_credentials().as_ref(), Some(&credentials));
+
+        forget_credentials().unwrap();
+        assert!(load_credentials().is_none());
+        // Forgetting something already gone is not an error -- the UI calls this
+        // to reset and shouldn't have to care.
+        forget_credentials().unwrap();
+        std::env::remove_var("SKYLIGHT_MUSIC_CREDENTIALS");
+    }
+
+    #[test]
+    fn album_sorts_map_to_the_types_subsonic_expects() {
+        assert_eq!(AlbumSort::Newest.as_type(), "newest");
+        assert_eq!(AlbumSort::Alphabetical.as_type(), "alphabeticalByName");
+        assert_eq!(AlbumSort::Frequent.label(), "Most played");
+    }
+}

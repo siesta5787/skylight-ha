@@ -1,3 +1,4 @@
+mod music;
 mod timezone;
 mod wifi;
 mod update;

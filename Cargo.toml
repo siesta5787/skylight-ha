@@ -24,6 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 time = { version = "0.3", features = ["serde", "parsing", "formatting", "macros"] }
 url = "2"
 sha2 = "0.10"
+# MD5 is not a security choice here -- the Subsonic API specifies it for its
+# token auth (t = md5(password + salt)), so interoperating means using it.
+md-5 = "0.10"
 
 [profile.release]
 lto = true

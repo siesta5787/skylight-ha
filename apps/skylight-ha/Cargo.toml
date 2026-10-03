@@ -42,6 +42,11 @@ thiserror.workspace = true
 # Hashing the local 4-digit parental PIN before writing it to disk, and
 # verifying the SHA-256 of a downloaded update while it streams.
 sha2.workspace = true
+# Subsonic's token auth is specified as md5(password + salt) -- not a security
+# decision on our part, just what Navidrome and every other Subsonic server
+# expects. Lets the music credentials file store a salt+token pair instead of
+# the user's actual password.
+md-5.workspace = true
 # The self-updater's HTTPS client. Same crate, version and feature set
 # ha-client already uses (rustls, no OpenSSL, so it stays static-musl
 # friendly and carries its own webpki root store rather than depending on the
