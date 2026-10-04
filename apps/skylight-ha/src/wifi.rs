@@ -769,6 +769,12 @@ aa:bb:cc:dd:ee:06\t2412\t-66\t[WPA2-PSK-CCMP][ESS]\t
                         .find(|(prefix, _)| command.starts_with(prefix))
                         .map(|(_, reply)| *reply)
                         .unwrap_or("OK");
+                    // Recorded *before* the reply goes out. The client returns
+                    // as soon as it has the reply, so a test that then drains
+                    // this channel would otherwise race the send and
+                    // intermittently miss the last command -- which it did,
+                    // roughly one run in ten.
+                    let _ = tx.send(command.clone());
                     if let Some(peer_path) = &peer_path {
                         let _ = socket.send_to(reply.as_bytes(), peer_path);
                     }
@@ -777,7 +783,6 @@ aa:bb:cc:dd:ee:06\t2412\t-66\t[WPA2-PSK-CCMP][ESS]\t
                             let _ = socket.send_to(event.as_bytes(), target);
                         }
                     }
-                    let _ = tx.send(command);
                 }
             });
 

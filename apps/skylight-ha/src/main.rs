@@ -348,9 +348,19 @@ fn main() {
     // the on-screen keyboard is what completes a join.
     // Loaded at startup so the tab knows whether to show the connect prompt
     // or the library without waiting on a network round trip.
-    let music_state: Arc<Mutex<MusicUi>> = Arc::new(Mutex::new(MusicUi {
-        credentials: music::load_credentials(),
-        ..MusicUi::default()
+    let music_state: Arc<Mutex<MusicUi>> = Arc::new(Mutex::new({
+        let credentials = music::load_credentials();
+        MusicUi {
+            // Restored from the saved credentials rather than left blank until
+            // the speaker is picked again -- otherwise the transport bar came
+            // back nameless after every restart.
+            player_name: credentials
+                .as_ref()
+                .and_then(|c| c.player_name.clone())
+                .unwrap_or_default(),
+            credentials,
+            ..MusicUi::default()
+        }
     }));
 
     let wifi_settings = wifi::Settings::from_env();
@@ -1423,6 +1433,7 @@ fn main() {
                         let mut state = music_state.lock().unwrap();
                         if let Some(credentials) = state.credentials.as_mut() {
                             credentials.player_entity_id = Some(entity_id.clone());
+                            credentials.player_name = Some(name.clone());
                             if let Err(err) = music::save_credentials(credentials) {
                                 tracing::warn!(%err, "could not save the chosen speaker");
                             }
@@ -2840,6 +2851,17 @@ impl MusicUi {
 /// Pushes the non-row parts of the Music tab into the UI.
 fn apply_music_chrome(app: &AppWindow, state: &MusicUi) {
     app.set_music_configured(state.credentials.is_some());
+    // Names the server in Settings, so "Disconnect" says what it will
+    // disconnect from rather than being an unlabelled switch.
+    app.set_music_server_label(
+        match &state.credentials {
+            Some(credentials) => {
+                format!("Connected to {} as {}", credentials.server_url, credentials.username)
+            }
+            None => "No music server connected. Set one up from the Music tab.".to_string(),
+        }
+        .into(),
+    );
     app.set_music_player_configured(state.player_entity_id().is_some());
     app.set_music_player_name(state.player_name.clone().into());
     let level = state.stack.last();

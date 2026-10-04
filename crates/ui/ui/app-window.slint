@@ -203,6 +203,7 @@ export component AppWindow inherits Window {
     // which level of the browse hierarchy is showing and supplies labelled
     // rows, so the navigation rules stay testable rather than living in markup.
     in property <bool> music-configured: false;
+    in property <string> music-server-label: "";
     in property <string> music-message: "";
     in property <bool> music-busy: false;
     in property <bool> music-player-configured: false;
@@ -610,11 +611,16 @@ export component AppWindow inherits Window {
                     sort-selected(i) => { root.music-sort-selected(i); }
                     load-more => { root.music-load-more(); }
                     setup-requested => { root.music-setup-requested(); }
-                    forget-requested => { root.music-forget-requested(); }
                     section-selected(i) => { root.music-section-selected(i); }
                     row-selected(i) => { root.music-row-selected(i); }
                     back => { root.music-back(); }
-                    choose-player => { root.music-choose-player(); }
+                    choose-player => {
+                        // The picker renders in the browse area, so leave the
+                        // now-playing view or the tap would appear to do
+                        // nothing.
+                        root.music-now-playing-view = false;
+                        root.music-choose-player();
+                    }
                     play-pause => { root.music-play-pause(); }
                     next-track => { root.music-next-track(); }
                     previous-track => { root.music-previous-track(); }
@@ -645,6 +651,10 @@ export component AppWindow inherits Window {
 
                     wifi-status: root.wifi-status;
                     wifi-manage-requested => { root.wifi-manage-requested(); }
+
+                    music-server-label: root.music-server-label;
+                    music-configured: root.music-configured;
+                    music-forget-requested => { root.music-forget-requested(); }
 
                     timezone-name: root.timezone-name;
                     timezone-detail: root.timezone-detail;

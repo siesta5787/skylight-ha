@@ -75,6 +75,12 @@ pub struct Credentials {
     /// picks one -- browsing works without it.
     #[serde(default)]
     pub player_entity_id: Option<String>,
+    /// Its friendly name, stored alongside the id so the transport bar can
+    /// label itself at startup without waiting for Home Assistant to connect
+    /// and without re-fetching the entity list. `serde(default)` so files
+    /// written before this field existed still load.
+    #[serde(default)]
+    pub player_name: Option<String>,
 }
 
 impl Credentials {
@@ -88,6 +94,7 @@ impl Credentials {
             salt,
             token,
             player_entity_id: None,
+            player_name: None,
         }
     }
 
@@ -609,6 +616,7 @@ mod tests {
             salt: "abcdef0123456789".into(),
             token: "0123456789abcdef0123456789abcdef".into(),
             player_entity_id: None,
+            player_name: None,
         }
     }
 
@@ -747,6 +755,17 @@ mod tests {
         assert_eq!(results.tracks[0].duration_label(), "5:02");
     }
 
+    /// Files written before the player name was stored must still load, or an
+    /// update would silently drop the speaker someone had already chosen.
+    #[test]
+    fn credentials_without_a_player_name_still_load() {
+        let older = r#"{"server_url":"http://music.local:4533","username":"me",
+            "salt":"abc","token":"def","player_entity_id":"media_player.kitchen"}"#;
+        let parsed: Credentials = serde_json::from_str(older).expect("older file should load");
+        assert_eq!(parsed.player_entity_id.as_deref(), Some("media_player.kitchen"));
+        assert_eq!(parsed.player_name, None, "absent, not a parse failure");
+    }
+
     #[test]
     fn cover_art_is_requested_at_the_size_we_intend_to_draw() {
         let url = credentials().cover_art_url("al-1", 128);
@@ -792,6 +811,7 @@ mod tests {
         assert!(load_credentials_at(&path).is_none(), "nothing saved yet");
         let mut credentials = credentials();
         credentials.player_entity_id = Some("media_player.kitchen".into());
+        credentials.player_name = Some("Kitchen".into());
         save_credentials_at(&path, &credentials).unwrap();
         assert_eq!(load_credentials_at(&path).as_ref(), Some(&credentials));
 

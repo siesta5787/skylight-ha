@@ -313,7 +313,6 @@ export component MusicPage inherits Rectangle {
     callback sort-selected(int);
     callback load-more();
     callback setup-requested();
-    callback forget-requested();
     callback section-selected(int);
     callback row-selected(int);
     callback back();
@@ -452,13 +451,46 @@ export component MusicPage inherits Rectangle {
         }
 
         Text {
-            text: root.now-playing-artist != ""
-                ? root.now-playing-artist + "  -  " + root.player-name
-                : root.player-name;
+            text: root.now-playing-artist;
             font-size: 15px;
             color: Theme.text-muted;
             horizontal-alignment: center;
             overflow: elide;
+            visible: root.now-playing-artist != "";
+        }
+
+        // Tappable, because the speaker was previously a one-way choice: the
+        // picker only appeared while none was set, so there was no way to move
+        // the music to a different room afterwards.
+        HorizontalLayout {
+            height: 40px;
+            alignment: center;
+
+            Rectangle {
+                width: 300px;
+                border-radius: 20px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: speaker-touch.pressed ? Theme.surface-alt : transparent;
+
+                speaker-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.choose-player(); }
+                }
+
+                Text {
+                    text: root.player-name != ""
+                        ? "Playing on " + root.player-name + "  -  change"
+                        : "Choose a speaker";
+                    font-size: 13px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
         }
 
         HorizontalLayout {
@@ -581,9 +613,12 @@ export component MusicPage inherits Rectangle {
                 }
                 }
 
-                if !root.player-configured: Rectangle {
+                // Shown whether or not a speaker is set: picking one used to be
+                // a one-way door, with no way back to the picker afterwards.
+                Rectangle {
                     width: 128px;
-                    height: 38px;
+                    height: 44px;
+                    y: (parent.height - self.height) / 2;
                     border-radius: 10px;
                     border-width: 1px;
                     border-color: Theme.border;
@@ -596,7 +631,7 @@ export component MusicPage inherits Rectangle {
                     }
 
                     Text {
-                        text: "Choose speaker";
+                        text: root.player-configured ? "Change speaker" : "Choose speaker";
                         font-size: 12px;
                         font-weight: 600;
                         color: Theme.text-primary;
@@ -662,30 +697,6 @@ export component MusicPage inherits Rectangle {
             }
 
             Rectangle { horizontal-stretch: 1; }
-
-            // Reachable from every level, so a wrong server or a changed
-            // password is recoverable without SSH.
-            Rectangle {
-                width: 96px;
-                border-radius: 17px;
-                border-width: 1px;
-                border-color: Theme.border;
-                background: forget-touch.pressed ? Theme.surface-alt : transparent;
-
-                forget-touch := TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => { root.forget-requested(); }
-                }
-
-                Text {
-                    text: "Disconnect";
-                    font-size: 11px;
-                    color: Theme.text-muted;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-            }
         }
 
         if root.sorts-visible: HorizontalLayout {

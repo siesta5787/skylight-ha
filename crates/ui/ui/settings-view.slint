@@ -100,6 +100,13 @@ export component SettingsPage inherits Rectangle {
     in property <string> wifi-status: "";
     callback wifi-manage-requested();
 
+    // Which music server is connected, or that none is. Disconnecting lives
+    // here rather than on the Music tab so it sits behind the PIN gate and has
+    // room to say what it actually does.
+    in property <string> music-server-label: "";
+    in property <bool> music-configured: false;
+    callback music-forget-requested();
+
     // e.g. "America/New_York" and "EDT - UTC-4".
     in property <string> timezone-name: "";
     in property <string> timezone-detail: "";
@@ -222,6 +229,30 @@ export component SettingsPage inherits Rectangle {
                 label: "Manage Wi-Fi";
                 secondary: true;
                 tapped => { root.wifi-manage-requested(); }
+            }
+        }
+
+        SettingsCard {
+            title: "Music Library";
+
+            Text {
+                text: root.music-server-label;
+                font-size: 13px;
+                color: Theme.text-primary;
+                wrap: word-wrap;
+            }
+
+            if root.music-configured: Text {
+                text: "Disconnecting forgets the server address and sign-in. Browsing and playback stop until it's set up again from the Music tab.";
+                font-size: 12px;
+                color: Theme.text-muted;
+                wrap: word-wrap;
+            }
+
+            if root.music-configured: SettingsButton {
+                label: "Disconnect music server";
+                danger: true;
+                tapped => { root.music-forget-requested(); }
             }
         }
 
