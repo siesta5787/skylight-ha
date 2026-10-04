@@ -17,7 +17,7 @@ use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Wee
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
     DashboardRowData, EventFormMember, MemberChipData, SensorRowData, TodoColumnData,
-    MusicRowData, TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
+    MusicGridRowData, MusicRowData, TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
     WifiNetworkData,
 };
 
@@ -1478,6 +1478,22 @@ fn main() {
             music_transport(&rt_handle, &music_state, &live_client, "media_previous_track");
         });
     }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        app.on_music_volume_up(move || {
+            music_volume(&rt_handle, &music_state, &live_client, 0.05);
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        app.on_music_volume_down(move || {
+            music_volume(&rt_handle, &music_state, &live_client, -0.05);
+        });
+    }
 
     // Now playing, driven by the target player's own state_changed events
     // rather than polling: get_states has been measured at 17s+ on this
@@ -1486,6 +1502,15 @@ fn main() {
         let music_state = music_state.clone();
         let live_client = live_client.clone();
         let app_weak = app.as_weak();
+        // Artwork comes from Home Assistant's media proxy, not the music
+        // server, so this needs HA's own base URL and credentials. A missing
+        // token just means no artwork, which degrades quietly.
+        let ha_base_url = config.ha.base_url.clone();
+        let ha_token = config.ha.load_token().ok();
+        let art_http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_default();
         rt_handle.spawn(async move {
             loop {
                 let client = { live_client.lock().unwrap().clone() };
@@ -1499,15 +1524,70 @@ fn main() {
                     if target.as_deref() != Some(state.entity_id.as_str()) {
                         continue;
                     }
-                    let (title, artist, playing) = now_playing_from(&state);
-                    let app_weak = app_weak.clone();
+                    let now = now_playing_from(&state);
+
+                    // Only refetch when the artwork actually changes: HA
+                    // republishes the whole attribute set on every position
+                    // update, which for a playing track is constant churn.
+                    let picture_changed = {
+                        let mut music = music_state.lock().unwrap();
+                        let changed = music.now_playing.picture != now.picture;
+                        music.now_playing = now.clone();
+                        changed
+                    };
+
+                    let app_weak_ui = app_weak.clone();
+                    let published = now.clone();
                     let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(app) = app_weak.upgrade() {
-                            app.set_music_now_playing_title(title.into());
-                            app.set_music_now_playing_artist(artist.into());
-                            app.set_music_now_playing_active(playing);
+                        if let Some(app) = app_weak_ui.upgrade() {
+                            // Volume label first: the String fields move out
+                            // below.
+                            app.set_music_volume_label(published.volume_label().into());
+                            app.set_music_now_playing_title(published.title.into());
+                            app.set_music_now_playing_artist(published.artist.into());
+                            app.set_music_now_playing_active(published.playing);
                         }
                     });
+
+                    if !picture_changed {
+                        continue;
+                    }
+                    let Some(picture) = now.picture.clone() else {
+                        let app_weak = app_weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(app) = app_weak.upgrade() {
+                                app.set_music_now_playing_art(Default::default());
+                            }
+                        });
+                        continue;
+                    };
+
+                    let url = now_playing_art_url(&ha_base_url, &picture);
+                    let request = art_http.get(&url);
+                    let request = match &ha_token {
+                        // Media-proxy URLs usually carry their own signed
+                        // token, but sending ours too is harmless and covers
+                        // the ones that don't.
+                        Some(token) => request.bearer_auth(token),
+                        None => request,
+                    };
+                    let fetched = async {
+                        let bytes = request.send().await.ok()?.bytes().await.ok()?;
+                        music::decode_cover(&bytes).ok()
+                    }
+                    .await;
+                    if let Some(cover) = fetched {
+                        let app_weak = app_weak.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            let Some(app) = app_weak.upgrade() else { return };
+                            let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                                cover.width,
+                                cover.height,
+                            );
+                            buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
+                            app.set_music_now_playing_art(slint::Image::from_rgba8(buffer));
+                        });
+                    }
                 }
                 // The broadcast ended, which means the HA connection went
                 // away; wait for `run_ha_sync` to publish a new one.
@@ -2205,25 +2285,67 @@ thread_local! {
     /// Thread-local rather than shared state because `slint::Image` is not
     /// `Send`; everything here is touched only from the event loop.
     static COVER_CACHE: RefCell<BTreeMap<String, slint::Image>> = const { RefCell::new(BTreeMap::new()) };
+    /// Bytes currently held by `COVER_CACHE`, tracked alongside it because a
+    /// `slint::Image` won't tell you what it cost.
+    static COVER_CACHE_USED: RefCell<usize> = const { RefCell::new(0) };
 }
 
-/// Caps the cover cache. At 96px RGBA each cover is ~36KB, so this is a few
-/// MB -- worth bounding on a 512MB board with a library that could be any size.
-const COVER_CACHE_LIMIT: usize = 400;
+/// Caps the cover cache, in bytes rather than entries.
+///
+/// A 224px RGBA cover is ~200KB, so counting entries would make the real
+/// memory cost invisible -- and this runs on a 512MB board against a library
+/// that could be any size.
+const COVER_CACHE_BYTES: usize = 24 * 1024 * 1024;
 
 fn cache_cover(id: &str, cover: &music::CoverArt) {
     let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(cover.width, cover.height);
     buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
     let image = slint::Image::from_rgba8(buffer);
+    let cost = cover.rgba.len();
     COVER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         // Wholesale clear rather than LRU bookkeeping: this only triggers on a
-        // very large browse, and the cost is re-fetching thumbnails.
-        if cache.len() >= COVER_CACHE_LIMIT {
+        // very large browse, and the cost is re-fetching some thumbnails.
+        if COVER_CACHE_USED.with(|used| *used.borrow()) + cost > COVER_CACHE_BYTES {
             cache.clear();
+            COVER_CACHE_USED.with(|used| *used.borrow_mut() = 0);
         }
-        cache.insert(id.to_string(), image);
+        if cache.insert(id.to_string(), image).is_none() {
+            COVER_CACHE_USED.with(|used| *used.borrow_mut() += cost);
+        }
     });
+}
+
+/// How many albums sit across the grid.
+///
+/// Fixed rather than derived from the window width: cells size themselves from
+/// the column count, so the grid stays aligned at any resolution, and four
+/// reads well on a wall display seen from across a room.
+const GRID_COLUMNS: usize = 4;
+
+/// Albums are shown as a wall of covers; everything else reads better as a
+/// list, and tracks in particular need their duration and play affordance.
+fn level_uses_grid(level: Option<&MusicLevel>) -> bool {
+    matches!(level, Some(MusicLevel::Albums { .. }) | Some(MusicLevel::Artist { .. }))
+}
+
+/// Chunks a flat album list into grid rows.
+///
+/// Slint has no wrapping layout, so the wrapping happens here -- the same
+/// shape `group_dashboard_rows` already uses for dashboard cards.
+fn music_grid_rows(rows: &[MusicRowData], columns: usize) -> Vec<MusicGridRowData> {
+    let columns = columns.max(1);
+    rows.chunks(columns)
+        .map(|chunk| {
+            let mut cells = chunk.to_vec();
+            // Cells share the row by stretching, so a short final row would
+            // otherwise blow its covers up to fill the width.
+            while cells.len() < columns {
+                cells.push(MusicRowData { filler: true, ..Default::default() });
+            }
+            MusicGridRowData { cells: slint::ModelRc::new(slint::VecModel::from(cells)) }
+        })
+        .collect()
 }
 
 /// Builds the Slint rows, pulling in whatever art has already been decoded.
@@ -2232,6 +2354,7 @@ fn to_row_data(rows: &[MusicRowInfo]) -> Vec<MusicRowData> {
         let cache = cache.borrow();
         rows.iter()
             .map(|row| MusicRowData {
+                filler: false,
                 art: row
                     .cover_id
                     .as_ref()
@@ -2371,12 +2494,103 @@ fn player_rows(states: &[EntityState]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction
         .unzip()
 }
 
+/// What the transport bar shows, read off a `media_player` entity's state.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct NowPlaying {
+    title: String,
+    artist: String,
+    playing: bool,
+    /// 0.0-1.0, when the player reports it. Absent for players with no
+    /// settable volume, which is why the controls fall back to volume_up and
+    /// volume_down rather than assuming a level to add to.
+    volume: Option<f32>,
+    /// HA-relative artwork URL (`/api/media_player_proxy/...`).
+    picture: Option<String>,
+}
+
+impl NowPlaying {
+    fn volume_label(&self) -> String {
+        match self.volume {
+            Some(level) => format!("{}%", (level * 100.0).round() as i32),
+            None => String::new(),
+        }
+    }
+}
+
 /// Pulls now-playing out of a `media_player` entity's state.
-fn now_playing_from(state: &EntityState) -> (String, String, bool) {
-    let attribute = |key: &str| {
+fn now_playing_from(state: &EntityState) -> NowPlaying {
+    let text = |key: &str| {
         state.attributes.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
     };
-    (attribute("media_title"), attribute("media_artist"), state.state == "playing")
+    NowPlaying {
+        title: text("media_title"),
+        artist: text("media_artist"),
+        playing: state.state == "playing",
+        volume: state
+            .attributes
+            .get("volume_level")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32),
+        picture: state
+            .attributes
+            .get("entity_picture")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string()),
+    }
+}
+
+/// Resolves HA's relative artwork URL against the configured base.
+fn now_playing_art_url(base_url: &str, picture: &str) -> String {
+    if picture.starts_with("http://") || picture.starts_with("https://") {
+        picture.to_string()
+    } else {
+        format!("{}/{}", base_url.trim_end_matches('/'), picture.trim_start_matches('/'))
+    }
+}
+
+/// Nudges a player's volume.
+///
+/// Prefers an absolute `volume_set` when the player reports a level, because
+/// that is the only way to guarantee a consistent step; falls back to
+/// `volume_up`/`volume_down` for players that don't report one, which would
+/// otherwise have no working control at all.
+fn music_volume(
+    rt_handle: &tokio::runtime::Handle,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    delta: f32,
+) {
+    let (player, level) = {
+        let state = music_state.lock().unwrap();
+        (state.player_entity_id(), state.now_playing.volume)
+    };
+    let Some(player) = player else { return };
+
+    let live_client = live_client.clone();
+    rt_handle.spawn(async move {
+        let ha = live_client.lock().unwrap().clone();
+        let Some(ha) = ha else { return };
+        let result = match level {
+            Some(level) => {
+                let target = (level + delta).clamp(0.0, 1.0);
+                ha.call_service(
+                    "media_player",
+                    "volume_set",
+                    &[player],
+                    serde_json::json!({ "volume_level": target }),
+                )
+                .await
+            }
+            None => {
+                let service = if delta > 0.0 { "volume_up" } else { "volume_down" };
+                ha.call_service("media_player", service, &[player], serde_json::json!({})).await
+            }
+        };
+        if let Err(err) = result {
+            tracing::warn!(%err, "volume change failed");
+        }
+    });
 }
 
 /// One page of a level's contents.
@@ -2505,6 +2719,9 @@ struct MusicUi {
     /// Cover ids already fetched. The images themselves live in the
     /// thread-local cache, which this mirrors on the Send side.
     art_fetched: std::collections::BTreeSet<String>,
+    /// Latest state of the target player, so the volume buttons have a level
+    /// to add to and the artwork fetch knows when the picture changed.
+    now_playing: NowPlaying,
 }
 
 impl MusicUi {
@@ -2528,13 +2745,22 @@ fn apply_music_chrome(app: &AppWindow, state: &MusicUi) {
         Some(MusicLevel::Albums { sort }) => Some(*sort),
         _ => None,
     };
+    app.set_music_grid_mode(level_uses_grid(level));
     app.set_music_sorts_visible(sort.is_some());
     app.set_music_selected_sort(sort.map(|s| s.index()).unwrap_or(0));
     app.set_music_can_load_more(state.can_load_more);
 }
 
 fn set_music_rows(app: &AppWindow, rows: &[MusicRowInfo]) {
-    app.set_music_rows(slint::ModelRc::new(slint::VecModel::from(to_row_data(rows))));
+    let data = to_row_data(rows);
+    // Both shapes are published every time: which one is drawn is the page's
+    // decision, and keeping them in step avoids a stale grid flashing up when
+    // the level changes.
+    app.set_music_grid_rows(slint::ModelRc::new(slint::VecModel::from(music_grid_rows(
+        &data,
+        GRID_COLUMNS,
+    ))));
+    app.set_music_rows(slint::ModelRc::new(slint::VecModel::from(data)));
 }
 
 /// Navigates to `stack`, fetching whatever the new top level needs.
@@ -2697,12 +2923,14 @@ fn finish_music_setup(
     });
 }
 
-/// Thumbnail size requested from the server.
+/// Cover size requested from the server.
 ///
-/// Rows draw art at 44px; 96 keeps it crisp without making the Pi decode
-/// full-resolution covers, which is the difference between this feature being
-/// pleasant and being unusable on a Zero 2 W.
-const COVER_PIXELS: u32 = 96;
+/// One size for both shapes: list rows draw it at 44px and grid cells at
+/// roughly 250px, so this is sized for the grid and downscaled by the list.
+/// Asking the server to scale means the Pi never decodes a full-resolution
+/// cover, which is the difference between this being pleasant and being
+/// unusable on a Zero 2 W.
+const COVER_PIXELS: u32 = 224;
 
 /// Fetches album art for the rows currently on screen, filling it in as it
 /// arrives.
@@ -5485,10 +5713,13 @@ mod tests {
             }),
             last_updated: None,
         };
-        assert_eq!(now_playing_from(&state), ("Roads".into(), "Portishead".into(), true));
+        let now = now_playing_from(&state);
+        assert_eq!(now.title, "Roads");
+        assert_eq!(now.artist, "Portishead");
+        assert!(now.playing);
 
         let paused = EntityState { state: "paused".into(), ..state.clone() };
-        assert!(!now_playing_from(&paused).2);
+        assert!(!now_playing_from(&paused).playing);
 
         let idle = EntityState {
             entity_id: "media_player.lounge".into(),
@@ -5496,7 +5727,46 @@ mod tests {
             attributes: serde_json::json!({}),
             last_updated: None,
         };
-        assert_eq!(now_playing_from(&idle), (String::new(), String::new(), false));
+        let idle_now = now_playing_from(&idle);
+        assert_eq!(idle_now.title, "");
+        assert!(!idle_now.playing);
+        assert_eq!(idle_now.volume, None, "no level reported means no level to step from");
+        assert_eq!(idle_now.volume_label(), "", "and nothing to show for it");
+    }
+
+    #[test]
+    fn volume_and_artwork_are_read_off_the_player_too() {
+        let state = EntityState {
+            entity_id: "media_player.lounge".into(),
+            state: "playing".into(),
+            attributes: serde_json::json!({
+                "media_title": "Roads",
+                "volume_level": 0.42,
+                "entity_picture": "/api/media_player_proxy/media_player.lounge?token=abc"
+            }),
+            last_updated: None,
+        };
+        let now = now_playing_from(&state);
+        assert_eq!(now.volume, Some(0.42));
+        assert_eq!(now.volume_label(), "42%");
+        assert_eq!(
+            now.picture.as_deref(),
+            Some("/api/media_player_proxy/media_player.lounge?token=abc")
+        );
+    }
+
+    /// HA hands back a relative path; an absolute one must be left alone.
+    #[test]
+    fn artwork_urls_resolve_against_the_ha_base() {
+        assert_eq!(
+            now_playing_art_url("http://ha.local:8123/", "/api/image/x.jpg"),
+            "http://ha.local:8123/api/image/x.jpg",
+            "exactly one slash between them"
+        );
+        assert_eq!(
+            now_playing_art_url("http://ha.local:8123", "https://covers.example/x.jpg"),
+            "https://covers.example/x.jpg"
+        );
     }
 
     /// A bare host is far likelier to be typed on a touchscreen than a full

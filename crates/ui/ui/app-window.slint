@@ -16,7 +16,7 @@ import { SettingsPage } from "settings-view.slint";
 import { UpdateOverlay } from "update-overlay.slint";
 import { TimezonePicker } from "timezone-picker.slint";
 import { WifiView, WifiNetworkData } from "wifi-view.slint";
-import { MusicPage, MusicRowData } from "music-view.slint";
+import { MusicPage, MusicRowData, MusicGridRowData } from "music-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -25,7 +25,7 @@ import "../assets/fonts/Inter-Regular.ttf";
 export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
     AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, DashboardRowData,
-    ToggleEntityData, SensorRowData, Page, WifiNetworkData, MusicRowData,
+    ToggleEntityData, SensorRowData, Page, WifiNetworkData, MusicRowData, MusicGridRowData,
 }
 
 component NavArrow inherits Rectangle {
@@ -203,6 +203,10 @@ export component AppWindow inherits Window {
     in property <string> music-now-playing-title: "";
     in property <string> music-now-playing-artist: "";
     in property <bool> music-now-playing-active: false;
+    in property <image> music-now-playing-art;
+    in property <string> music-volume-label: "";
+    callback music-volume-up();
+    callback music-volume-down();
     in property <[string]> music-sections: [];
     in property <int> music-selected-section: 0;
     in property <string> music-heading: "";
@@ -212,6 +216,9 @@ export component AppWindow inherits Window {
     in property <[string]> music-sorts: [];
     in property <int> music-selected-sort: 0;
     in property <bool> music-can-load-more: false;
+    in property <bool> music-grid-mode: false;
+    in property <[MusicGridRowData]> music-grid-rows: [];
+    in property <int> music-grid-columns: 4;
     callback music-sort-selected(int);
     callback music-load-more();
     // Fired when the Music tab is opened, so the library refreshes instead of
@@ -549,6 +556,10 @@ export component AppWindow inherits Window {
                     now-playing-title: root.music-now-playing-title;
                     now-playing-artist: root.music-now-playing-artist;
                     now-playing-active: root.music-now-playing-active;
+                    now-playing-art: root.music-now-playing-art;
+                    volume-label: root.music-volume-label;
+                    volume-up => { root.music-volume-up(); }
+                    volume-down => { root.music-volume-down(); }
                     sections: root.music-sections;
                     selected-section: root.music-selected-section;
                     heading: root.music-heading;
@@ -558,6 +569,13 @@ export component AppWindow inherits Window {
                     sorts: root.music-sorts;
                     selected-sort: root.music-selected-sort;
                     can-load-more: root.music-can-load-more;
+                    grid-mode: root.music-grid-mode;
+                    grid-rows: root.music-grid-rows;
+                    grid-columns: root.music-grid-columns;
+                    // Flat index: rows are padded to full width, so
+                    // row * columns + column addresses the same list Rust
+                    // already holds actions for.
+                    cell-selected(i) => { root.music-row-selected(i); }
                     sort-selected(i) => { root.music-sort-selected(i); }
                     load-more => { root.music-load-more(); }
                     setup-requested => { root.music-setup-requested(); }

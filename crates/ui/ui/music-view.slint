@@ -4,12 +4,75 @@ export struct MusicRowData {
     // Album art, filled in asynchronously after the row first appears -- empty
     // until it arrives, which is why the row draws a placeholder behind it.
     art: image,
+    // Pads a short final grid row. Cells stretch to share the row, so without
+    // padding the last row's covers would balloon to fill the width.
+    filler: bool,
     title: string,
     subtitle: string,
     // Right-hand detail: a track's duration, or an album count.
     trailing: string,
     // Tracks start playback; everything else drills in. Drives the chevron.
     playable: bool,
+}
+
+// A row of grid cells. Nested array rather than a flat list because Slint has
+// no wrapping layout -- Rust chunks the albums into rows, the same shape the
+// dashboard already uses for its cards.
+export struct MusicGridRowData {
+    cells: [MusicRowData],
+}
+
+// One album in the grid: a big square cover with its name under it.
+component AlbumCell inherits VerticalLayout {
+    in property <MusicRowData> data;
+    callback tapped();
+
+    spacing: 6px;
+
+    Rectangle {
+        // Square, driven by whatever width the row's stretch gives it, so the
+        // grid stays aligned at any resolution. Deliberately not computed from
+        // parent.width: inside a Flickable that feeds back through the
+        // viewport and Slint rejects it as a binding loop.
+        height: self.width;
+        border-radius: 8px;
+        background: root.data.filler ? transparent : Theme.border;
+        clip: true;
+
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.data.art;
+            image-fit: cover;
+        }
+
+        // Covers the artwork rather than the whole cell: the text below is
+        // elided and narrow, and a tap target that includes it would overlap
+        // its neighbour's artwork on a touchscreen.
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => {
+                if (!root.data.filler) { root.tapped(); }
+            }
+        }
+    }
+
+    Text {
+        text: root.data.title;
+        font-size: 13px;
+        font-weight: 600;
+        color: Theme.text-primary;
+        overflow: elide;
+    }
+
+    Text {
+        text: root.data.subtitle;
+        font-size: 11px;
+        color: Theme.text-muted;
+        overflow: elide;
+        visible: root.data.subtitle != "";
+    }
 }
 
 component SectionChip inherits Rectangle {
@@ -169,12 +232,22 @@ export component MusicPage inherits Rectangle {
     in property <string> now-playing-title: "";
     in property <string> now-playing-artist: "";
     in property <bool> now-playing-active: false;
+    in property <image> now-playing-art;
+    // Empty when the player doesn't report a level; the controls still work,
+    // they just step via volume_up/volume_down instead.
+    in property <string> volume-label: "";
 
     in property <[string]> sections: [];
     in property <int> selected-section: 0;
     in property <string> heading: "";
     in property <bool> can-go-back: false;
     in property <[MusicRowData]> rows: [];
+    // Albums are shown as a wall of covers rather than a list; everything else
+    // (tracks, artists, playlists, speakers) stays a list.
+    in property <bool> grid-mode: false;
+    in property <[MusicGridRowData]> grid-rows: [];
+    in property <int> grid-columns: 4;
+    callback cell-selected(int);
 
     // Album ordering. Only meaningful on the album list, hence the visibility
     // flag rather than always showing a row of chips that do nothing.
@@ -196,6 +269,8 @@ export component MusicPage inherits Rectangle {
     callback play-pause();
     callback next-track();
     callback previous-track();
+    callback volume-up();
+    callback volume-down();
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -269,9 +344,26 @@ export component MusicPage inherits Rectangle {
             border-color: Theme.border;
 
             HorizontalLayout {
-                padding-left: 16px;
+                padding-left: 12px;
                 padding-right: 16px;
                 spacing: 10px;
+
+                // Always present, so the bar doesn't reflow when art arrives.
+                Rectangle {
+                    width: 52px;
+                    height: 52px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 6px;
+                    background: Theme.border;
+                    clip: true;
+
+                    Image {
+                        width: 100%;
+                        height: 100%;
+                        source: root.now-playing-art;
+                        image-fit: cover;
+                    }
+                }
 
                 VerticalLayout {
                     alignment: center;
@@ -338,6 +430,27 @@ export component MusicPage inherits Rectangle {
                     TransportButton {
                         glyph: ">|";
                         tapped => { root.next-track(); }
+                    }
+
+                    Rectangle { width: 10px; }
+
+                    TransportButton {
+                        glyph: "-";
+                        tapped => { root.volume-down(); }
+                    }
+                    // Shows the level when the player reports one; the buttons
+                    // work either way.
+                    Text {
+                        text: root.volume-label;
+                        font-size: 11px;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                        width: 34px;
+                    }
+                    TransportButton {
+                        glyph: "+";
+                        tapped => { root.volume-up(); }
                     }
                 }
             }
@@ -437,7 +550,57 @@ export component MusicPage inherits Rectangle {
             wrap: word-wrap;
         }
 
-        Flickable {
+        if root.grid-mode: Flickable {
+            VerticalLayout {
+                spacing: 16px;
+                alignment: start;
+
+                if root.grid-rows.length == 0: Text {
+                    text: root.busy ? "Loading..." : "Nothing here.";
+                    font-size: 13px;
+                    color: Theme.text-muted;
+                }
+
+                for grid-row[ridx] in root.grid-rows: HorizontalLayout {
+                    spacing: 16px;
+                    alignment: start;
+
+                    for cell[cidx] in grid-row.cells: AlbumCell {
+                        // Even share of the row. Short rows are padded with
+                        // filler cells so the last row's covers stay the same
+                        // size as every other row's.
+                        horizontal-stretch: 1;
+                        data: cell;
+                        tapped => { root.cell-selected(ridx * root.grid-columns + cidx); }
+                    }
+                }
+
+                if root.can-load-more: Rectangle {
+                    height: 46px;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: grid-more-touch.pressed ? Theme.surface-alt : transparent;
+
+                    grid-more-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.load-more(); }
+                    }
+
+                    Text {
+                        text: root.busy ? "Loading..." : "Load more";
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        if !root.grid-mode: Flickable {
             VerticalLayout {
                 spacing: 2px;
                 alignment: start;
