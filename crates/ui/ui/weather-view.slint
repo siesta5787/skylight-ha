@@ -1,0 +1,162 @@
+import { Theme } from "theme.slint";
+import { WeatherIcon, WeatherStatIcon } from "weather-icon.slint";
+
+// One measurement, big enough to read from across a room.
+component WeatherStatCard inherits Rectangle {
+    in property <string> kind;
+    in property <string> label;
+    in property <string> value;
+
+    background: Theme.surface-alt;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 6px;
+        alignment: center;
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+
+            WeatherStatIcon {
+                kind: root.kind;
+                width: 18px;
+                height: 18px;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: root.label;
+                font-size: 13px;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+            }
+        }
+
+        Text {
+            text: root.value;
+            font-size: 24px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+    }
+}
+
+// The Weather tab.
+//
+// Everything here used to be crammed into a single line in the header beside
+// the clock. The data path is unchanged -- `apply_weather` in main.rs still
+// fills these from the same entities -- it just has room to breathe now, and
+// the header keeps only the temperature and today's range.
+//
+// Deliberately only what the existing entities already report. More is planned;
+// this pass is a move, not a redesign.
+export component WeatherPage inherits Rectangle {
+    in property <string> icon-condition: "";
+    in property <string> condition-label: "";
+    in property <string> updated-label: "";
+    in property <string> temp-now: "--°";
+    in property <string> temp-range: "";
+    in property <string> precip: "";
+    in property <string> pressure: "";
+    in property <string> humidity: "";
+    in property <string> wind: "";
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 20px;
+        alignment: start;
+
+        Text {
+            text: "Weather";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+
+        // Current conditions.
+        HorizontalLayout {
+            spacing: 20px;
+            height: 132px;
+
+            WeatherIcon {
+                condition: root.icon-condition;
+                width: 112px;
+                height: 112px;
+                y: (parent.height - self.height) / 2;
+            }
+
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 4px;
+
+                Text {
+                    text: root.temp-now;
+                    font-size: 64px;
+                    font-weight: 700;
+                    color: Theme.text-primary;
+                }
+                Text {
+                    text: root.condition-label;
+                    font-size: 18px;
+                    color: Theme.text-primary;
+                    visible: root.condition-label != "";
+                }
+                Text {
+                    text: root.temp-range;
+                    font-size: 15px;
+                    color: Theme.text-muted;
+                    visible: root.temp-range != "";
+                }
+            }
+        }
+
+        // Measurements. Each is hidden when the entity doesn't report it --
+        // this instance's primary weather entity has no humidity or pressure
+        // at all, which is why there's a backfill entity in the first place
+        // (see the weather notes in CLAUDE.md).
+        HorizontalLayout {
+            spacing: 14px;
+            height: 116px;
+
+            if root.precip != "": WeatherStatCard {
+                kind: "precip";
+                label: "Precipitation";
+                value: root.precip;
+                horizontal-stretch: 1;
+            }
+            if root.humidity != "": WeatherStatCard {
+                kind: "humidity";
+                label: "Humidity";
+                value: root.humidity;
+                horizontal-stretch: 1;
+            }
+            if root.pressure != "": WeatherStatCard {
+                kind: "pressure";
+                label: "Pressure";
+                value: root.pressure;
+                horizontal-stretch: 1;
+            }
+            if root.wind != "": WeatherStatCard {
+                kind: "wind";
+                label: "Wind";
+                value: root.wind;
+                horizontal-stretch: 1;
+            }
+        }
+
+        Text {
+            text: root.updated-label;
+            font-size: 12px;
+            color: Theme.text-muted;
+            visible: root.updated-label != "";
+        }
+    }
+}

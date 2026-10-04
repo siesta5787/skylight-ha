@@ -80,18 +80,15 @@ component WeatherStatLine inherits Rectangle {
 // apply_weather in main.rs) but not shown here; kept as properties so a
 // future tap-to-expand detail view can reuse them without re-plumbing the
 // data path.
+// Just the temperature and today's range, sized to sit beside the clock.
+// Everything else the weather entity reports -- condition, humidity, pressure,
+// wind, precipitation, freshness -- moved to the Weather tab, which has room
+// for it and doesn't crowd the header.
 export component WeatherWidget inherits Rectangle {
-    in property <string> icon-condition;
-    in property <string> condition-label;
-    in property <string> updated-label;
     in property <string> temp-now: "--°";
     in property <string> temp-range;
-    in property <string> precip;
-    in property <string> pressure;
-    in property <string> humidity;
-    in property <string> wind;
 
-    height: 26px;
+    height: 46px;
     background: transparent;
     // Explicit 0 so this doesn't also pick up a share of the outer header
     // row's leftover width (see TopBar below, which gives that space to
@@ -99,40 +96,22 @@ export component WeatherWidget inherits Rectangle {
     // fixes one level down, just at the next layout up.
     horizontal-stretch: 0;
 
-    HorizontalLayout {
-        spacing: 6px;
-        // Without this, a plain HorizontalLayout distributes any leftover
-        // width equally among children that have no explicit width (every
-        // WeatherStatLine here) instead of packing them at their natural
-        // size -- exactly the "big gaps between every item after the
-        // first" symptom this was added to fix. Same fix already used for
-        // the member-chip row below.
-        alignment: start;
+    VerticalLayout {
+        alignment: center;
 
-        WeatherIcon {
-            condition: root.icon-condition;
-            width: 22px;
-            height: 22px;
-            y: (parent.height - self.height) / 2;
+        Text {
+            text: root.temp-now;
+            font-size: 26px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: right;
         }
-        VerticalLayout {
-            alignment: center;
-            Text {
-                text: root.temp-now;
-                font-size: 16px;
-                font-weight: 700;
-                color: Theme.text-primary;
-            }
-            if root.temp-range != "": Text {
-                text: root.temp-range;
-                font-size: 9px;
-                color: Theme.text-muted;
-            }
+        if root.temp-range != "": Text {
+            text: root.temp-range;
+            font-size: 13px;
+            color: Theme.text-muted;
+            horizontal-alignment: right;
         }
-        if root.precip != "": WeatherStatLine { kind: "precip"; value: root.precip; }
-        if root.humidity != "": WeatherStatLine { kind: "humidity"; value: root.humidity; }
-        if root.pressure != "": WeatherStatLine { kind: "pressure"; value: root.pressure; }
-        if root.wind != "": WeatherStatLine { kind: "wind"; value: root.wind; }
     }
 }
 
@@ -142,15 +121,11 @@ export component TopBar inherits Rectangle {
     in property <string> family-name: "Family";
     in property <string> clock-text: "--:--";
     in property <string> date-text: "";
-    in property <string> weather-icon-condition: "";
-    in property <string> weather-condition-label: "";
-    in property <string> weather-updated-label: "";
     in property <string> weather-temp-now: "--°";
     in property <string> weather-temp-range: "";
-    in property <string> weather-precip: "";
-    in property <string> weather-pressure: "";
-    in property <string> weather-humidity: "";
-    in property <string> weather-wind: "";
+    // Split from the clock so AM/PM can sit beside it at its own size rather
+    // than being baked into one string.
+    in property <string> clock-meridiem: "";
     in property <[MemberChipData]> members;
     in property <[bool]> member-visible;
     // Tapping a member's name toggles them on/off the calendar below.
@@ -175,15 +150,8 @@ export component TopBar inherits Rectangle {
             }
 
             WeatherWidget {
-                icon-condition: root.weather-icon-condition;
-                condition-label: root.weather-condition-label;
-                updated-label: root.weather-updated-label;
                 temp-now: root.weather-temp-now;
                 temp-range: root.weather-temp-range;
-                precip: root.weather-precip;
-                pressure: root.weather-pressure;
-                humidity: root.weather-humidity;
-                wind: root.weather-wind;
             }
 
             VerticalLayout {
@@ -191,16 +159,28 @@ export component TopBar inherits Rectangle {
                 horizontal-stretch: 0;
                 Text {
                     text: date-text;
-                    font-size: 11px;
+                    font-size: 12px;
                     color: Theme.text-muted;
                     horizontal-alignment: right;
                 }
-                Text {
-                    text: clock-text;
-                    font-size: 26px;
-                    font-weight: 700;
-                    color: Theme.text-primary;
-                    horizontal-alignment: right;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: end;
+
+                    Text {
+                        text: clock-text;
+                        font-size: 36px;
+                        font-weight: 700;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                    }
+                    Text {
+                        text: root.clock-meridiem;
+                        font-size: 26px;
+                        font-weight: 700;
+                        color: Theme.text-muted;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }

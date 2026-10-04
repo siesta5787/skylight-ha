@@ -8,6 +8,7 @@ export enum Page {
     Tasks,
     Photos,
     Music,
+    Weather,
     Settings,
 }
 
@@ -91,6 +92,28 @@ component TasksIcon inherits Rectangle {
 // A quaver: note head plus stem. Straight lines and a rounded rectangle only,
 // for the same reason as the other icons here -- no icon font or asset
 // pipeline exists, and curves are hard to get right without a live preview.
+// A sun: a filled disc with four straight rays. Straight lines only, for the
+// same reason as every other icon here -- no icon font, and curves are hard to
+// get right without a live preview.
+component WeatherIconGlyph inherits Rectangle {
+    in property <color> icon-color;
+    width: 20px;
+    height: 20px;
+
+    Rectangle {
+        x: 6px;
+        y: 6px;
+        width: 8px;
+        height: 8px;
+        border-radius: 4px;
+        background: icon-color;
+    }
+    Rectangle { x: 9.2px; y: 0px; width: 1.6px; height: 4px; background: icon-color; }
+    Rectangle { x: 9.2px; y: 16px; width: 1.6px; height: 4px; background: icon-color; }
+    Rectangle { x: 0px; y: 9.2px; width: 4px; height: 1.6px; background: icon-color; }
+    Rectangle { x: 16px; y: 9.2px; width: 4px; height: 1.6px; background: icon-color; }
+}
+
 component MusicIcon inherits Rectangle {
     in property <color> icon-color;
     width: 20px;
@@ -248,6 +271,7 @@ export component Sidebar inherits Rectangle {
     property <color> tasks-color: root.active-page == Page.Tasks ? Theme.accent : Theme.text-muted;
     property <color> photos-color: root.active-page == Page.Photos ? Theme.accent : Theme.text-muted;
     property <color> music-color: root.active-page == Page.Music ? Theme.accent : Theme.text-muted;
+    property <color> weather-color: root.active-page == Page.Weather ? Theme.accent : Theme.text-muted;
     property <color> settings-color: root.active-page == Page.Settings ? Theme.accent : Theme.text-muted;
 
     VerticalLayout {
@@ -286,8 +310,15 @@ export component Sidebar inherits Rectangle {
             MusicIcon { icon-color: root.music-color; }
         }
 
+        NavItem {
+            label: "Weather";
+            active: root.active-page == Page.Weather;
+            tapped => { root.page-selected(Page.Weather); }
+            WeatherIconGlyph { icon-color: root.weather-color; }
+        }
+
         // Pushes Settings to the bottom of the rail rather than packing
-        // directly under Music.
+        // directly under Weather.
         Rectangle { vertical-stretch: 1; }
 
         NavItem {

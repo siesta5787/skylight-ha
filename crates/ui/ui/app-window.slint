@@ -17,6 +17,7 @@ import { UpdateOverlay } from "update-overlay.slint";
 import { TimezonePicker } from "timezone-picker.slint";
 import { WifiView, WifiNetworkData } from "wifi-view.slint";
 import { MusicPage, MusicRowData, MusicGridRowData } from "music-view.slint";
+import { WeatherPage } from "weather-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -125,6 +126,7 @@ export component AppWindow inherits Window {
     default-font-family: "Inter";
 
     in property <string> clock-text: "--:--";
+    in property <string> clock-meridiem: "";
     in property <string> date-text: "";
     in property <string> month-label: "";
     // All empty/placeholder until a weather entity is resolved and its
@@ -403,16 +405,12 @@ export component AppWindow inherits Window {
 
                 TopBar {
                     clock-text: root.clock-text;
+                    clock-meridiem: root.clock-meridiem;
                     date-text: root.date-text;
-                    weather-icon-condition: root.weather-icon-condition;
-                    weather-condition-label: root.weather-condition-label;
-                    weather-updated-label: root.weather-updated-label;
+                    // Only the temperature and today's range live up here now;
+                    // the rest moved to the Weather tab.
                     weather-temp-now: root.weather-temp-now;
                     weather-temp-range: root.weather-temp-range;
-                    weather-precip: root.weather-precip;
-                    weather-pressure: root.weather-pressure;
-                    weather-humidity: root.weather-humidity;
-                    weather-wind: root.weather-wind;
                     members: root.members;
                     member-visible: root.member-visible;
                     member-toggled(idx) => {
@@ -545,6 +543,19 @@ export component AppWindow inherits Window {
                     group-toggled(ids, on) => { root.dashboard-group-toggled(ids, on); }
                     climate-mode-selected(id, mode) => { root.dashboard-climate-mode-selected(id, mode); }
                     climate-temp-delta(id, delta) => { root.dashboard-climate-temp-delta(id, delta); }
+                }
+
+                if root.current-page == Page.Weather: WeatherPage {
+                    vertical-stretch: 1;
+                    icon-condition: root.weather-icon-condition;
+                    condition-label: root.weather-condition-label;
+                    updated-label: root.weather-updated-label;
+                    temp-now: root.weather-temp-now;
+                    temp-range: root.weather-temp-range;
+                    precip: root.weather-precip;
+                    pressure: root.weather-pressure;
+                    humidity: root.weather-humidity;
+                    wind: root.weather-wind;
                 }
 
                 if root.current-page == Page.Music: MusicPage {

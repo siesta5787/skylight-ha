@@ -88,6 +88,19 @@ fn system_utc_offset(at: OffsetDateTime) -> Option<UtcOffset> {
     UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32).ok()
 }
 
+/// Converts a 24-hour hour into a 12-hour one and its meridiem.
+///
+/// Midnight and noon are the cases worth being careful about: hour 0 is 12 AM
+/// and hour 12 is 12 PM, both of which a naive `% 12` turns into "0".
+fn twelve_hour(hour24: u8) -> (u8, &'static str) {
+    let meridiem = if hour24 < 12 { "AM" } else { "PM" };
+    let hour = match hour24 % 12 {
+        0 => 12,
+        other => other,
+    };
+    (hour, meridiem)
+}
+
 /// The zone's current abbreviation (`EDT`, `GMT`, `AEST`), for showing in
 /// Settings that daylight saving is being handled rather than ignored.
 ///
@@ -1931,7 +1944,9 @@ fn main() {
             let now = OffsetDateTime::now_utc().to_offset(offset);
 
             if let Some(app) = clock_weak.upgrade() {
-                app.set_clock_text(format!("{:02}:{:02}", now.hour(), now.minute()).into());
+                let (hour12, meridiem) = twelve_hour(now.hour());
+                app.set_clock_text(format!("{}:{:02}", hour12, now.minute()).into());
+                app.set_clock_meridiem(meridiem.into());
                 app.set_date_text(format!("{}", now.date()).into());
                 // Deliberately not touching `month_label` here -- it tracks
                 // `reference_date` (whatever's being navigated/viewed), not
@@ -5814,6 +5829,18 @@ mod tests {
 
     /// Art is fetched by cover id, so a row without one must carry None rather
     /// than falling back to some other id and showing the wrong cover.
+    /// Midnight and noon are the cases a naive `% 12` gets wrong, turning both
+    /// into "0:xx".
+    #[test]
+    fn the_clock_reads_as_twelve_hour_with_a_meridiem() {
+        assert_eq!(twelve_hour(0), (12, "AM"), "midnight is 12 AM, not 0");
+        assert_eq!(twelve_hour(12), (12, "PM"), "noon is 12 PM, not 0");
+        assert_eq!(twelve_hour(1), (1, "AM"));
+        assert_eq!(twelve_hour(11), (11, "AM"));
+        assert_eq!(twelve_hour(13), (1, "PM"));
+        assert_eq!(twelve_hour(23), (11, "PM"));
+    }
+
     #[test]
     fn rows_carry_the_cover_id_their_art_should_come_from() {
         let mut with_art = album("al-1", "Dummy", Some("Portishead"), None);
