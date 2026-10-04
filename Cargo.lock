@@ -911,7 +911,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "dashboard-config"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -1649,7 +1649,7 @@ checksum = "b40ca9252762c466af32d0b1002e91e4e1bc5398f77455e55474deb466355ff5"
 
 [[package]]
 name = "ha-client"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "futures-util",
  "reqwest",
@@ -4611,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "skylight-ha"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dashboard-config",
  "ha-client",
@@ -5521,7 +5521,7 @@ dependencies = [
 
 [[package]]
 name = "ui"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "fontique",
  "slint",
