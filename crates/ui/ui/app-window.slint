@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Sidebar, Page } from "sidebar.slint";
-import { TopBar, MemberChipData } from "top-bar.slint";
+import { TopBar, MemberChipRow, MemberChipData } from "top-bar.slint";
 import { CalendarCard, CalendarDayData, CalendarEventDot } from "calendar-card.slint";
 import { CalendarViewSwitcher, CalendarViewMode } from "calendar-view-switcher.slint";
 import { TimeGridView, WeekDayColumnData, WeekEventData, AllDayBannerData } from "time-grid-view.slint";
@@ -411,13 +411,6 @@ export component AppWindow inherits Window {
                     // the rest moved to the Weather tab.
                     weather-temp-now: root.weather-temp-now;
                     weather-temp-range: root.weather-temp-range;
-                    members: root.members;
-                    member-visible: root.member-visible;
-                    member-toggled(idx) => {
-                        if idx >= 0 && idx < root.member-visible.length {
-                            root.member-visible[idx] = !root.member-visible[idx];
-                        }
-                    }
                 }
 
                 if root.current-page == Page.Calendar: VerticalLayout {
@@ -465,7 +458,19 @@ export component AppWindow inherits Window {
                             color: Theme.text-primary;
                             vertical-alignment: center;
                         }
-                        Rectangle { horizontal-stretch: 1; }
+                        // Centred between the date and the view switcher. These
+                        // only affect the calendar, which is why they're no
+                        // longer in the header on every page.
+                        MemberChipRow {
+                            horizontal-stretch: 1;
+                            members: root.members;
+                            member-visible: root.member-visible;
+                            member-toggled(idx) => {
+                                if idx >= 0 && idx < root.member-visible.length {
+                                    root.member-visible[idx] = !root.member-visible[idx];
+                                }
+                            }
+                        }
                         CalendarViewSwitcher {
                             mode: root.current-calendar-mode;
                             mode-selected(m) => { root.current-calendar-mode = m; }

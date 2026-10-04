@@ -179,8 +179,18 @@ pub fn credentials_path() -> PathBuf {
 }
 
 pub fn load_credentials() -> Option<Credentials> {
-    let path = credentials_path();
-    let raw = std::fs::read_to_string(&path).ok()?;
+    load_credentials_at(&credentials_path())
+}
+
+/// Reads credentials from an explicit path.
+///
+/// Separate from [`load_credentials`] so tests can point at a scratch file by
+/// argument. They must *not* do it by setting the env var: `set_var` is
+/// unsound once the process is multithreaded, which a parallel test runner
+/// very much is -- the same hazard that made the timezone feature restart
+/// rather than call `setenv` (see `timezone.rs`).
+pub fn load_credentials_at(path: &std::path::Path) -> Option<Credentials> {
+    let raw = std::fs::read_to_string(path).ok()?;
     match serde_json::from_str(&raw) {
         Ok(credentials) => Some(credentials),
         Err(err) => {
@@ -195,7 +205,10 @@ pub fn load_credentials() -> Option<Credentials> {
 /// Temp-then-rename so a crash mid-write can't leave a half-file that would
 /// then be silently ignored on next boot.
 pub fn save_credentials(credentials: &Credentials) -> io::Result<()> {
-    let path = credentials_path();
+    save_credentials_at(&credentials_path(), credentials)
+}
+
+pub fn save_credentials_at(path: &std::path::Path, credentials: &Credentials) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -203,11 +216,15 @@ pub fn save_credentials(credentials: &Credentials) -> io::Result<()> {
     let body = serde_json::to_string_pretty(credentials)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     std::fs::write(&staging, body)?;
-    std::fs::rename(&staging, &path)
+    std::fs::rename(&staging, path)
 }
 
 pub fn forget_credentials() -> io::Result<()> {
-    match std::fs::remove_file(credentials_path()) {
+    forget_credentials_at(&credentials_path())
+}
+
+pub fn forget_credentials_at(path: &std::path::Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
         other => other,
     }
@@ -761,27 +778,28 @@ mod tests {
         assert_eq!(cover.rgba[3], 255, "opaque");
     }
 
+    /// Uses the `_at` entry points rather than pointing the env var at a
+    /// scratch file: `set_var` mutates process-global state and is unsound once
+    /// other threads exist, which under a parallel test runner they always do.
+    /// An earlier version of this test did exactly that and made an unrelated
+    /// updater test fail intermittently.
     #[test]
     fn credentials_round_trip_through_disk() {
         let path = std::env::temp_dir()
             .join(format!("skylight-music-test-{}.secret", std::process::id()));
-        // SAFETY-ish: single-threaded test process section; this mirrors how the
-        // other feature tests point at scratch paths.
-        std::env::set_var("SKYLIGHT_MUSIC_CREDENTIALS", &path);
-        let _ = forget_credentials();
+        let _ = forget_credentials_at(&path);
 
-        assert!(load_credentials().is_none(), "nothing saved yet");
+        assert!(load_credentials_at(&path).is_none(), "nothing saved yet");
         let mut credentials = credentials();
         credentials.player_entity_id = Some("media_player.kitchen".into());
-        save_credentials(&credentials).unwrap();
-        assert_eq!(load_credentials().as_ref(), Some(&credentials));
+        save_credentials_at(&path, &credentials).unwrap();
+        assert_eq!(load_credentials_at(&path).as_ref(), Some(&credentials));
 
-        forget_credentials().unwrap();
-        assert!(load_credentials().is_none());
+        forget_credentials_at(&path).unwrap();
+        assert!(load_credentials_at(&path).is_none());
         // Forgetting something already gone is not an error -- the UI calls this
         // to reset and shouldn't have to care.
-        forget_credentials().unwrap();
-        std::env::remove_var("SKYLIGHT_MUSIC_CREDENTIALS");
+        forget_credentials_at(&path).unwrap();
     }
 
     #[test]

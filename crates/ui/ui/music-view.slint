@@ -703,12 +703,16 @@ export component MusicPage inherits Rectangle {
 
         // Heading + back.
         HorizontalLayout {
-            height: 30px;
-            spacing: 10px;
+            height: 44px;
+            spacing: 12px;
 
+            // Same size and shape as the now-playing view's back button: a
+            // bare chevron was a hard target to hit on a touchscreen.
             if root.can-go-back: Rectangle {
-                width: 38px;
-                border-radius: 8px;
+                width: 110px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
                 background: back-touch.pressed ? Theme.surface-alt : transparent;
 
                 back-touch := TouchArea {
@@ -718,8 +722,9 @@ export component MusicPage inherits Rectangle {
                 }
 
                 Text {
-                    text: "‹";
-                    font-size: 22px;
+                    text: "‹  Back";
+                    font-size: 14px;
+                    font-weight: 600;
                     color: Theme.text-primary;
                     horizontal-alignment: center;
                     vertical-alignment: center;

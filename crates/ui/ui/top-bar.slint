@@ -84,6 +84,28 @@ component WeatherStatLine inherits Rectangle {
 // Everything else the weather entity reports -- condition, humidity, pressure,
 // wind, precipitation, freshness -- moved to the Weather tab, which has room
 // for it and doesn't crowd the header.
+// The family filter chips.
+//
+// Lives on the Calendar page rather than the header: toggling a member only
+// affects the calendar, so showing it above Tasks, Music, Weather and Settings
+// was offering a control that did nothing there.
+export component MemberChipRow inherits Rectangle {
+    in property <[MemberChipData]> members;
+    in property <[bool]> member-visible;
+    callback member-toggled(int);
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+
+        for member[idx] in root.members: MemberChip {
+            member: member;
+            visible-on-calendar: idx < root.member-visible.length && root.member-visible[idx];
+            tapped => { root.member-toggled(idx); }
+        }
+    }
+}
+
 export component WeatherWidget inherits Rectangle {
     in property <string> temp-now: "--°";
     in property <string> temp-range;
@@ -126,82 +148,51 @@ export component TopBar inherits Rectangle {
     // Split from the clock so AM/PM can sit beside it at its own size rather
     // than being baked into one string.
     in property <string> clock-meridiem: "";
-    in property <[MemberChipData]> members;
-    in property <[bool]> member-visible;
-    // Tapping a member's name toggles them on/off the calendar below.
-    callback member-toggled(int);
-
     background: transparent;
 
-    VerticalLayout {
-        spacing: 10px;
+    HorizontalLayout {
+        spacing: Theme.gap;
 
-        HorizontalLayout {
-            spacing: Theme.gap;
-
-            Text {
-                text: family-name;
-                font-size: 22px;
-                font-weight: 700;
-                color: Theme.text-primary;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-                overflow: elide;
-            }
-
-            WeatherWidget {
-                temp-now: root.weather-temp-now;
-                temp-range: root.weather-temp-range;
-            }
-
-            VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Text {
-                    text: date-text;
-                    font-size: 12px;
-                    color: Theme.text-muted;
-                    horizontal-alignment: right;
-                }
-                HorizontalLayout {
-                    spacing: 6px;
-                    alignment: end;
-
-                    Text {
-                        text: clock-text;
-                        font-size: 36px;
-                        font-weight: 700;
-                        color: Theme.text-primary;
-                        vertical-alignment: center;
-                    }
-                    Text {
-                        text: root.clock-meridiem;
-                        font-size: 26px;
-                        font-weight: 700;
-                        color: Theme.text-muted;
-                        vertical-alignment: center;
-                    }
-                }
-            }
+        Text {
+            text: family-name;
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
         }
 
-        // Scrollable rather than a plain HorizontalLayout: with a large or
-        // auto-discovered family (see discover_family in main.rs -- a real
-        // household ended up with 10 entries) a fixed-width row of chips
-        // can overflow the window, same overflow bug the event-creation
-        // form's member picker had.
-        Flickable {
-            height: 30px;
-            HorizontalLayout {
-                height: 30px;
-                spacing: 8px;
-                alignment: start;
-                for member[idx] in members: MemberChip {
-                    member: member;
-                    visible-on-calendar: idx < root.member-visible.length && root.member-visible[idx];
-                    tapped => { root.member-toggled(idx); }
-                }
-            }
+        WeatherWidget {
+            temp-now: root.weather-temp-now;
+            temp-range: root.weather-temp-range;
+        }
+
+        // Temperature, time and date all on one line, vertically
+        // centred against each other rather than the date sitting above
+        // the clock.
+        Text {
+            text: clock-text;
+            font-size: 36px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: root.clock-meridiem;
+            font-size: 26px;
+            font-weight: 700;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        Text {
+            text: date-text;
+            font-size: 26px;
+            color: Theme.text-muted;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
         }
     }
 }

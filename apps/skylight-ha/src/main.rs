@@ -1587,6 +1587,23 @@ fn main() {
                     if !picture_changed {
                         continue;
                     }
+
+                    // Artwork is fetched on its own task, never inline.
+                    //
+                    // Doing it here starved the whole feature: HA republishes a
+                    // playing entity's attributes constantly, and awaiting an
+                    // HTTP fetch inside the loop meant we stopped reading the
+                    // broadcast long enough to fall behind and be dropped --
+                    // so the bar froze on whatever was playing when the first
+                    // fetch started, play/pause stopped tracking, and the art
+                    // never arrived either. A generation counter keeps the
+                    // newest result and discards any slow one that lands after
+                    // the track has already moved on.
+                    let generation = {
+                        let mut music = music_state.lock().unwrap();
+                        music.art_generation = music.art_generation.wrapping_add(1);
+                        music.art_generation
+                    };
                     let Some(picture) = now.picture.clone() else {
                         let app_weak = app_weak.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -1606,15 +1623,35 @@ fn main() {
                         Some(token) => request.bearer_auth(token),
                         None => request,
                     };
-                    let fetched = async {
-                        let bytes = request.send().await.ok()?.bytes().await.ok()?;
-                        music::decode_cover(&bytes).ok()
-                    }
-                    .await;
-                    if let Some(cover) = fetched {
-                        let app_weak = app_weak.clone();
+                    let app_weak = app_weak.clone();
+                    let music_state = music_state.clone();
+                    tokio::spawn(async move {
+                        let cover = match request.send().await {
+                            Ok(response) => match response.bytes().await {
+                                Ok(bytes) => match music::decode_cover(&bytes) {
+                                    Ok(cover) => Some(cover),
+                                    Err(err) => {
+                                        tracing::warn!(%err, %url, "now-playing art did not decode");
+                                        None
+                                    }
+                                },
+                                Err(err) => {
+                                    tracing::warn!(%err, %url, "could not read now-playing art");
+                                    None
+                                }
+                            },
+                            Err(err) => {
+                                tracing::warn!(%err, %url, "could not fetch now-playing art");
+                                None
+                            }
+                        };
+                        let Some(cover) = cover else { return };
                         let _ = slint::invoke_from_event_loop(move || {
                             let Some(app) = app_weak.upgrade() else { return };
+                            // Stale art for a track that has already changed.
+                            if music_state.lock().unwrap().art_generation != generation {
+                                return;
+                            }
                             let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
                                 cover.width,
                                 cover.height,
@@ -1622,7 +1659,7 @@ fn main() {
                             buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
                             app.set_music_now_playing_art(slint::Image::from_rgba8(buffer));
                         });
-                    }
+                    });
                 }
                 // The broadcast ended, which means the HA connection went
                 // away; wait for `run_ha_sync` to publish a new one.
@@ -2767,6 +2804,9 @@ struct MusicUi {
     /// Latest state of the target player, so the volume buttons have a level
     /// to add to and the artwork fetch knows when the picture changed.
     now_playing: NowPlaying,
+    /// Bumped per artwork request, so a slow fetch landing after the track has
+    /// moved on doesn't overwrite the current cover.
+    art_generation: u64,
 }
 
 impl MusicUi {
