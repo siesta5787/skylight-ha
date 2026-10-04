@@ -205,8 +205,9 @@ export component AppWindow inherits Window {
     in property <bool> music-now-playing-active: false;
     in property <image> music-now-playing-art;
     in property <string> music-volume-label: "";
-    callback music-volume-up();
-    callback music-volume-down();
+    callback music-volume-pressed(int);
+    callback music-volume-released();
+    in-out property <bool> music-now-playing-view: false;
     in property <[string]> music-sections: [];
     in property <int> music-selected-section: 0;
     in property <string> music-heading: "";
@@ -558,8 +559,15 @@ export component AppWindow inherits Window {
                     now-playing-active: root.music-now-playing-active;
                     now-playing-art: root.music-now-playing-art;
                     volume-label: root.music-volume-label;
-                    volume-up => { root.music-volume-up(); }
-                    volume-down => { root.music-volume-down(); }
+                    volume-pressed(d) => { root.music-volume-pressed(d); }
+                    volume-released => { root.music-volume-released(); }
+                    now-playing-view: root.music-now-playing-view;
+                    open-now-playing => {
+                        if (root.music-player-configured) {
+                            root.music-now-playing-view = true;
+                        }
+                    }
+                    close-now-playing => { root.music-now-playing-view = false; }
                     sections: root.music-sections;
                     selected-section: root.music-selected-section;
                     heading: root.music-heading;

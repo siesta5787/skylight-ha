@@ -28,6 +28,12 @@ component AlbumCell inherits VerticalLayout {
     callback tapped();
 
     spacing: 6px;
+    // Every cell is the same width regardless of what's in it. Without these
+    // the cover's own pixel size becomes the cell's preferred width, so cells
+    // with art and cells without end up different sizes in the same row.
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    min-width: 0px;
 
     Rectangle {
         // Square, driven by whatever width the row's stretch gives it, so the
@@ -35,6 +41,8 @@ component AlbumCell inherits VerticalLayout {
         // parent.width: inside a Flickable that feeds back through the
         // viewport and Slint rejects it as a binding loop.
         height: self.width;
+        preferred-width: 0px;
+        min-width: 0px;
         border-radius: 8px;
         background: root.data.filler ? transparent : Theme.border;
         clip: true;
@@ -107,8 +115,8 @@ component TransportButton inherits Rectangle {
     in property <bool> prominent: false;
     callback tapped();
 
-    width: root.prominent ? 48px : 40px;
-    height: root.prominent ? 48px : 40px;
+    width: root.prominent ? 64px : 54px;
+    height: root.prominent ? 64px : 54px;
     border-radius: self.width / 2;
     background: root.prominent
         ? (touch.pressed ? Theme.accent.darker(0.15) : Theme.accent)
@@ -122,9 +130,50 @@ component TransportButton inherits Rectangle {
 
     Text {
         text: root.glyph;
-        font-size: root.prominent ? 17px : 15px;
+        font-size: root.prominent ? 23px : 20px;
         font-weight: 700;
         color: root.prominent ? white : Theme.text-primary;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// Volume stepper. A press steps once; holding repeats in bigger increments,
+// which is the difference between nudging a level and crossing the dial.
+//
+// Driven by pointer-event rather than `clicked`: `clicked` only fires on
+// release, so a press-and-hold would apply its step *after* the repeat had
+// already run, double-counting the gesture.
+component VolumeButton inherits Rectangle {
+    in property <string> glyph;
+    // +1 or -1.
+    in property <int> direction;
+    callback pressed(int);
+    callback released();
+
+    width: 54px;
+    height: 54px;
+    border-radius: 27px;
+    background: touch.pressed ? Theme.border : transparent;
+
+    touch := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(event) => {
+            if (event.kind == PointerEventKind.down) {
+                root.pressed(root.direction);
+            }
+            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                root.released();
+            }
+        }
+    }
+
+    Text {
+        text: root.glyph;
+        font-size: 24px;
+        font-weight: 700;
+        color: Theme.text-primary;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -236,6 +285,9 @@ export component MusicPage inherits Rectangle {
     // Empty when the player doesn't report a level; the controls still work,
     // they just step via volume_up/volume_down instead.
     in property <string> volume-label: "";
+    // Swaps the browse area for the full-size now-playing view. Stays inside
+    // the page, so the sidebar and header are untouched.
+    in property <bool> now-playing-view: false;
 
     in property <[string]> sections: [];
     in property <int> selected-section: 0;
@@ -269,8 +321,10 @@ export component MusicPage inherits Rectangle {
     callback play-pause();
     callback next-track();
     callback previous-track();
-    callback volume-up();
-    callback volume-down();
+    callback volume-pressed(int);
+    callback volume-released();
+    callback open-now-playing();
+    callback close-now-playing();
 
     background: Theme.surface;
     border-radius: Theme.radius;
@@ -330,14 +384,136 @@ export component MusicPage inherits Rectangle {
         }
     }
 
+    // --- Now playing, full size -----------------------------------------
+    if root.configured && root.now-playing-view: VerticalLayout {
+        padding: 18px;
+        spacing: 14px;
+
+        HorizontalLayout {
+            height: 44px;
+            spacing: 10px;
+
+            Rectangle {
+                width: 150px;
+                border-radius: 10px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: back-np-touch.pressed ? Theme.surface-alt : transparent;
+
+                back-np-touch := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => { root.close-now-playing(); }
+                }
+
+                Text {
+                    text: "‹  Back to music";
+                    font-size: 14px;
+                    font-weight: 600;
+                    color: Theme.text-primary;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+
+        // The cover, as large as the remaining space allows and still square.
+        Rectangle {
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+
+            Rectangle {
+                // Square: whichever of the available width/height is smaller.
+                width: min(parent.width, parent.height);
+                height: self.width;
+                x: (parent.width - self.width) / 2;
+                border-radius: 12px;
+                background: Theme.border;
+                clip: true;
+
+                Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.now-playing-art;
+                    image-fit: contain;
+                }
+            }
+        }
+
+        Text {
+            text: root.now-playing-title != "" ? root.now-playing-title : "Nothing playing";
+            font-size: 24px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+
+        Text {
+            text: root.now-playing-artist != ""
+                ? root.now-playing-artist + "  -  " + root.player-name
+                : root.player-name;
+            font-size: 15px;
+            color: Theme.text-muted;
+            horizontal-alignment: center;
+            overflow: elide;
+        }
+
+        HorizontalLayout {
+            height: 70px;
+            spacing: 14px;
+            alignment: center;
+
+            TransportButton {
+                glyph: "|<";
+                tapped => { root.previous-track(); }
+            }
+            TransportButton {
+                glyph: root.now-playing-active ? "||" : ">";
+                prominent: true;
+                tapped => { root.play-pause(); }
+            }
+            TransportButton {
+                glyph: ">|";
+                tapped => { root.next-track(); }
+            }
+
+            Rectangle { width: 28px; }
+
+            VolumeButton {
+                glyph: "-";
+                direction: -1;
+                pressed(d) => { root.volume-pressed(d); }
+                released => { root.volume-released(); }
+            }
+            Text {
+                text: root.volume-label;
+                font-size: 19px;
+                font-weight: 600;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+                width: 68px;
+            }
+            VolumeButton {
+                glyph: "+";
+                direction: 1;
+                pressed(d) => { root.volume-pressed(d); }
+                released => { root.volume-released(); }
+            }
+        }
+    }
+
     // --- Set up ---------------------------------------------------------
-    if root.configured: VerticalLayout {
+    if root.configured && !root.now-playing-view: VerticalLayout {
         padding: 18px;
         spacing: 12px;
 
         // Now playing / transport.
         Rectangle {
-            height: 72px;
+            height: 96px;
             border-radius: Theme.radius;
             background: Theme.surface-alt;
             border-width: 1px;
@@ -365,9 +541,21 @@ export component MusicPage inherits Rectangle {
                     }
                 }
 
+                // Tapping the text opens the full view; the transport buttons
+                // beside it keep their own targets.
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: bar-touch.pressed ? Theme.border : transparent;
+                    border-radius: 8px;
+
+                    bar-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.open-now-playing(); }
+                    }
+
                 VerticalLayout {
                     alignment: center;
-                    horizontal-stretch: 1;
                     spacing: 2px;
 
                     Text {
@@ -390,6 +578,7 @@ export component MusicPage inherits Rectangle {
                         color: Theme.text-muted;
                         overflow: elide;
                     }
+                }
                 }
 
                 if !root.player-configured: Rectangle {
@@ -432,25 +621,30 @@ export component MusicPage inherits Rectangle {
                         tapped => { root.next-track(); }
                     }
 
-                    Rectangle { width: 10px; }
+                    Rectangle { width: 12px; }
 
-                    TransportButton {
+                    VolumeButton {
                         glyph: "-";
-                        tapped => { root.volume-down(); }
+                        direction: -1;
+                        pressed(d) => { root.volume-pressed(d); }
+                        released => { root.volume-released(); }
                     }
                     // Shows the level when the player reports one; the buttons
                     // work either way.
                     Text {
                         text: root.volume-label;
-                        font-size: 11px;
-                        color: Theme.text-muted;
+                        font-size: 17px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
                         vertical-alignment: center;
                         horizontal-alignment: center;
-                        width: 34px;
+                        width: 62px;
                     }
-                    TransportButton {
+                    VolumeButton {
                         glyph: "+";
-                        tapped => { root.volume-up(); }
+                        direction: 1;
+                        pressed(d) => { root.volume-pressed(d); }
+                        released => { root.volume-released(); }
                     }
                 }
             }
@@ -551,7 +745,15 @@ export component MusicPage inherits Rectangle {
         }
 
         if root.grid-mode: Flickable {
+            // Without this the viewport takes the content's preferred width,
+            // which is what the rows are trying to derive their width *from* --
+            // so the grid sized itself to its covers and filled about half the
+            // screen. Pinning it to the Flickable's own width gives the rows a
+            // real width to divide up, and only scrolls vertically.
+            viewport-width: self.width;
+
             VerticalLayout {
+                width: parent.width;
                 spacing: 16px;
                 alignment: start;
 
@@ -561,15 +763,17 @@ export component MusicPage inherits Rectangle {
                     color: Theme.text-muted;
                 }
 
+                // No `alignment` here on purpose: an aligned layout hands every
+                // child its *preferred* size and ignores stretch, so cells with
+                // a decoded cover claimed its full pixel size while artless ones
+                // collapsed -- a ragged half-width grid. Unaligned, stretch
+                // divides the row evenly and every cell matches.
                 for grid-row[ridx] in root.grid-rows: HorizontalLayout {
                     spacing: 16px;
-                    alignment: start;
 
                     for cell[cidx] in grid-row.cells: AlbumCell {
-                        // Even share of the row. Short rows are padded with
-                        // filler cells so the last row's covers stay the same
-                        // size as every other row's.
-                        horizontal-stretch: 1;
+                        // Short rows are padded with filler cells so the last
+                        // row's covers stay the size of every other row's.
                         data: cell;
                         tapped => { root.cell-selected(ridx * root.grid-columns + cidx); }
                     }

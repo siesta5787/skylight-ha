@@ -1430,6 +1430,10 @@ fn main() {
                     };
 
                     app.set_music_message(format!("Playing {}...", tracks_head.title).into());
+                    // Starting something is the moment you want to see what's
+                    // playing, so go straight there; "Back to music" returns to
+                    // exactly the list you left.
+                    app.set_music_now_playing_view(true);
                     let live_client = live_client.clone();
                     let app_weak = app_weak.clone();
                     rt_handle.spawn(async move {
@@ -1478,20 +1482,38 @@ fn main() {
             music_transport(&rt_handle, &music_state, &live_client, "media_previous_track");
         });
     }
+    // Volume: one step per press, bigger steps while held. The repeat timer
+    // has to outlive the press handler, hence the shared slot.
+    let volume_repeat: Rc<RefCell<Option<slint::Timer>>> = Rc::new(RefCell::new(None));
     {
         let music_state = music_state.clone();
         let live_client = live_client.clone();
         let rt_handle = rt_handle.clone();
-        app.on_music_volume_up(move || {
-            music_volume(&rt_handle, &music_state, &live_client, 0.05);
+        let volume_repeat = volume_repeat.clone();
+        app.on_music_volume_pressed(move |direction| {
+            let sign = if direction >= 0 { 1.0 } else { -1.0 };
+            // One nudge for the press itself, whether or not a hold follows.
+            music_volume(&rt_handle, &music_state, &live_client, sign * VOLUME_STEP);
+
+            let timer = slint::Timer::default();
+            let music_state = music_state.clone();
+            let live_client = live_client.clone();
+            let rt_handle = rt_handle.clone();
+            timer.start(
+                slint::TimerMode::Repeated,
+                VOLUME_REPEAT_INTERVAL,
+                move || {
+                    music_volume(&rt_handle, &music_state, &live_client, sign * VOLUME_HELD_STEP);
+                },
+            );
+            *volume_repeat.borrow_mut() = Some(timer);
         });
     }
     {
-        let music_state = music_state.clone();
-        let live_client = live_client.clone();
-        let rt_handle = rt_handle.clone();
-        app.on_music_volume_down(move || {
-            music_volume(&rt_handle, &music_state, &live_client, -0.05);
+        let volume_repeat = volume_repeat.clone();
+        app.on_music_volume_released(move || {
+            // Dropping the timer stops it.
+            volume_repeat.borrow_mut().take();
         });
     }
 
@@ -2548,6 +2570,14 @@ fn now_playing_art_url(base_url: &str, picture: &str) -> String {
         format!("{}/{}", base_url.trim_end_matches('/'), picture.trim_start_matches('/'))
     }
 }
+
+/// One press of the volume buttons.
+const VOLUME_STEP: f32 = 0.01;
+/// Each repeat while the button is held. Deliberately coarser: holding is how
+/// you cross the dial, tapping is how you fine-tune.
+const VOLUME_HELD_STEP: f32 = 0.05;
+/// Slow enough to be controllable on a touchscreen rather than racing to 100%.
+const VOLUME_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// Nudges a player's volume.
 ///
