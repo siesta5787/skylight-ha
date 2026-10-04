@@ -114,6 +114,15 @@ impl Credentials {
         url
     }
 
+    /// Album art, already scaled by the server.
+    ///
+    /// Asking Subsonic for the size we want means the Pi downloads and decodes
+    /// a thumbnail rather than a full-resolution cover -- on a Zero 2 W that
+    /// difference is the whole feature being usable or not.
+    pub fn cover_art_url(&self, cover_art_id: &str, size: u32) -> String {
+        self.endpoint("getCoverArt", &[("id", cover_art_id), ("size", &size.to_string())])
+    }
+
     /// The URL handed to `media_player.play_media`.
     ///
     /// Deliberately a plain authenticated GET: every player that can fetch a
@@ -432,6 +441,34 @@ pub fn parse_search(response: &serde_json::Value) -> Result<SearchResults> {
     })
 }
 
+/// Decoded album art, in a form that can cross a thread boundary.
+///
+/// Raw RGBA rather than a `slint::Image` because that type isn't `Send`: the
+/// download and decode happen on a worker, and only the final cheap wrap into
+/// an image happens on the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverArt {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Decodes fetched art bytes.
+///
+/// Split from the fetch so the awkward part -- "is this actually an image?" --
+/// is testable without a server. Servers have been known to answer with an
+/// HTML error page and a 200, which must not be mistaken for a cover.
+pub fn decode_cover(bytes: &[u8]) -> Result<CoverArt> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|err| Error::Malformed(format!("cover art is not a readable image: {err}")))?
+        .to_rgba8();
+    Ok(CoverArt {
+        width: decoded.width(),
+        height: decoded.height(),
+        rgba: decoded.into_raw(),
+    })
+}
+
 // --- The client ----------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -511,6 +548,21 @@ impl Client {
     pub async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
         let response = self.get("getPlaylist", &[("id", playlist_id)]).await?;
         parse_playlist_tracks(&response)
+    }
+
+    /// Fetches and decodes one cover at the given pixel size.
+    pub async fn cover_art(&self, cover_art_id: &str, size: u32) -> Result<CoverArt> {
+        let url = self.credentials.cover_art_url(cover_art_id, size);
+        let bytes = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(Error::Unreachable)?
+            .bytes()
+            .await
+            .map_err(Error::Unreachable)?;
+        decode_cover(&bytes)
     }
 
     pub async fn search(&self, query: &str) -> Result<SearchResults> {
@@ -676,6 +728,37 @@ mod tests {
         assert_eq!(results.artists[0].name, "Portishead");
         assert_eq!(results.albums[0].name, "Dummy");
         assert_eq!(results.tracks[0].duration_label(), "5:02");
+    }
+
+    #[test]
+    fn cover_art_is_requested_at_the_size_we_intend_to_draw() {
+        let url = credentials().cover_art_url("al-1", 128);
+        assert!(url.contains("/rest/getCoverArt?"));
+        assert!(url.contains("id=al-1") && url.contains("size=128"));
+    }
+
+    /// A server answering an error page with a 200 must not be mistaken for a
+    /// cover -- that would put garbage pixels on a wall display.
+    #[test]
+    fn cover_art_that_is_not_an_image_is_rejected() {
+        assert!(matches!(decode_cover(b"<html>not found</html>"), Err(Error::Malformed(_))));
+        assert!(matches!(decode_cover(&[]), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn a_real_png_decodes_to_rgba() {
+        // A 1x1 opaque red PNG, byte-for-byte.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+            0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let cover = decode_cover(png).expect("a valid PNG should decode");
+        assert_eq!((cover.width, cover.height), (1, 1));
+        assert_eq!(cover.rgba.len(), 4, "one pixel, four channels");
+        assert_eq!(cover.rgba[3], 255, "opaque");
     }
 
     #[test]

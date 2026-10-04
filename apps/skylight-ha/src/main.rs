@@ -1315,7 +1315,7 @@ fn main() {
             let mut state = music_state.lock().unwrap();
             *state = MusicUi::default();
             apply_music_chrome(&app, &state);
-            set_music_rows(&app, Vec::new());
+            set_music_rows(&app, &[]);
             app.set_music_message("".into());
         });
     }
@@ -2167,16 +2167,86 @@ enum MusicRowAction {
     SelectPlayer { entity_id: String, name: String },
 }
 
-fn music_row(title: &str, subtitle: &str, trailing: &str, playable: bool) -> MusicRowData {
-    MusicRowData {
-        title: title.into(),
-        subtitle: subtitle.into(),
-        trailing: trailing.into(),
+/// A row as the worker thread produces it.
+///
+/// Deliberately not `MusicRowData`: that carries a `slint::Image`, which is
+/// not `Send`, so it can only be built on the UI thread. Keeping the Slint
+/// type at the boundary is what lets the whole fetch/decode path run off the
+/// event loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MusicRowInfo {
+    title: String,
+    subtitle: String,
+    trailing: String,
+    playable: bool,
+    /// Subsonic cover-art id, when this row has art to show.
+    cover_id: Option<String>,
+}
+
+fn music_row(
+    title: &str,
+    subtitle: &str,
+    trailing: &str,
+    playable: bool,
+    cover_id: Option<String>,
+) -> MusicRowInfo {
+    MusicRowInfo {
+        title: title.to_string(),
+        subtitle: subtitle.to_string(),
+        trailing: trailing.to_string(),
         playable,
+        cover_id,
     }
 }
 
-fn album_rows(albums: &[music::Album]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+thread_local! {
+    /// Decoded covers, keyed by Subsonic cover-art id.
+    ///
+    /// Thread-local rather than shared state because `slint::Image` is not
+    /// `Send`; everything here is touched only from the event loop.
+    static COVER_CACHE: RefCell<BTreeMap<String, slint::Image>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Caps the cover cache. At 96px RGBA each cover is ~36KB, so this is a few
+/// MB -- worth bounding on a 512MB board with a library that could be any size.
+const COVER_CACHE_LIMIT: usize = 400;
+
+fn cache_cover(id: &str, cover: &music::CoverArt) {
+    let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(cover.width, cover.height);
+    buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
+    let image = slint::Image::from_rgba8(buffer);
+    COVER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // Wholesale clear rather than LRU bookkeeping: this only triggers on a
+        // very large browse, and the cost is re-fetching thumbnails.
+        if cache.len() >= COVER_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(id.to_string(), image);
+    });
+}
+
+/// Builds the Slint rows, pulling in whatever art has already been decoded.
+fn to_row_data(rows: &[MusicRowInfo]) -> Vec<MusicRowData> {
+    COVER_CACHE.with(|cache| {
+        let cache = cache.borrow();
+        rows.iter()
+            .map(|row| MusicRowData {
+                art: row
+                    .cover_id
+                    .as_ref()
+                    .and_then(|id| cache.get(id).cloned())
+                    .unwrap_or_default(),
+                title: row.title.as_str().into(),
+                subtitle: row.subtitle.as_str().into(),
+                trailing: row.trailing.as_str().into(),
+                playable: row.playable,
+            })
+            .collect()
+    })
+}
+
+fn album_rows(albums: &[music::Album]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     albums
         .iter()
         .map(|album| {
@@ -2187,7 +2257,7 @@ fn album_rows(albums: &[music::Album]) -> (Vec<MusicRowData>, Vec<MusicRowAction
                 (None, None) => String::new(),
             };
             (
-                music_row(&album.name, &subtitle, "", false),
+                music_row(&album.name, &subtitle, "", false, album.cover_art.clone()),
                 MusicRowAction::Open(MusicLevel::Album {
                     id: album.id.clone(),
                     name: album.name.clone(),
@@ -2197,7 +2267,7 @@ fn album_rows(albums: &[music::Album]) -> (Vec<MusicRowData>, Vec<MusicRowAction
         .unzip()
 }
 
-fn artist_rows(artists: &[music::Artist]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+fn artist_rows(artists: &[music::Artist]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     artists
         .iter()
         .map(|artist| {
@@ -2207,7 +2277,7 @@ fn artist_rows(artists: &[music::Artist]) -> (Vec<MusicRowData>, Vec<MusicRowAct
                 n => format!("{n} albums"),
             };
             (
-                music_row(&artist.name, "", &trailing, false),
+                music_row(&artist.name, "", &trailing, false, None),
                 MusicRowAction::Open(MusicLevel::Artist {
                     id: artist.id.clone(),
                     name: artist.name.clone(),
@@ -2217,7 +2287,7 @@ fn artist_rows(artists: &[music::Artist]) -> (Vec<MusicRowData>, Vec<MusicRowAct
         .unzip()
 }
 
-fn playlist_rows(playlists: &[music::Playlist]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+fn playlist_rows(playlists: &[music::Playlist]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     playlists
         .iter()
         .map(|playlist| {
@@ -2226,7 +2296,7 @@ fn playlist_rows(playlists: &[music::Playlist]) -> (Vec<MusicRowData>, Vec<Music
                 n => format!("{n} tracks"),
             };
             (
-                music_row(&playlist.name, "", &trailing, false),
+                music_row(&playlist.name, "", &trailing, false, None),
                 MusicRowAction::Open(MusicLevel::Playlist {
                     id: playlist.id.clone(),
                     name: playlist.name.clone(),
@@ -2236,7 +2306,7 @@ fn playlist_rows(playlists: &[music::Playlist]) -> (Vec<MusicRowData>, Vec<Music
         .unzip()
 }
 
-fn track_rows(tracks: &[music::Track]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+fn track_rows(tracks: &[music::Track]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     tracks
         .iter()
         .enumerate()
@@ -2247,6 +2317,7 @@ fn track_rows(tracks: &[music::Track]) -> (Vec<MusicRowData>, Vec<MusicRowAction
                     track.artist.as_deref().unwrap_or(""),
                     &track.duration_label(),
                     true,
+                    track.cover_art.clone(),
                 ),
                 MusicRowAction::PlayTrack(index),
             )
@@ -2256,7 +2327,7 @@ fn track_rows(tracks: &[music::Track]) -> (Vec<MusicRowData>, Vec<MusicRowAction
 
 /// Search returns three kinds at once; they're concatenated with the tracks
 /// last so the playable rows sit together at the bottom.
-fn search_rows(results: &music::SearchResults) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+fn search_rows(results: &music::SearchResults) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     let (mut rows, mut actions) = artist_rows(&results.artists);
     let (album_rows_, album_actions) = album_rows(&results.albums);
     rows.extend(album_rows_);
@@ -2273,7 +2344,7 @@ fn search_rows(results: &music::SearchResults) -> (Vec<MusicRowData>, Vec<MusicR
 /// guess which ones accept a URL: that varies by integration and by firmware,
 /// and a wrong guess hiding the right speaker is worse than listing one that
 /// turns out not to work.
-fn player_rows(states: &[EntityState]) -> (Vec<MusicRowData>, Vec<MusicRowAction>) {
+fn player_rows(states: &[EntityState]) -> (Vec<MusicRowInfo>, Vec<MusicRowAction>) {
     let mut players: Vec<(String, String)> = states
         .iter()
         .filter(|state| state.entity_id.starts_with("media_player."))
@@ -2293,7 +2364,7 @@ fn player_rows(states: &[EntityState]) -> (Vec<MusicRowData>, Vec<MusicRowAction
         .into_iter()
         .map(|(entity_id, name)| {
             (
-                music_row(&name, &entity_id, "", false),
+                music_row(&name, &entity_id, "", false, None),
                 MusicRowAction::SelectPlayer { entity_id, name },
             )
         })
@@ -2310,7 +2381,7 @@ fn now_playing_from(state: &EntityState) -> (String, String, bool) {
 
 /// One page of a level's contents.
 struct MusicPageLoad {
-    rows: Vec<MusicRowData>,
+    rows: Vec<MusicRowInfo>,
     actions: Vec<MusicRowAction>,
     tracks: Vec<music::Track>,
     /// Whether a further page might exist. Only albums page.
@@ -2319,7 +2390,7 @@ struct MusicPageLoad {
 
 impl MusicPageLoad {
     fn complete(
-        rows: Vec<MusicRowData>,
+        rows: Vec<MusicRowInfo>,
         actions: Vec<MusicRowAction>,
         tracks: Vec<music::Track>,
     ) -> Self {
@@ -2424,10 +2495,16 @@ struct MusicUi {
     player_name: String,
     /// Kept alongside the Slint model so "Load more" can append rather than
     /// re-fetching everything already on screen.
-    rows: Vec<MusicRowData>,
+    rows: Vec<MusicRowInfo>,
     /// Albums already loaded at the current level.
     album_offset: u32,
     can_load_more: bool,
+    /// Bumped on every navigation, so album art arriving for a level the user
+    /// has already left is discarded rather than painted over the new one.
+    generation: u64,
+    /// Cover ids already fetched. The images themselves live in the
+    /// thread-local cache, which this mirrors on the Send side.
+    art_fetched: std::collections::BTreeSet<String>,
 }
 
 impl MusicUi {
@@ -2456,8 +2533,8 @@ fn apply_music_chrome(app: &AppWindow, state: &MusicUi) {
     app.set_music_can_load_more(state.can_load_more);
 }
 
-fn set_music_rows(app: &AppWindow, rows: Vec<MusicRowData>) {
-    app.set_music_rows(slint::ModelRc::new(slint::VecModel::from(rows)));
+fn set_music_rows(app: &AppWindow, rows: &[MusicRowInfo]) {
+    app.set_music_rows(slint::ModelRc::new(slint::VecModel::from(to_row_data(rows))));
 }
 
 /// Navigates to `stack`, fetching whatever the new top level needs.
@@ -2481,6 +2558,7 @@ fn music_show(
     let app_weak = app_weak.clone();
     let music_state = music_state.clone();
     let live_client = live_client.clone();
+    let rt_for_art = rt_handle.clone();
     rt_handle.spawn(async move {
         let credentials = music_state.lock().unwrap().credentials.clone();
 
@@ -2524,9 +2602,11 @@ fn music_show(
                         // A fresh navigation always starts at the first page.
                         state.album_offset = 0;
                         state.can_load_more = page.more;
+                        state.generation = state.generation.wrapping_add(1);
                         apply_music_chrome(&app, &state);
-                        set_music_rows(&app, state.rows.clone());
+                        set_music_rows(&app, &state.rows);
                     }
+                    music_fetch_art(&rt_for_art, &app.as_weak(), &music_state);
                 }
                 Err(message) => {
                     tracing::warn!(%message, "music browse failed");
@@ -2617,6 +2697,77 @@ fn finish_music_setup(
     });
 }
 
+/// Thumbnail size requested from the server.
+///
+/// Rows draw art at 44px; 96 keeps it crisp without making the Pi decode
+/// full-resolution covers, which is the difference between this feature being
+/// pleasant and being unusable on a Zero 2 W.
+const COVER_PIXELS: u32 = 96;
+
+/// Fetches album art for the rows currently on screen, filling it in as it
+/// arrives.
+///
+/// Deliberately sequential. A hundred parallel fetches would hammer both the
+/// server and a single-core-ish board for no visible benefit -- covers appear
+/// progressively either way, and the list is usable from the first frame
+/// because every row already has its placeholder.
+fn music_fetch_art(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+) {
+    let (credentials, ids, generation) = {
+        let state = music_state.lock().unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let ids: Vec<String> = state
+            .rows
+            .iter()
+            .filter_map(|row| row.cover_id.clone())
+            // Albums in a list often share art ids, and anything already
+            // fetched is in the cache.
+            .filter(|id| !state.art_fetched.contains(id) && seen.insert(id.clone()))
+            .collect();
+        (state.credentials.clone(), ids, state.generation)
+    };
+    let (Some(credentials), false) = (credentials, ids.is_empty()) else { return };
+
+    let app_weak = app_weak.clone();
+    let music_state = music_state.clone();
+    rt_handle.spawn(async move {
+        let client = music::Client::new(credentials);
+        for id in ids {
+            // Stop as soon as the user has navigated elsewhere; their new
+            // level's art matters, this one's doesn't.
+            if music_state.lock().unwrap().generation != generation {
+                return;
+            }
+            let cover = match client.cover_art(&id, COVER_PIXELS).await {
+                Ok(cover) => cover,
+                Err(err) => {
+                    // One unreadable cover shouldn't stop the rest; the row
+                    // keeps its placeholder.
+                    tracing::debug!(%err, id, "could not load album art");
+                    continue;
+                }
+            };
+
+            let app_weak = app_weak.clone();
+            let music_state = music_state.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = app_weak.upgrade() else { return };
+                let mut state = music_state.lock().unwrap();
+                if state.generation != generation {
+                    return;
+                }
+                // Built here, not on the worker: slint::Image isn't Send.
+                cache_cover(&id, &cover);
+                state.art_fetched.insert(id);
+                set_music_rows(&app, &state.rows);
+            });
+        }
+    });
+}
+
 /// Appends the next page of albums to what's already on screen.
 ///
 /// Appends rather than re-fetching from zero, so "Load more" stays cheap no
@@ -2644,6 +2795,7 @@ fn music_load_more(
 
     let app_weak = app_weak.clone();
     let music_state = music_state.clone();
+    let rt_for_art = rt_handle.clone();
     rt_handle.spawn(async move {
         let client = music::Client::new(credentials);
         let loaded = load_music_level(&client, &level, next_offset)
@@ -2666,7 +2818,9 @@ fn music_load_more(
                     state.album_offset = next_offset;
                     state.can_load_more = page.more;
                     app.set_music_can_load_more(page.more);
-                    set_music_rows(&app, state.rows.clone());
+                    set_music_rows(&app, &state.rows);
+                    drop(state);
+                    music_fetch_art(&rt_for_art, &app.as_weak(), &music_state);
                 }
                 Err(message) => {
                     tracing::warn!(%message, "loading more albums failed");
@@ -5356,6 +5510,37 @@ mod tests {
             "https://music.example.com"
         );
         assert_eq!(normalise_music_server_url("http://x:4533"), "http://x:4533");
+    }
+
+    /// Art is fetched by cover id, so a row without one must carry None rather
+    /// than falling back to some other id and showing the wrong cover.
+    #[test]
+    fn rows_carry_the_cover_id_their_art_should_come_from() {
+        let mut with_art = album("al-1", "Dummy", Some("Portishead"), None);
+        with_art.cover_art = Some("cover-al-1".into());
+        let (rows, _) = album_rows(&[with_art, album("al-2", "No Art", None, None)]);
+        assert_eq!(rows[0].cover_id.as_deref(), Some("cover-al-1"));
+        assert_eq!(rows[1].cover_id, None, "no art id means no art, not a guess");
+
+        let mut tr = track("tr-1", "Roads", Some("Portishead"), Some(302));
+        tr.cover_art = Some("cover-tr-1".into());
+        let (rows, _) = track_rows(&[tr]);
+        assert_eq!(rows[0].cover_id.as_deref(), Some("cover-tr-1"));
+
+        // Artists and playlists have no art in this UI, and asking for it with
+        // a borrowed id would show something misleading.
+        let (rows, _) = artist_rows(&[music::Artist {
+            id: "ar-1".into(),
+            name: "Portishead".into(),
+            album_count: 3,
+        }]);
+        assert_eq!(rows[0].cover_id, None);
+        let (rows, _) = playlist_rows(&[music::Playlist {
+            id: "pl-1".into(),
+            name: "Dinner".into(),
+            song_count: 4,
+        }]);
+        assert_eq!(rows[0].cover_id, None);
     }
 
     /// Albums carry their sort, so switching order is a navigation like any

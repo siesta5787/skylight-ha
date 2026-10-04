@@ -27,6 +27,11 @@ sha2 = "0.10"
 # MD5 is not a security choice here -- the Subsonic API specifies it for its
 # token auth (t = md5(password + salt)), so interoperating means using it.
 md-5 = "0.10"
+# Decoding album art. Already in the tree via Slint, so this mostly costs the
+# extra decoder features rather than a new compile unit. default-features off
+# deliberately: the full crate pulls in a dozen formats a music server will
+# never serve.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]
 lto = true

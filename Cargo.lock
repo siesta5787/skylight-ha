@@ -4615,6 +4615,7 @@ version = "0.5.0"
 dependencies = [
  "dashboard-config",
  "ha-client",
+ "image",
  "libc",
  "md-5",
  "reqwest",

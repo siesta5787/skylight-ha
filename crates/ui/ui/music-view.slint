@@ -1,6 +1,9 @@
 import { Theme } from "theme.slint";
 
 export struct MusicRowData {
+    // Album art, filled in asynchronously after the row first appears -- empty
+    // until it arrives, which is why the row draws a placeholder behind it.
+    art: image,
     title: string,
     subtitle: string,
     // Right-hand detail: a track's duration, or an album count.
@@ -86,6 +89,25 @@ component MusicRow inherits Rectangle {
         padding-left: 14px;
         padding-right: 14px;
         spacing: 12px;
+
+        // Fixed-size art well, always present: the artwork arrives after the
+        // row does, and a slot that appears later would make the whole list
+        // jump as covers load in.
+        Rectangle {
+            width: 44px;
+            height: 44px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 6px;
+            background: Theme.border;
+            clip: true;
+
+            Image {
+                width: 100%;
+                height: 100%;
+                source: root.data.art;
+                image-fit: cover;
+            }
+        }
 
         VerticalLayout {
             alignment: center;
