@@ -208,6 +208,15 @@ export component AppWindow inherits Window {
     in property <string> music-heading: "";
     in property <bool> music-can-go-back: false;
     in property <[MusicRowData]> music-rows: [];
+    in property <bool> music-sorts-visible: false;
+    in property <[string]> music-sorts: [];
+    in property <int> music-selected-sort: 0;
+    in property <bool> music-can-load-more: false;
+    callback music-sort-selected(int);
+    callback music-load-more();
+    // Fired when the Music tab is opened, so the library refreshes instead of
+    // showing whatever was loaded at app startup.
+    callback music-tab-opened();
     callback music-setup-requested();
     callback music-forget-requested();
     callback music-section-selected(int);
@@ -365,6 +374,12 @@ export component AppWindow inherits Window {
                     root.current-page = p;
                     if p != Page.Dashboard && p != Page.Settings {
                         root.pin-unlocked = false;
+                    }
+                    // Opening the tab is exactly when the library should be
+                    // current; without this it showed whatever was fetched at
+                    // app startup, so music added since never appeared.
+                    if p == Page.Music {
+                        root.music-tab-opened();
                     }
                 }
             }
@@ -539,6 +554,12 @@ export component AppWindow inherits Window {
                     heading: root.music-heading;
                     can-go-back: root.music-can-go-back;
                     rows: root.music-rows;
+                    sorts-visible: root.music-sorts-visible;
+                    sorts: root.music-sorts;
+                    selected-sort: root.music-selected-sort;
+                    can-load-more: root.music-can-load-more;
+                    sort-selected(i) => { root.music-sort-selected(i); }
+                    load-more => { root.music-load-more(); }
                     setup-requested => { root.music-setup-requested(); }
                     forget-requested => { root.music-forget-requested(); }
                     section-selected(i) => { root.music-section-selected(i); }

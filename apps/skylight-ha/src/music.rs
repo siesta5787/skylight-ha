@@ -266,24 +266,68 @@ pub struct Playlist {
     pub song_count: u32,
 }
 
-/// How the album list is ordered.
-///
-/// Subsonic's `getAlbumList2` supports several (`recent`, `frequent`,
-/// `random`, `alphabeticalByName`); only the one the UI offers is modelled, so
-/// there's no dead surface. Adding a sort picker means adding variants here.
+/// How the album list is ordered -- the orders `getAlbumList2` defines that
+/// are worth offering on a wall display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlbumSort {
-    /// Recently added, which is the useful default for a wall display.
+    /// Recently added. The default: it's what "anything new?" means.
     Newest,
+    Alphabetical,
+    Frequent,
+    Recent,
+    Random,
 }
 
 impl AlbumSort {
+    pub const ALL: [AlbumSort; 5] = [
+        AlbumSort::Newest,
+        AlbumSort::Alphabetical,
+        AlbumSort::Frequent,
+        AlbumSort::Recent,
+        AlbumSort::Random,
+    ];
+
+    /// Subsonic's `getAlbumList2` type parameter.
     pub fn as_type(self) -> &'static str {
         match self {
             AlbumSort::Newest => "newest",
+            AlbumSort::Alphabetical => "alphabeticalByName",
+            AlbumSort::Frequent => "frequent",
+            AlbumSort::Recent => "recent",
+            AlbumSort::Random => "random",
         }
     }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AlbumSort::Newest => "Newest",
+            AlbumSort::Alphabetical => "A-Z",
+            AlbumSort::Frequent => "Most played",
+            AlbumSort::Recent => "Recently played",
+            AlbumSort::Random => "Random",
+        }
+    }
+
+    pub fn from_index(index: usize) -> AlbumSort {
+        Self::ALL.get(index).copied().unwrap_or(AlbumSort::Newest)
+    }
+
+    pub fn index(self) -> i32 {
+        Self::ALL.iter().position(|s| *s == self).unwrap_or(0) as i32
+    }
+
+    /// `random` returns a fresh shuffle per request, so paging it would just
+    /// show overlapping random picks rather than "the next page".
+    pub fn is_pageable(self) -> bool {
+        !matches!(self, AlbumSort::Random)
+    }
 }
+
+/// How many albums a page holds.
+///
+/// Subsonic caps `getAlbumList2` at 500, but smaller pages keep each request
+/// quick and the list responsive on a Pi Zero 2 W.
+pub const ALBUM_PAGE_SIZE: u32 = 100;
 
 // --- Response envelope ---------------------------------------------------
 
@@ -429,9 +473,17 @@ impl Client {
         self.get("ping", &[]).await.map(|_| ())
     }
 
-    pub async fn albums(&self, sort: AlbumSort, size: u32) -> Result<Vec<Album>> {
+    /// One page of albums. `offset` is in albums, not pages.
+    pub async fn albums(&self, sort: AlbumSort, offset: u32) -> Result<Vec<Album>> {
         let response = self
-            .get("getAlbumList2", &[("type", sort.as_type()), ("size", &size.to_string())])
+            .get(
+                "getAlbumList2",
+                &[
+                    ("type", sort.as_type()),
+                    ("size", &ALBUM_PAGE_SIZE.to_string()),
+                    ("offset", &offset.to_string()),
+                ],
+            )
             .await?;
         parse_albums(&response)
     }
@@ -650,7 +702,28 @@ mod tests {
     }
 
     #[test]
-    fn the_album_sort_maps_to_the_type_subsonic_expects() {
+    fn album_sorts_map_to_the_types_subsonic_expects() {
         assert_eq!(AlbumSort::Newest.as_type(), "newest");
+        assert_eq!(AlbumSort::Alphabetical.as_type(), "alphabeticalByName");
+        assert_eq!(AlbumSort::Frequent.as_type(), "frequent");
+    }
+
+    #[test]
+    fn sorts_round_trip_through_their_ui_index() {
+        for sort in AlbumSort::ALL {
+            assert_eq!(AlbumSort::from_index(sort.index() as usize), sort);
+            assert!(!sort.label().is_empty());
+        }
+        // A stray index from the UI must not panic.
+        assert_eq!(AlbumSort::from_index(99), AlbumSort::Newest);
+    }
+
+    /// `random` reshuffles per request, so "page 2" would just be more random
+    /// albums overlapping page 1 -- offering Load more there would be a lie.
+    #[test]
+    fn random_is_not_pageable_but_the_rest_are() {
+        assert!(!AlbumSort::Random.is_pageable());
+        assert!(AlbumSort::Newest.is_pageable());
+        assert!(AlbumSort::Alphabetical.is_pageable());
     }
 }

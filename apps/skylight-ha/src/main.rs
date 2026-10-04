@@ -1272,6 +1272,9 @@ fn main() {
     app.set_music_sections(slint::ModelRc::new(slint::VecModel::from(
         MUSIC_SECTIONS.iter().map(|s| SharedString::from(*s)).collect::<Vec<_>>(),
     )));
+    app.set_music_sorts(slint::ModelRc::new(slint::VecModel::from(
+        music::AlbumSort::ALL.iter().map(|s| SharedString::from(s.label())).collect::<Vec<_>>(),
+    )));
     {
         let state = music_state.lock().unwrap();
         apply_music_chrome(&app, &state);
@@ -1284,7 +1287,7 @@ fn main() {
             &app.as_weak(),
             &music_state,
             &live_client,
-            vec![MusicLevel::Albums],
+            vec![MusicLevel::Albums { sort: music::AlbumSort::Newest }],
         );
     }
 
@@ -1326,7 +1329,7 @@ fn main() {
         app.on_music_section_selected(move |index| {
             let Some(app) = app_weak.upgrade() else { return };
             let level = match index {
-                0 => MusicLevel::Albums,
+                0 => MusicLevel::Albums { sort: music::AlbumSort::Newest },
                 1 => MusicLevel::Artists,
                 2 => MusicLevel::Playlists,
                 _ => {
@@ -1403,7 +1406,7 @@ fn main() {
                         stack.pop();
                         stack
                     };
-                    let stack = if stack.is_empty() { vec![MusicLevel::Albums] } else { stack };
+                    let stack = if stack.is_empty() { vec![MusicLevel::Albums { sort: music::AlbumSort::Newest }] } else { stack };
                     music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
                 }
                 MusicRowAction::PlayTrack(start) => {
@@ -1510,6 +1513,46 @@ fn main() {
                 // away; wait for `run_ha_sync` to publish a new one.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
+        });
+    }
+
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_sort_selected(move |index| {
+            let sort = music::AlbumSort::from_index(index as usize);
+            music_show(
+                &rt_handle,
+                &app_weak,
+                &music_state,
+                &live_client,
+                vec![MusicLevel::Albums { sort }],
+            );
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let live_client = live_client.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_tab_opened(move || {
+            // Re-fetch whatever level is showing rather than resetting to the
+            // album list: returning to the tab shouldn't lose your place.
+            let stack = music_state.lock().unwrap().stack.clone();
+            if stack.is_empty() {
+                return;
+            }
+            music_show(&rt_handle, &app_weak, &music_state, &live_client, stack);
+        });
+    }
+    {
+        let music_state = music_state.clone();
+        let rt_handle = rt_handle.clone();
+        let app_weak = app.as_weak();
+        app.on_music_load_more(move || {
+            music_load_more(&rt_handle, &app_weak, &music_state);
         });
     }
 
@@ -2078,7 +2121,7 @@ const MUSIC_SECTIONS: [&str; 4] = ["Albums", "Artists", "Playlists", "Search"];
 /// to that artist, not to the album list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MusicLevel {
-    Albums,
+    Albums { sort: music::AlbumSort },
     Artists,
     Playlists,
     Album { id: String, name: String },
@@ -2092,7 +2135,7 @@ enum MusicLevel {
 impl MusicLevel {
     fn heading(&self) -> String {
         match self {
-            MusicLevel::Albums => "Albums".into(),
+            MusicLevel::Albums { .. } => "Albums".into(),
             MusicLevel::Artists => "Artists".into(),
             MusicLevel::Playlists => "Playlists".into(),
             MusicLevel::Album { name, .. } | MusicLevel::Artist { name, .. } => name.clone(),
@@ -2105,7 +2148,7 @@ impl MusicLevel {
     /// Which section chip to highlight, or -1 where none applies.
     fn section_index(&self) -> i32 {
         match self {
-            MusicLevel::Albums | MusicLevel::Album { .. } => 0,
+            MusicLevel::Albums { .. } | MusicLevel::Album { .. } => 0,
             MusicLevel::Artists | MusicLevel::Artist { .. } => 1,
             MusicLevel::Playlists | MusicLevel::Playlist { .. } => 2,
             MusicLevel::Search { .. } => 3,
@@ -2265,49 +2308,73 @@ fn now_playing_from(state: &EntityState) -> (String, String, bool) {
     (attribute("media_title"), attribute("media_artist"), state.state == "playing")
 }
 
+/// One page of a level's contents.
+struct MusicPageLoad {
+    rows: Vec<MusicRowData>,
+    actions: Vec<MusicRowAction>,
+    tracks: Vec<music::Track>,
+    /// Whether a further page might exist. Only albums page.
+    more: bool,
+}
+
+impl MusicPageLoad {
+    fn complete(
+        rows: Vec<MusicRowData>,
+        actions: Vec<MusicRowAction>,
+        tracks: Vec<music::Track>,
+    ) -> Self {
+        Self { rows, actions, tracks, more: false }
+    }
+}
+
 /// What a level's rows are, fetched from the server.
 async fn load_music_level(
     client: &music::Client,
     level: &MusicLevel,
-) -> music::Result<(Vec<MusicRowData>, Vec<MusicRowAction>, Vec<music::Track>)> {
+    offset: u32,
+) -> music::Result<MusicPageLoad> {
     Ok(match level {
-        MusicLevel::Albums => {
-            let albums = client.albums(music::AlbumSort::Newest, 100).await?;
+        MusicLevel::Albums { sort } => {
+            let albums = client.albums(*sort, offset).await?;
+            // A full page back means there is probably another; a short page
+            // means we've reached the end. One request, no count endpoint.
+            let more = sort.is_pageable()
+                && albums.len() as u32 == music::ALBUM_PAGE_SIZE;
             let (rows, actions) = album_rows(&albums);
-            (rows, actions, Vec::new())
+            MusicPageLoad { rows, actions, tracks: Vec::new(), more }
         }
         MusicLevel::Artists => {
             let artists = client.artists().await?;
             let (rows, actions) = artist_rows(&artists);
-            (rows, actions, Vec::new())
+            MusicPageLoad::complete(rows, actions, Vec::new())
         }
         MusicLevel::Playlists => {
             let playlists = client.playlists().await?;
             let (rows, actions) = playlist_rows(&playlists);
-            (rows, actions, Vec::new())
+            MusicPageLoad::complete(rows, actions, Vec::new())
         }
         MusicLevel::Album { id, .. } => {
             let tracks = client.album_tracks(id).await?;
             let (rows, actions) = track_rows(&tracks);
-            (rows, actions, tracks)
+            MusicPageLoad::complete(rows, actions, tracks)
         }
         MusicLevel::Artist { id, .. } => {
             let albums = client.artist_albums(id).await?;
             let (rows, actions) = album_rows(&albums);
-            (rows, actions, Vec::new())
+            MusicPageLoad::complete(rows, actions, Vec::new())
         }
         MusicLevel::Playlist { id, .. } => {
             let tracks = client.playlist_tracks(id).await?;
             let (rows, actions) = track_rows(&tracks);
-            (rows, actions, tracks)
+            MusicPageLoad::complete(rows, actions, tracks)
         }
         MusicLevel::Search { query } => {
             let results = client.search(query).await?;
             let (rows, actions) = search_rows(&results);
-            (rows, actions, results.tracks)
+            MusicPageLoad::complete(rows, actions, results.tracks)
         }
         // Filled from HA's entity list, not the music server.
-        MusicLevel::ChoosePlayer => (Vec::new(), Vec::new(), Vec::new()),
+        MusicLevel::ChoosePlayer => MusicPageLoad::complete(Vec::new(), Vec::new(), Vec::new()),
     })
 }
 
@@ -2355,6 +2422,12 @@ struct MusicUi {
     /// The track list behind the current level, for playback.
     tracks: Vec<music::Track>,
     player_name: String,
+    /// Kept alongside the Slint model so "Load more" can append rather than
+    /// re-fetching everything already on screen.
+    rows: Vec<MusicRowData>,
+    /// Albums already loaded at the current level.
+    album_offset: u32,
+    can_load_more: bool,
 }
 
 impl MusicUi {
@@ -2372,6 +2445,15 @@ fn apply_music_chrome(app: &AppWindow, state: &MusicUi) {
     app.set_music_heading(level.map(|l| l.heading()).unwrap_or_default().into());
     app.set_music_can_go_back(state.stack.len() > 1);
     app.set_music_selected_section(level.map(|l| l.section_index()).unwrap_or(0));
+
+    // Sorts only mean anything on the album list itself.
+    let sort = match level {
+        Some(MusicLevel::Albums { sort }) => Some(*sort),
+        _ => None,
+    };
+    app.set_music_sorts_visible(sort.is_some());
+    app.set_music_selected_sort(sort.map(|s| s.index()).unwrap_or(0));
+    app.set_music_can_load_more(state.can_load_more);
 }
 
 fn set_music_rows(app: &AppWindow, rows: Vec<MusicRowData>) {
@@ -2410,7 +2492,7 @@ fn music_show(
                     Some(ha) => match ha.get_states().await {
                         Ok(states) => {
                             let (rows, actions) = player_rows(&states);
-                            Ok((rows, actions, Vec::new()))
+                            Ok(MusicPageLoad::complete(rows, actions, Vec::new()))
                         }
                         Err(err) => Err(format!("Could not ask Home Assistant for speakers: {err}")),
                     },
@@ -2420,7 +2502,7 @@ fn music_show(
             level => match credentials {
                 Some(credentials) => {
                     let client = music::Client::new(credentials);
-                    load_music_level(&client, level)
+                    load_music_level(&client, level, 0)
                         .await
                         .map_err(|err| format!("{err}"))
                 }
@@ -2432,15 +2514,19 @@ fn music_show(
             let Some(app) = app_weak.upgrade() else { return };
             app.set_music_busy(false);
             match loaded {
-                Ok((rows, actions, tracks)) => {
+                Ok(page) => {
                     {
                         let mut state = music_state.lock().unwrap();
                         state.stack = stack;
-                        state.actions = actions;
-                        state.tracks = tracks;
+                        state.actions = page.actions;
+                        state.tracks = page.tracks;
+                        state.rows = page.rows;
+                        // A fresh navigation always starts at the first page.
+                        state.album_offset = 0;
+                        state.can_load_more = page.more;
                         apply_music_chrome(&app, &state);
+                        set_music_rows(&app, state.rows.clone());
                     }
-                    set_music_rows(&app, rows);
                 }
                 Err(message) => {
                     tracing::warn!(%message, "music browse failed");
@@ -2519,12 +2605,72 @@ fn finish_music_setup(
                         &app.as_weak(),
                         &music_state,
                         &live_client,
-                        vec![MusicLevel::Albums],
+                        vec![MusicLevel::Albums { sort: music::AlbumSort::Newest }],
                     );
                 }
                 Err(err) => {
                     tracing::warn!(%err, "music server rejected the credentials");
                     app.set_music_message(format!("{err}").into());
+                }
+            }
+        });
+    });
+}
+
+/// Appends the next page of albums to what's already on screen.
+///
+/// Appends rather than re-fetching from zero, so "Load more" stays cheap no
+/// matter how deep into a large library you've scrolled -- and so the rows
+/// above don't flicker.
+fn music_load_more(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+) {
+    let (credentials, level, next_offset) = {
+        let state = music_state.lock().unwrap();
+        let Some(level) = state.stack.last().cloned() else { return };
+        (
+            state.credentials.clone(),
+            level,
+            state.album_offset + music::ALBUM_PAGE_SIZE,
+        )
+    };
+    let Some(credentials) = credentials else { return };
+
+    if let Some(app) = app_weak.upgrade() {
+        app.set_music_busy(true);
+    }
+
+    let app_weak = app_weak.clone();
+    let music_state = music_state.clone();
+    rt_handle.spawn(async move {
+        let client = music::Client::new(credentials);
+        let loaded = load_music_level(&client, &level, next_offset)
+            .await
+            .map_err(|err| format!("{err}"));
+
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = app_weak.upgrade() else { return };
+            app.set_music_busy(false);
+            match loaded {
+                Ok(page) => {
+                    let mut state = music_state.lock().unwrap();
+                    // Guard against a stale page landing after the user has
+                    // navigated elsewhere: appending it would mix two levels.
+                    if state.stack.last() != Some(&level) {
+                        return;
+                    }
+                    state.rows.extend(page.rows);
+                    state.actions.extend(page.actions);
+                    state.album_offset = next_offset;
+                    state.can_load_more = page.more;
+                    app.set_music_can_load_more(page.more);
+                    set_music_rows(&app, state.rows.clone());
+                }
+                Err(message) => {
+                    tracing::warn!(%message, "loading more albums failed");
+                    app.set_music_message(message.into());
                 }
             }
         });
@@ -5212,9 +5358,20 @@ mod tests {
         assert_eq!(normalise_music_server_url("http://x:4533"), "http://x:4533");
     }
 
+    /// Albums carry their sort, so switching order is a navigation like any
+    /// other and Back/section-highlighting keep working.
+    #[test]
+    fn the_album_level_carries_its_sort() {
+        let newest = MusicLevel::Albums { sort: music::AlbumSort::Newest };
+        let alphabetical = MusicLevel::Albums { sort: music::AlbumSort::Alphabetical };
+        assert_ne!(newest, alphabetical);
+        assert_eq!(newest.heading(), "Albums");
+        assert_eq!(alphabetical.section_index(), 0, "still the Albums section");
+    }
+
     #[test]
     fn levels_name_themselves_and_light_the_right_section() {
-        assert_eq!(MusicLevel::Albums.heading(), "Albums");
+        assert_eq!(MusicLevel::Albums { sort: music::AlbumSort::Newest }.heading(), "Albums");
         assert_eq!(
             MusicLevel::Album { id: "a".into(), name: "Dummy".into() }.heading(),
             "Dummy"

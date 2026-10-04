@@ -154,6 +154,17 @@ export component MusicPage inherits Rectangle {
     in property <bool> can-go-back: false;
     in property <[MusicRowData]> rows: [];
 
+    // Album ordering. Only meaningful on the album list, hence the visibility
+    // flag rather than always showing a row of chips that do nothing.
+    in property <bool> sorts-visible: false;
+    in property <[string]> sorts: [];
+    in property <int> selected-sort: 0;
+    // Another page may exist. False for short pages and for Random, which
+    // reshuffles per request so "more" would just overlap what's shown.
+    in property <bool> can-load-more: false;
+
+    callback sort-selected(int);
+    callback load-more();
     callback setup-requested();
     callback forget-requested();
     callback section-selected(int);
@@ -348,6 +359,19 @@ export component MusicPage inherits Rectangle {
             }
         }
 
+        if root.sorts-visible: HorizontalLayout {
+            spacing: 8px;
+            height: 30px;
+
+            for sort[idx] in root.sorts: SectionChip {
+                label: sort;
+                active: idx == root.selected-sort;
+                tapped => { root.sort-selected(idx); }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+
         // Heading + back.
         HorizontalLayout {
             height: 30px;
@@ -405,6 +429,32 @@ export component MusicPage inherits Rectangle {
                 for entry[idx] in root.rows: MusicRow {
                     data: entry;
                     tapped => { root.row-selected(idx); }
+                }
+
+                // Paging by an explicit tap rather than on-scroll loading:
+                // predictable on a touchscreen, and it never fires by accident
+                // while someone is just scrolling the list.
+                if root.can-load-more: Rectangle {
+                    height: 46px;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: more-touch.pressed ? Theme.surface-alt : transparent;
+
+                    more-touch := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => { root.load-more(); }
+                    }
+
+                    Text {
+                        text: root.busy ? "Loading..." : "Load more";
+                        font-size: 13px;
+                        font-weight: 600;
+                        color: Theme.text-primary;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
