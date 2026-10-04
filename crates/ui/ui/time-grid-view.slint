@@ -173,6 +173,10 @@ component DayColumn inherits Rectangle {
     in property <[bool]> member-visible;
     in property <length> row-height;
     in property <int> column-index;
+    // Minutes since midnight, or -1 before the clock is trusted. Positioned
+    // with the same formula as event cards, so the line and the events it sits
+    // between can't drift apart.
+    in property <int> now-minutes: -1;
     callback slot-tapped(int /* column */, int /* hour */);
     callback event-tapped(WeekEventData);
 
@@ -201,6 +205,26 @@ component DayColumn inherits Rectangle {
         height: root.row-height * event.duration-minutes / 60;
         tapped => { root.event-tapped(event); }
     }
+
+    // "Now" line, last so it draws over the event cards it crosses -- being
+    // hidden behind a meeting is exactly when you most want to see it.
+    if root.day.is-today && root.now-minutes >= 0: Rectangle {
+        y: root.row-height * root.now-minutes / 60;
+        width: 100%;
+        height: 2px;
+        background: #e5484d;
+
+        // A dot at the left edge, the convention every digital calendar uses
+        // to distinguish this from an ordinary gridline.
+        Rectangle {
+            x: 0px;
+            y: -3px;
+            width: 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: #e5484d;
+        }
+    }
 }
 
 // Hourly time-axis grid. Used for both Week view (7-entry `days`) and Day
@@ -208,6 +232,10 @@ component DayColumn inherits Rectangle {
 export component TimeGridView inherits Rectangle {
     in property <[WeekDayColumnData]> days;
     in property <[bool]> member-visible;
+    // Minutes since midnight; -1 hides the line. Drawn only on the column
+    // flagged is-today, so Week view marks one column and Day view marks its
+    // single column only when that day actually is today.
+    in property <int> now-minutes: -1;
     // Built once in Rust (["12 AM", "1 AM", ..., "11 PM"]) rather than
     // formatted here -- Slint's expression language has no numeric-to-label
     // formatting for this.
@@ -273,6 +301,7 @@ export component TimeGridView inherits Rectangle {
                     day: day;
                     member-visible: root.member-visible;
                     row-height: root.row-height;
+                    now-minutes: root.now-minutes;
                     column-index: idx;
                     horizontal-stretch: 1;
                     slot-tapped(col, h) => { root.slot-tapped(col, h); }

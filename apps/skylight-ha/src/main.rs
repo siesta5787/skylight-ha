@@ -88,6 +88,20 @@ fn system_utc_offset(at: OffsetDateTime) -> Option<UtcOffset> {
     UtcOffset::from_whole_seconds(tm.tm_gmtoff as i32).ok()
 }
 
+/// Minutes since midnight for the calendar's "now" line, or -1 to hide it.
+///
+/// Hidden while the clock is still at the kernel epoch. The device has no RTC
+/// and boots in 1970 until NTP corrects it, and a line drawn confidently at the
+/// wrong time is worse than no line -- the whole point of it is being glanceable
+/// and trusted.
+fn now_minutes_for_grid(year: i32, minutes_since_midnight: i32) -> i32 {
+    if year < 2000 {
+        -1
+    } else {
+        minutes_since_midnight
+    }
+}
+
 /// Converts a 24-hour hour into a 12-hour one and its meridiem.
 ///
 /// Midnight and noon are the cases worth being careful about: hour 0 is 12 AM
@@ -1984,6 +1998,14 @@ fn main() {
                 let (hour12, meridiem) = twelve_hour(now.hour());
                 app.set_clock_text(format!("{}:{:02}", hour12, now.minute()).into());
                 app.set_clock_meridiem(meridiem.into());
+                // Drives the "now" line on the Day/Week grids. Suppressed until
+                // the clock is plausible: this board has no RTC and boots at the
+                // kernel epoch, and a line confidently drawn at 1970's idea of
+                // the time would be worse than no line (see the clock
+                // self-correction notes in CLAUDE.md).
+                app.set_now_minutes(
+                    now_minutes_for_grid(now.year(), i32::from(now.hour()) * 60 + i32::from(now.minute())),
+                );
                 app.set_date_text(format!("{}", now.date()).into());
                 // Deliberately not touching `month_label` here -- it tracks
                 // `reference_date` (whatever's being navigated/viewed), not
@@ -5869,6 +5891,17 @@ mod tests {
 
     /// Art is fetched by cover id, so a row without one must carry None rather
     /// than falling back to some other id and showing the wrong cover.
+    /// The device boots at the kernel epoch with no RTC, and a "now" line
+    /// drawn confidently at 1970's idea of the time would be worse than none --
+    /// the whole value of it is being glanceable and trusted.
+    #[test]
+    fn the_now_line_hides_itself_until_the_clock_is_believable() {
+        assert_eq!(now_minutes_for_grid(1970, 0), -1, "pre-NTP clock must not draw a line");
+        assert_eq!(now_minutes_for_grid(1999, 13 * 60), -1);
+        assert_eq!(now_minutes_for_grid(2026, 13 * 60 + 15), 13 * 60 + 15);
+        assert_eq!(now_minutes_for_grid(2026, 0), 0, "midnight is a real position, not 'hidden'");
+    }
+
     /// Midnight and noon are the cases a naive `% 12` gets wrong, turning both
     /// into "0:xx".
     #[test]

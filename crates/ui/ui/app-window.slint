@@ -127,6 +127,11 @@ export component AppWindow inherits Window {
 
     in property <string> clock-text: "--:--";
     in property <string> clock-meridiem: "";
+    // Minutes since midnight, for the "now" line on the Day/Week grids. -1
+    // until the clock is worth trusting -- this board boots at the kernel
+    // epoch, and a line drawn at 1970's idea of the time would be worse than
+    // no line at all.
+    in property <int> now-minutes: -1;
     in property <string> date-text: "";
     in property <string> month-label: "";
     // All empty/placeholder until a weather entity is resolved and its
@@ -496,6 +501,7 @@ export component AppWindow inherits Window {
                             height: 100%;
                             days: root.calendar-week;
                             member-visible: root.member-visible;
+                            now-minutes: root.now-minutes;
                             hour-labels: root.hour-labels;
                             slot-tapped(col, hour) => { root.week-slot-tapped(col, hour); }
                             event-tapped(ev) => { root.show-event-detail(ev); }
@@ -505,6 +511,7 @@ export component AppWindow inherits Window {
                             height: 100%;
                             days: root.calendar-day;
                             member-visible: root.member-visible;
+                            now-minutes: root.now-minutes;
                             hour-labels: root.hour-labels;
                             slot-tapped(col, hour) => { root.day-slot-tapped(hour); }
                             event-tapped(ev) => { root.show-event-detail(ev); }

@@ -4,8 +4,8 @@ component KeyButton inherits Rectangle {
     in property <string> label;
     callback tapped();
 
-    width: 46px;
-    height: 46px;
+    width: 60px;
+    height: 60px;
     border-radius: 6px;
     background: touch.pressed ? Theme.accent.with-alpha(0.30) : Theme.surface-alt;
     border-width: 1px;
@@ -15,7 +15,7 @@ component KeyButton inherits Rectangle {
         clicked => { root.tapped(); }
         Text {
             text: root.label;
-            font-size: 15px;
+            font-size: 20px;
             font-weight: 600;
             color: Theme.text-primary;
             horizontal-alignment: center;
@@ -29,7 +29,7 @@ component WideKeyButton inherits Rectangle {
     in property <bool> active: false;
     callback tapped();
 
-    height: 46px;
+    height: 60px;
     border-radius: 6px;
     background: active ? Theme.accent : (touch.pressed ? Theme.border : Theme.surface-alt);
     border-width: 1px;
@@ -39,7 +39,7 @@ component WideKeyButton inherits Rectangle {
         clicked => { root.tapped(); }
         Text {
             text: root.label;
-            font-size: 13px;
+            font-size: 17px;
             font-weight: 700;
             color: active ? white : Theme.text-primary;
             horizontal-alignment: center;
@@ -75,8 +75,8 @@ export component VirtualKeyboard inherits Rectangle {
     z: 2000;
 
     Rectangle {
-        width: 660px;
-        height: 320px;
+        width: 858px;
+        height: 416px;
         x: (parent.width - self.width) / 2;
         y: parent.height - self.height - 24px;
         background: Theme.surface;
@@ -85,18 +85,18 @@ export component VirtualKeyboard inherits Rectangle {
         border-color: Theme.border;
 
         VerticalLayout {
-            padding: 16px;
-            spacing: 10px;
+            padding: 20px;
+            spacing: 13px;
 
             Text {
                 text: root.prompt;
-                font-size: 13px;
+                font-size: 17px;
                 font-weight: 600;
                 color: Theme.text-muted;
             }
 
             Rectangle {
-                height: 40px;
+                height: 52px;
                 border-radius: 8px;
                 background: Theme.surface-alt;
                 border-width: 1px;
@@ -104,18 +104,18 @@ export component VirtualKeyboard inherits Rectangle {
                 Text {
                     x: 10px;
                     text: root.text;
-                    font-size: 16px;
+                    font-size: 21px;
                     color: Theme.text-primary;
                     vertical-alignment: center;
                     overflow: elide;
-                    width: parent.width - 20px;
+                    width: parent.width - 26px;
                 }
             }
 
             if !root.numeric-mode: VerticalLayout {
-                spacing: 6px;
+                spacing: 8px;
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     for key in root.shift
                         ? ["Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P"]
@@ -123,7 +123,7 @@ export component VirtualKeyboard inherits Rectangle {
                         KeyButton { label: key; tapped => { root.key-pressed(key); } }
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     for key in root.shift
                         ? ["A", "S", "D", "F", "G", "H", "J", "K", "L"]
@@ -131,7 +131,7 @@ export component VirtualKeyboard inherits Rectangle {
                         KeyButton { label: key; tapped => { root.key-pressed(key); } }
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     WideKeyButton {
                         label: "Shift";
@@ -147,21 +147,21 @@ export component VirtualKeyboard inherits Rectangle {
             }
 
             if root.numeric-mode: VerticalLayout {
-                spacing: 6px;
+                spacing: 8px;
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     for key in ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]:
                         KeyButton { label: key; tapped => { root.key-pressed(key); } }
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     for key in ["-", "/", ":", ";", "(", ")", "$", "&", "@"]:
                         KeyButton { label: key; tapped => { root.key-pressed(key); } }
                 }
                 HorizontalLayout {
-                    spacing: 6px;
+                    spacing: 8px;
                     alignment: center;
                     for key in [".", ",", "?", "!", "'"]:
                         KeyButton { label: key; tapped => { root.key-pressed(key); } }
@@ -170,7 +170,7 @@ export component VirtualKeyboard inherits Rectangle {
             }
 
             HorizontalLayout {
-                spacing: 6px;
+                spacing: 8px;
                 WideKeyButton {
                     label: root.numeric-mode ? "ABC" : "123";
                     tapped => { root.numeric-mode = !root.numeric-mode; }
