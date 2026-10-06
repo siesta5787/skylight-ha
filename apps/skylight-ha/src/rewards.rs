@@ -19,8 +19,6 @@ use ha_client::entities::EntityState;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Member {
     pub name: String,
-    /// The Monday this week started, ISO. Same for every member.
-    pub week_start: String,
     pub stars: i32,
     pub goal: i32,
     /// Monday first, one entry per day of the week.
@@ -118,11 +116,6 @@ fn member_from(state: &EntityState) -> Option<Member> {
 
     Some(Member {
         name: display_name(state),
-        week_start: attributes
-            .get("week_start")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string(),
         // The state carries the count; the attributes don't repeat it.
         stars: state.state.parse().unwrap_or(0),
         goal: int("goal"),
@@ -199,7 +192,6 @@ mod tests {
         assert_eq!(members.len(), 1);
         let ava = &members[0];
         assert_eq!(ava.name, "Ava", "the column is headed by the person, not the sensor");
-        assert_eq!(ava.week_start, "2026-10-05");
         assert_eq!(ava.stars, 1);
         assert_eq!(ava.goal, 6);
         assert_eq!(ava.stars_needed, 5);

@@ -227,7 +227,6 @@ component MemberCard inherits Rectangle {
 // ask -- did I get today's star, and how close is the weekly prize.
 export component RewardsPage inherits Rectangle {
     in property <[RewardMemberData]> members;
-    in property <string> week-label: "";
     in property <string> message: "";
 
     background: Theme.surface;
@@ -238,24 +237,11 @@ export component RewardsPage inherits Rectangle {
         padding: 24px;
         spacing: 18px;
 
-        HorizontalLayout {
-            spacing: 12px;
-            height: 32px;
-
-            Text {
-                text: "Rewards";
-                font-size: 22px;
-                font-weight: 700;
-                color: Theme.text-primary;
-                vertical-alignment: center;
-            }
-            Text {
-                text: root.week-label;
-                font-size: 16px;
-                color: Theme.text-muted;
-                vertical-alignment: center;
-                horizontal-stretch: 1;
-            }
+        Text {
+            text: "Rewards";
+            font-size: 22px;
+            font-weight: 700;
+            color: Theme.text-primary;
         }
 
         if root.members.length == 0: Text {

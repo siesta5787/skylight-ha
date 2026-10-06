@@ -4510,31 +4510,8 @@ fn reward_member_rows(
         .collect()
 }
 
-/// "This week: Oct 5 - Oct 11", from the ISO Monday the integration reports.
-fn reward_week_label(week_start: &str) -> String {
-    let Some(start) = parse_iso_date(week_start) else { return String::new() };
-    let end = start + TimeDuration::days(6);
-    let short = |date: Date| {
-        let month = date.month().to_string();
-        format!("{} {}", &month[..3.min(month.len())], date.day())
-    };
-    format!("This week: {} - {}", short(start), short(end))
-}
-
-/// An ISO `YYYY-MM-DD`, which is the only date shape HA ever sends.
-fn parse_iso_date(value: &str) -> Option<Date> {
-    let mut parts = value.split('-');
-    let year: i32 = parts.next()?.parse().ok()?;
-    let month: u8 = parts.next()?.parse().ok()?;
-    let day: u8 = parts.next()?.parse().ok()?;
-    Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()
-}
-
 /// Pushes a fresh set of reward rows onto the page.
 fn apply_rewards(app: &AppWindow, members: &[rewards::Member], family: &[FamilyMember]) {
-    app.set_rewards_week_label(
-        members.first().map(|m| reward_week_label(&m.week_start)).unwrap_or_default().into(),
-    );
     app.set_rewards_members(slint::ModelRc::new(slint::VecModel::from(reward_member_rows(
         members, family,
     ))));
@@ -6365,7 +6342,6 @@ mod tests {
     fn reward_member(name: &str, stars: i32) -> rewards::Member {
         rewards::Member {
             name: name.into(),
-            week_start: "2026-10-05".into(),
             stars,
             goal: 6,
             days: vec![
@@ -6379,14 +6355,6 @@ mod tests {
             tablet_time: true,
             stars_needed: 6 - stars,
         }
-    }
-
-    #[test]
-    fn the_week_reads_as_dates_not_as_an_iso_string() {
-        assert_eq!(reward_week_label("2026-10-05"), "This week: Oct 5 - Oct 11");
-        // Across a month boundary, which is most weeks' second half.
-        assert_eq!(reward_week_label("2026-12-28"), "This week: Dec 28 - Jan 3");
-        assert_eq!(reward_week_label(""), "", "no week is better than a wrong one");
     }
 
     /// A kid is one colour everywhere: the same one their calendar events and

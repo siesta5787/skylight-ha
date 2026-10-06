@@ -156,7 +156,6 @@ export component AppWindow inherits Window {
     // entity fetch lands, or permanently if nobody has reward tracking turned
     // on -- `rewards-message` says which.
     in property <[RewardMemberData]> rewards-members: [];
-    in property <string> rewards-week-label: "";
     in property <string> rewards-message: "";
     in property <[MemberChipData]> members;
     in property <[DashboardRowData]> dashboard-rows;
@@ -580,7 +579,6 @@ export component AppWindow inherits Window {
                 if root.current-page == Page.Rewards: RewardsPage {
                     vertical-stretch: 1;
                     members: root.rewards-members;
-                    week-label: root.rewards-week-label;
                     message: root.rewards-message;
                 }
 
