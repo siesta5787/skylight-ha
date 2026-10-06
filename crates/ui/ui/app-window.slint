@@ -134,11 +134,11 @@ export component AppWindow inherits Window {
     in property <int> now-minutes: -1;
     in property <string> date-text: "";
     in property <string> month-label: "";
-    // All empty/placeholder until a weather entity is resolved and its
-    // first fetch succeeds -- WeatherWidget falls back to plain "Weather"/
-    // "--°" text and hides rows it has no data for until then. Set from
-    // `apply_weather` in main.rs; see that function for how each is
-    // sourced (some optionally backfilled from a second entity).
+    // All empty/placeholder until a weather entity is resolved and its first
+    // fetch succeeds -- the Weather page shows "--°" and hides the cards it
+    // has no data for until then. Set from `apply_weather` in main.rs; see
+    // that function for how each is sourced (some optionally backfilled from
+    // a second entity). Nothing here reaches the header any more.
     in property <string> weather-icon-condition: "";
     in property <string> weather-condition-label: "";
     in property <string> weather-updated-label: "";
@@ -413,10 +413,6 @@ export component AppWindow inherits Window {
                     clock-text: root.clock-text;
                     clock-meridiem: root.clock-meridiem;
                     date-text: root.date-text;
-                    // Only the temperature and today's range live up here now;
-                    // the rest moved to the Weather tab.
-                    weather-temp-now: root.weather-temp-now;
-                    weather-temp-range: root.weather-temp-range;
                 }
 
                 if root.current-page == Page.Calendar: VerticalLayout {

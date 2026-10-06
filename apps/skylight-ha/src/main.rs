@@ -1467,6 +1467,11 @@ fn main() {
                         return;
                     };
 
+                    // Remember what we queued before the call: the player's
+                    // first state update can arrive before an await here would
+                    // have returned, and art lookup needs the queue by then.
+                    music_state.lock().unwrap().queued = tracks.clone();
+
                     app.set_music_message(format!("Playing {}...", tracks_head.title).into());
                     // Starting something is the moment you want to see what's
                     // playing, so go straight there; "Back to music" returns to
@@ -1528,20 +1533,28 @@ fn main() {
         let live_client = live_client.clone();
         let rt_handle = rt_handle.clone();
         let volume_repeat = volume_repeat.clone();
+        let app_weak = app.as_weak();
         app.on_music_volume_pressed(move |direction| {
             let sign = if direction >= 0 { 1.0 } else { -1.0 };
             // One nudge for the press itself, whether or not a hold follows.
-            music_volume(&rt_handle, &music_state, &live_client, sign * VOLUME_STEP);
+            music_volume(&rt_handle, &app_weak, &music_state, &live_client, sign * VOLUME_STEP);
 
             let timer = slint::Timer::default();
             let music_state = music_state.clone();
             let live_client = live_client.clone();
             let rt_handle = rt_handle.clone();
+            let app_weak = app_weak.clone();
             timer.start(
                 slint::TimerMode::Repeated,
                 VOLUME_REPEAT_INTERVAL,
                 move || {
-                    music_volume(&rt_handle, &music_state, &live_client, sign * VOLUME_HELD_STEP);
+                    music_volume(
+                        &rt_handle,
+                        &app_weak,
+                        &music_state,
+                        &live_client,
+                        sign * VOLUME_HELD_STEP,
+                    );
                 },
             );
             *volume_repeat.borrow_mut() = Some(timer);
@@ -1586,14 +1599,21 @@ fn main() {
                     }
                     let now = now_playing_from(&state);
 
-                    // Only refetch when the artwork actually changes: HA
+                    // Only refetch when the artwork *source* changes: HA
                     // republishes the whole attribute set on every position
                     // update, which for a playing track is constant churn.
-                    let picture_changed = {
+                    // Keyed on the source rather than on `entity_picture`
+                    // alone, which is what left the cover stale: a track this
+                    // app queued has no picture at all, so picture-to-picture
+                    // comparison said "unchanged" on every track change and
+                    // the art never moved.
+                    let (source, source_changed, credentials) = {
                         let mut music = music_state.lock().unwrap();
-                        let changed = music.now_playing.picture != now.picture;
+                        let source = now_playing_art(&now, &music.queued);
+                        let changed = music.art_source != source;
+                        music.art_source = source.clone();
                         music.now_playing = now.clone();
-                        changed
+                        (source, changed, music.credentials.clone())
                     };
 
                     let app_weak_ui = app_weak.clone();
@@ -1609,7 +1629,7 @@ fn main() {
                         }
                     });
 
-                    if !picture_changed {
+                    if !source_changed {
                         continue;
                     }
 
@@ -1629,62 +1649,82 @@ fn main() {
                         music.art_generation = music.art_generation.wrapping_add(1);
                         music.art_generation
                     };
-                    let Some(picture) = now.picture.clone() else {
-                        let app_weak = app_weak.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(app) = app_weak.upgrade() {
-                                app.set_music_now_playing_art(Default::default());
-                            }
-                        });
-                        continue;
-                    };
 
-                    let url = now_playing_art_url(&ha_base_url, &picture);
-                    let request = art_http.get(&url);
-                    let request = match &ha_token {
-                        // Media-proxy URLs usually carry their own signed
-                        // token, but sending ours too is harmless and covers
-                        // the ones that don't.
-                        Some(token) => request.bearer_auth(token),
-                        None => request,
-                    };
-                    let app_weak = app_weak.clone();
-                    let music_state = music_state.clone();
-                    tokio::spawn(async move {
-                        let cover = match request.send().await {
-                            Ok(response) => match response.bytes().await {
-                                Ok(bytes) => match music::decode_cover(&bytes) {
+                    match source {
+                        NowPlayingArt::None => {
+                            publish_now_playing_art(&app_weak, &music_state, generation, None);
+                        }
+                        // Our own queue: the cover comes from the music server,
+                        // the same place the browse grid gets it.
+                        NowPlayingArt::Server(cover_id) => {
+                            let Some(credentials) = credentials else { continue };
+                            let app_weak = app_weak.clone();
+                            let music_state = music_state.clone();
+                            tokio::spawn(async move {
+                                let client = music::Client::new(credentials);
+                                let cover = match client
+                                    .cover_art(&cover_id, NOW_PLAYING_COVER_PIXELS)
+                                    .await
+                                {
                                     Ok(cover) => Some(cover),
                                     Err(err) => {
-                                        tracing::warn!(%err, %url, "now-playing art did not decode");
+                                        tracing::debug!(
+                                            %err, cover_id,
+                                            "could not load now-playing art from the music server"
+                                        );
                                         None
                                     }
-                                },
-                                Err(err) => {
-                                    tracing::warn!(%err, %url, "could not read now-playing art");
-                                    None
-                                }
-                            },
-                            Err(err) => {
-                                tracing::warn!(%err, %url, "could not fetch now-playing art");
-                                None
-                            }
-                        };
-                        let Some(cover) = cover else { return };
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let Some(app) = app_weak.upgrade() else { return };
-                            // Stale art for a track that has already changed.
-                            if music_state.lock().unwrap().art_generation != generation {
-                                return;
-                            }
-                            let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
-                                cover.width,
-                                cover.height,
-                            );
-                            buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
-                            app.set_music_now_playing_art(slint::Image::from_rgba8(buffer));
-                        });
-                    });
+                                };
+                                publish_now_playing_art(
+                                    &app_weak,
+                                    &music_state,
+                                    generation,
+                                    cover,
+                                );
+                            });
+                        }
+                        NowPlayingArt::Proxy(picture) => {
+                            let url = now_playing_art_url(&ha_base_url, &picture);
+                            let request = art_http.get(&url);
+                            let request = match &ha_token {
+                                // Media-proxy URLs usually carry their own
+                                // signed token, but sending ours too is
+                                // harmless and covers the ones that don't.
+                                Some(token) => request.bearer_auth(token),
+                                None => request,
+                            };
+                            let app_weak = app_weak.clone();
+                            let music_state = music_state.clone();
+                            tokio::spawn(async move {
+                                let cover = match request.send().await {
+                                    Ok(response) => match response.bytes().await {
+                                        Ok(bytes) => match music::decode_cover(&bytes) {
+                                            Ok(cover) => Some(cover),
+                                            Err(err) => {
+                                                tracing::warn!(%err, %url, "now-playing art did not decode");
+                                                None
+                                            }
+                                        },
+                                        Err(err) => {
+                                            tracing::warn!(%err, %url, "could not read now-playing art");
+                                            None
+                                        }
+                                    },
+                                    Err(err) => {
+                                        tracing::warn!(%err, %url, "could not fetch now-playing art");
+                                        None
+                                    }
+                                };
+                                let Some(cover) = cover else { return };
+                                publish_now_playing_art(
+                                    &app_weak,
+                                    &music_state,
+                                    generation,
+                                    Some(cover),
+                                );
+                            });
+                        }
+                    }
                 }
                 // The broadcast ended, which means the HA connection went
                 // away; wait for `run_ha_sync` to publish a new one.
@@ -2613,15 +2653,21 @@ struct NowPlaying {
     volume: Option<f32>,
     /// HA-relative artwork URL (`/api/media_player_proxy/...`).
     picture: Option<String>,
+    /// What the player says it is playing. For anything this app started it is
+    /// the stream URL we handed `play_media`, which is how `now_playing_art`
+    /// recognises its own queue.
+    content_id: Option<String>,
 }
 
 impl NowPlaying {
     fn volume_label(&self) -> String {
-        match self.volume {
-            Some(level) => format!("{}%", (level * 100.0).round() as i32),
-            None => String::new(),
-        }
+        self.volume.map(volume_label).unwrap_or_default()
     }
+}
+
+/// A level as the volume readout shows it.
+fn volume_label(level: f32) -> String {
+    format!("{}%", (f64::from(level) * 100.0).round() as i32)
 }
 
 /// Pulls now-playing out of a `media_player` entity's state.
@@ -2644,8 +2690,102 @@ fn now_playing_from(state: &EntityState) -> NowPlaying {
             .and_then(|v| v.as_str())
             .filter(|v| !v.is_empty())
             .map(|v| v.to_string()),
+        content_id: state
+            .attributes
+            .get("media_content_id")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string()),
     }
 }
+
+/// Where the now-playing artwork should come from.
+#[derive(Debug, Clone, Default, PartialEq)]
+enum NowPlayingArt {
+    #[default]
+    None,
+    /// A cover id on the music server, used whenever the player is playing a
+    /// track this app queued.
+    ///
+    /// Those are handed to `play_media` as a plain stream URL, so Music
+    /// Assistant has nothing but that URL to go on and publishes no
+    /// `entity_picture` for them at all. Start the same track from Music
+    /// Assistant's own UI and it resolves its own library item and does
+    /// publish a picture -- which is exactly why the art appeared then and
+    /// not when the track was started here. Since we queued it, we already
+    /// know its cover id; take the art from the same place the browse grid
+    /// does rather than depending on the player to find it.
+    Server(String),
+    /// Home Assistant's media proxy, for anything this app didn't start.
+    Proxy(String),
+}
+
+/// The `id` parameter of one of our own Subsonic stream URLs.
+///
+/// Players echo what they were given back as `media_content_id`, which makes
+/// this a reliable identification of the track -- independent of whatever
+/// title the player did or didn't manage to read out of the stream itself.
+fn stream_url_track_id(content_id: &str) -> Option<&str> {
+    let (path, query) = content_id.split_once('?')?;
+    if !path.ends_with("/rest/stream") {
+        return None;
+    }
+    query.split('&').find_map(|pair| pair.strip_prefix("id="))
+}
+
+/// Picks the artwork source for what the player reports playing.
+fn now_playing_art(now: &NowPlaying, queued: &[music::Track]) -> NowPlayingArt {
+    let ours = now
+        .content_id
+        .as_deref()
+        .and_then(stream_url_track_id)
+        .and_then(|id| queued.iter().find(|track| music::urlencode(&track.id) == id))
+        .and_then(|track| track.cover_art.clone());
+    match (ours, now.picture.clone()) {
+        (Some(cover_id), _) => NowPlayingArt::Server(cover_id),
+        (None, Some(picture)) => NowPlayingArt::Proxy(picture),
+        (None, None) => NowPlayingArt::None,
+    }
+}
+
+/// Paints a fetched cover -- or clears the old one -- on the UI thread.
+///
+/// `generation` is checked there rather than by the caller: the fetch is
+/// asynchronous, so the only moment worth asking whether this art is still
+/// wanted is the moment before it goes on screen.
+fn publish_now_playing_art(
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+    generation: u64,
+    cover: Option<music::CoverArt>,
+) {
+    let app_weak = app_weak.clone();
+    let music_state = music_state.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = app_weak.upgrade() else { return };
+        // Stale art for a track that has already changed.
+        if music_state.lock().unwrap().art_generation != generation {
+            return;
+        }
+        match cover {
+            Some(cover) => {
+                // Built here, not on the worker: slint::Image isn't Send.
+                let mut buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::new(
+                    cover.width,
+                    cover.height,
+                );
+                buffer.make_mut_bytes().copy_from_slice(&cover.rgba);
+                app.set_music_now_playing_art(slint::Image::from_rgba8(buffer));
+            }
+            None => app.set_music_now_playing_art(Default::default()),
+        }
+    });
+}
+
+/// Covers are drawn far larger on the now-playing screen than in the browse
+/// grid, so they are fetched larger too -- one image, unlike the grid's
+/// hundred, which is what makes the extra pixels affordable here.
+const NOW_PLAYING_COVER_PIXELS: u32 = 384;
 
 /// Resolves HA's relative artwork URL against the configured base.
 fn now_playing_art_url(base_url: &str, picture: &str) -> String {
@@ -2664,6 +2804,28 @@ const VOLUME_HELD_STEP: f32 = 0.05;
 /// Slow enough to be controllable on a touchscreen rather than racing to 100%.
 const VOLUME_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(450);
 
+/// The level to ask for, one step from `level`.
+///
+/// Not just `level + delta`. Every player this drives quantises volume to
+/// whole percent, and `level` has already been through `f32` on the way in, so
+/// a player sitting at 42% reports 0.41999998; adding 0.01 to that and sending
+/// the sum asks for 0.42999998, which a player that truncates reads as 42 --
+/// the tap up does nothing -- while a step down asks for 0.40999998 and lands
+/// on 40, so the tap down moves two. Both halves of that were reported from
+/// the wall. So: round to whole percent first, step there, and aim a hair
+/// inside the resulting bucket rather than exactly at its lower edge, which is
+/// not representable in binary and falls below it about half the time.
+fn stepped_volume(level: f32, delta: f32) -> f64 {
+    let from = (f64::from(level) * 100.0).round();
+    let step = (f64::from(delta) * 100.0).round();
+    let percent = (from + step).clamp(0.0, 100.0);
+    ((percent / 100.0) + VOLUME_BUCKET_NUDGE).min(1.0)
+}
+
+/// Far too small to shift the percent a player reads out of the value it
+/// receives, and far larger than the float dust it exists to clear.
+const VOLUME_BUCKET_NUDGE: f64 = 1e-6;
+
 /// Nudges a player's volume.
 ///
 /// Prefers an absolute `volume_set` when the player reports a level, because
@@ -2672,23 +2834,36 @@ const VOLUME_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// otherwise have no working control at all.
 fn music_volume(
     rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
     music_state: &Arc<Mutex<MusicUi>>,
     live_client: &Arc<Mutex<Option<Client>>>,
     delta: f32,
 ) {
-    let (player, level) = {
-        let state = music_state.lock().unwrap();
-        (state.player_entity_id(), state.now_playing.volume)
+    let (player, target) = {
+        let mut state = music_state.lock().unwrap();
+        let target = state.now_playing.volume.map(|level| stepped_volume(level, delta));
+        // Step from this press rather than from whatever HA last echoed back:
+        // the echo is a round trip behind, so two quick taps would otherwise
+        // both compute the same target and the second would appear to do
+        // nothing. The echo still corrects this if the player disagrees.
+        if let Some(target) = target {
+            state.now_playing.volume = Some(target as f32);
+        }
+        (state.player_entity_id(), target)
     };
     let Some(player) = player else { return };
+    // Same optimistic shape the dashboard controls use: show the step now, let
+    // the player's own state reconcile it.
+    if let (Some(app), Some(target)) = (app_weak.upgrade(), target) {
+        app.set_music_volume_label(volume_label(target as f32).into());
+    }
 
     let live_client = live_client.clone();
     rt_handle.spawn(async move {
         let ha = live_client.lock().unwrap().clone();
         let Some(ha) = ha else { return };
-        let result = match level {
-            Some(level) => {
-                let target = (level + delta).clamp(0.0, 1.0);
+        let result = match target {
+            Some(target) => {
                 ha.call_service(
                     "media_player",
                     "volume_set",
@@ -2837,6 +3012,13 @@ struct MusicUi {
     /// Latest state of the target player, so the volume buttons have a level
     /// to add to and the artwork fetch knows when the picture changed.
     now_playing: NowPlaying,
+    /// The queue this app last sent to the player. Kept so now-playing art can
+    /// be looked up by the stream URL the player echoes back -- see
+    /// `NowPlayingArt::Server`.
+    queued: Vec<music::Track>,
+    /// Where the current cover came from, so a track change is recognised even
+    /// when neither track has an `entity_picture`.
+    art_source: NowPlayingArt,
     /// Bumped per artwork request, so a slow fetch landing after the track has
     /// moved on doesn't overwrite the current cover.
     art_generation: u64,
@@ -5882,6 +6064,105 @@ mod tests {
             now.picture.as_deref(),
             Some("/api/media_player_proxy/media_player.lounge?token=abc")
         );
+    }
+
+    /// The bug from the wall: tapping up did nothing and tapping down
+    /// sometimes moved two. A level arrives as a double, is kept as an `f32`,
+    /// and comes back a hair under the percent it represents -- so a naive
+    /// `level + 0.01` lands just below the percent above it, and a player that
+    /// truncates reads no change going up and a double step going down.
+    #[test]
+    fn one_tap_moves_exactly_one_percent_in_either_direction() {
+        // Exactly what `now_playing_from` produces for a player at 42%.
+        let reported = 0.42_f64 as f32;
+        assert!(f64::from(reported) < 0.42, "the premise: f32 rounds this down");
+
+        let up = stepped_volume(reported, VOLUME_STEP);
+        let down = stepped_volume(reported, -VOLUME_STEP);
+        // Checked the way a player reads it, both ways a player might:
+        // rounding, and truncating.
+        assert_eq!((up * 100.0).round() as i32, 43);
+        assert_eq!((up * 100.0) as i32, 43, "a player that truncates must also see 43");
+        assert_eq!((down * 100.0).round() as i32, 41);
+        assert_eq!((down * 100.0) as i32, 41, "and 41, not 40");
+    }
+
+    /// Stepping from the level we just asked for (which is what the optimistic
+    /// update stores) has to keep landing on whole percent, or the dust the
+    /// nudge clears would accumulate over a held press.
+    #[test]
+    fn repeated_steps_do_not_drift() {
+        let mut level = 0.42_f64 as f32;
+        for expected in [43, 44, 45, 46] {
+            level = stepped_volume(level, VOLUME_STEP) as f32;
+            assert_eq!(volume_label(level), format!("{expected}%"));
+        }
+    }
+
+    #[test]
+    fn volume_steps_stop_at_the_ends_of_the_dial() {
+        assert_eq!(stepped_volume(0.0, -VOLUME_STEP), VOLUME_BUCKET_NUDGE);
+        assert_eq!(stepped_volume(1.0, VOLUME_HELD_STEP), 1.0);
+    }
+
+    #[test]
+    fn a_stream_url_identifies_its_track() {
+        let credentials = music::Credentials {
+            server_url: "https://music.example".into(),
+            username: "me".into(),
+            salt: "s".into(),
+            token: "t".into(),
+            player_entity_id: None,
+            player_name: None,
+        };
+        let url = credentials.stream_url("tr-7");
+        assert_eq!(stream_url_track_id(&url), Some("tr-7"));
+
+        assert_eq!(
+            stream_url_track_id("https://music.example/rest/getCoverArt?id=co-7"),
+            None,
+            "only the stream endpoint names a track being played"
+        );
+        assert_eq!(stream_url_track_id("spotify:track:abc"), None);
+        assert_eq!(stream_url_track_id("https://radio.example/stream"), None);
+    }
+
+    /// Music Assistant publishes no `entity_picture` for a plain stream URL,
+    /// which is why art has to come from the music server for anything this
+    /// app queued -- and why a picture-to-picture comparison could never see
+    /// the track change.
+    #[test]
+    fn artwork_for_our_own_queue_comes_from_the_music_server() {
+        let mut queued = track("tr-7", "Roads", Some("Portishead"), None);
+        queued.cover_art = Some("co-7".into());
+        let queue = vec![track("tr-1", "Mysterons", None, None), queued];
+
+        let ours = NowPlaying {
+            content_id: Some(
+                "https://music.example/rest/stream?u=me&t=t&s=s&v=1.16.1&c=skylight&f=json&id=tr-7"
+                    .into(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(now_playing_art(&ours, &queue), NowPlayingArt::Server("co-7".into()));
+
+        // Started somewhere else: the player found its own artwork, use it.
+        let elsewhere = NowPlaying {
+            content_id: Some("library://track/19".into()),
+            picture: Some("/api/media_player_proxy/media_player.lounge?token=abc".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            now_playing_art(&elsewhere, &queue),
+            NowPlayingArt::Proxy("/api/media_player_proxy/media_player.lounge?token=abc".into())
+        );
+
+        // Ours, but the track has no cover on the server either.
+        let no_cover = NowPlaying {
+            content_id: Some("https://music.example/rest/stream?id=tr-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(now_playing_art(&no_cover, &queue), NowPlayingArt::None);
     }
 
     /// HA hands back a relative path; an absolute one must be left alone.

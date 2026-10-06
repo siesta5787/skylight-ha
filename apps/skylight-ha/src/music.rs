@@ -161,7 +161,11 @@ fn random_salt() -> String {
 ///
 /// Deliberately minimal rather than a dependency: usernames and search terms
 /// are the only user-controlled values that reach here.
-fn urlencode(value: &str) -> String {
+///
+/// `pub` because `main.rs` compares a track id against the one a player echoes
+/// back out of a stream URL built here, and that comparison has to be made
+/// against the same encoding that went into the URL.
+pub fn urlencode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
