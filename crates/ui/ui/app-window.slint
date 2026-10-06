@@ -18,6 +18,7 @@ import { TimezonePicker } from "timezone-picker.slint";
 import { WifiView, WifiNetworkData } from "wifi-view.slint";
 import { MusicPage, MusicRowData, MusicGridRowData } from "music-view.slint";
 import { WeatherPage } from "weather-view.slint";
+import { RewardsPage, RewardMemberData, RewardDayData } from "rewards-view.slint";
 // Embeds the font at compile time (Slint's recommended approach -- see
 // i-slint-compiler's font import handling) since the target device has no
 // system fonts or fontconfig at all (see crates/ui/Cargo.toml).
@@ -27,6 +28,7 @@ export {
     CalendarDayData, CalendarEventDot, TodoColumnData, WeekDayColumnData, WeekEventData,
     AllDayBannerData, MemberChipData, EventFormMember, DashboardCardData, DashboardRowData,
     ToggleEntityData, SensorRowData, Page, WifiNetworkData, MusicRowData, MusicGridRowData,
+    RewardMemberData, RewardDayData,
 }
 
 component NavArrow inherits Rectangle {
@@ -148,6 +150,14 @@ export component AppWindow inherits Window {
     in property <string> weather-pressure: "";
     in property <string> weather-humidity: "";
     in property <string> weather-wind: "";
+
+    // The Rewards tab, fed from the Skylight Family integration's star
+    // sensors (see the `rewards` module in main.rs). Empty until the first
+    // entity fetch lands, or permanently if nobody has reward tracking turned
+    // on -- `rewards-message` says which.
+    in property <[RewardMemberData]> rewards-members: [];
+    in property <string> rewards-week-label: "";
+    in property <string> rewards-message: "";
     in property <[MemberChipData]> members;
     in property <[DashboardRowData]> dashboard-rows;
     callback dashboard-entity-toggled(string, bool);
@@ -565,6 +575,13 @@ export component AppWindow inherits Window {
                     pressure: root.weather-pressure;
                     humidity: root.weather-humidity;
                     wind: root.weather-wind;
+                }
+
+                if root.current-page == Page.Rewards: RewardsPage {
+                    vertical-stretch: 1;
+                    members: root.rewards-members;
+                    week-label: root.rewards-week-label;
+                    message: root.rewards-message;
                 }
 
                 if root.current-page == Page.Music: MusicPage {

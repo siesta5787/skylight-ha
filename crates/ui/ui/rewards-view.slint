@@ -1,0 +1,278 @@
+import { Theme } from "theme.slint";
+
+// A filled five-pointed star, drawn rather than typed.
+//
+// The embedded font is Inter (see app-window.slint) and nothing guarantees it
+// carries U+2605 -- a missing glyph on the device is a blank box, and there is
+// no way to notice that from here. Straight lines only, same approach as the
+// sidebar's hand-drawn icons.
+export component StarGlyph inherits Path {
+    in property <brush> fill-color: Theme.text-muted;
+    // Same shape as the sidebar's other icons: a Path with a commands string,
+    // sized by whoever uses it.
+    width: 20px;
+    height: 20px;
+    viewbox-width: 100;
+    viewbox-height: 100;
+    fill: root.fill-color;
+    commands: "M50 2 L61.2 34.6 L95.7 35.2 L68.1 55.9 L78.2 88.8 L50 69 L21.8 88.8 L31.9 55.9 L4.3 35.2 L38.8 34.6 Z";
+}
+
+export struct RewardDayData {
+    label: string,
+    earned: bool,
+    // Hasn't happened yet: drawn as a faint dot, not as a day lost.
+    upcoming: bool,
+    today: bool,
+    // "auto" / "manual" / "" -- how the day was decided.
+    note: string,
+}
+
+// Nested array rather than a flat list: Slint has no wrapping layout and no
+// per-row sub-model, so Rust hands each member their own week. Same shape the
+// music grid and dashboard cards already use.
+export struct RewardMemberData {
+    name: string,
+    color: color,
+    stars: string,
+    goal: string,
+    days: [RewardDayData],
+    chores: string,
+    tablet-time: bool,
+    prize: string,
+    prize-earned: bool,
+}
+
+component DayCell inherits VerticalLayout {
+    in property <RewardDayData> day;
+
+    spacing: 6px;
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    min-width: 0px;
+
+    Text {
+        text: root.day.label;
+        font-size: 13px;
+        font-weight: 600;
+        color: root.day.today ? Theme.accent : Theme.text-muted;
+        horizontal-alignment: center;
+    }
+
+    Rectangle {
+        height: 56px;
+        border-radius: 10px;
+        border-width: root.day.today ? 2px : 1px;
+        border-color: root.day.today ? Theme.accent : Theme.border;
+        background: root.day.earned ? #3a2f12 : transparent;
+
+        // Centred by hand: a Rectangle places its children at its own origin,
+        // it isn't a layout.
+        if !root.day.upcoming: StarGlyph {
+            width: 30px;
+            height: 30px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            fill-color: root.day.earned ? #f6b73c : Theme.border;
+        }
+        // A day that hasn't happened gets a dot: an empty star outline here
+        // would read as a star already missed.
+        if root.day.upcoming: Rectangle {
+            width: 6px;
+            height: 6px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: 3px;
+            background: Theme.border;
+        }
+    }
+
+    Text {
+        text: root.day.note;
+        font-size: 10px;
+        color: Theme.text-muted;
+        horizontal-alignment: center;
+    }
+}
+
+// One kid's whole week. Columns across the screen rather than cards down it --
+// the wall display is wide and the kids read their own column at a glance.
+component MemberCard inherits Rectangle {
+    in property <RewardMemberData> member;
+
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    min-width: 0px;
+    background: Theme.surface-alt;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+        alignment: start;
+
+        // Name and score.
+        HorizontalLayout {
+            spacing: 10px;
+            height: 34px;
+
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: 7px;
+                background: root.member.color;
+                y: (parent.height - self.height) / 2;
+            }
+            Text {
+                text: root.member.name;
+                font-size: 24px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            Text {
+                text: root.member.stars;
+                font-size: 24px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.member.goal;
+                font-size: 16px;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+            }
+            StarGlyph {
+                width: 16px;
+                height: 16px;
+                fill-color: Theme.text-muted;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+
+            for day in root.member.days: DayCell {
+                day: day;
+            }
+        }
+
+        // Only ever describes right now, which is why there is no week
+        // browsing on this screen -- see the note on RewardsPage.
+        VerticalLayout {
+            spacing: 4px;
+
+            Text {
+                text: root.member.chores;
+                font-size: 15px;
+                color: Theme.text-primary;
+                overflow: elide;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                height: 26px;
+
+                Text {
+                    text: "Tablet time today:";
+                    font-size: 15px;
+                    color: Theme.text-primary;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    width: badge.preferred-width + 16px;
+                    border-radius: 13px;
+                    background: root.member.tablet-time ? #1f3b24 : Theme.border;
+
+                    badge := Text {
+                        // Explicit: a Rectangle places a child at its own
+                        // origin at the child's preferred size, so without
+                        // this the label would sit in the badge's corner and
+                        // its own centring would have nothing to centre in.
+                        width: 100%;
+                        height: 100%;
+                        text: root.member.tablet-time ? "YES" : "no";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: root.member.tablet-time ? #6ee787 : Theme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            Text {
+                text: root.member.prize;
+                font-size: 15px;
+                font-weight: root.member.prize-earned ? 700 : 400;
+                color: root.member.prize-earned ? #f6b73c : Theme.text-primary;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// The Rewards tab.
+//
+// Read-only on purpose: awarding a star by hand is a parent's job and lives in
+// the Home Assistant panel, which is also where a past week can be browsed.
+// This screen answers the question the kids actually stand in front of it to
+// ask -- did I get today's star, and how close is the weekly prize.
+export component RewardsPage inherits Rectangle {
+    in property <[RewardMemberData]> members;
+    in property <string> week-label: "";
+    in property <string> message: "";
+
+    background: Theme.surface;
+    border-radius: Theme.radius;
+    clip: true;
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 18px;
+
+        HorizontalLayout {
+            spacing: 12px;
+            height: 32px;
+
+            Text {
+                text: "Rewards";
+                font-size: 22px;
+                font-weight: 700;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.week-label;
+                font-size: 16px;
+                color: Theme.text-muted;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+        }
+
+        if root.members.length == 0: Text {
+            text: root.message != "" ? root.message : "Nobody is being tracked yet.";
+            font-size: 16px;
+            color: Theme.text-muted;
+            vertical-stretch: 1;
+        }
+
+        if root.members.length > 0: HorizontalLayout {
+            spacing: 16px;
+            vertical-stretch: 1;
+            alignment: stretch;
+
+            for member in root.members: MemberCard {
+                member: member;
+            }
+        }
+    }
+}

@@ -1,4 +1,5 @@
 import { Theme } from "theme.slint";
+import { StarGlyph } from "rewards-view.slint";
 
 // Which full-page section of the app is showing. Page switching is pure
 // `.slint` state (see AppWindow) -- Rust never needs to know the current page.
@@ -9,6 +10,7 @@ export enum Page {
     Photos,
     Music,
     Weather,
+    Rewards,
     Settings,
 }
 
@@ -272,6 +274,7 @@ export component Sidebar inherits Rectangle {
     property <color> photos-color: root.active-page == Page.Photos ? Theme.accent : Theme.text-muted;
     property <color> music-color: root.active-page == Page.Music ? Theme.accent : Theme.text-muted;
     property <color> weather-color: root.active-page == Page.Weather ? Theme.accent : Theme.text-muted;
+    property <color> rewards-color: root.active-page == Page.Rewards ? Theme.accent : Theme.text-muted;
     property <color> settings-color: root.active-page == Page.Settings ? Theme.accent : Theme.text-muted;
 
     VerticalLayout {
@@ -317,8 +320,19 @@ export component Sidebar inherits Rectangle {
             WeatherIconGlyph { icon-color: root.weather-color; }
         }
 
+        NavItem {
+            label: "Rewards";
+            active: root.active-page == Page.Rewards;
+            tapped => { root.page-selected(Page.Rewards); }
+            StarGlyph {
+                width: 22px;
+                height: 22px;
+                fill-color: root.rewards-color;
+            }
+        }
+
         // Pushes Settings to the bottom of the rail rather than packing
-        // directly under Weather.
+        // directly under Rewards.
         Rectangle { vertical-stretch: 1; }
 
         NavItem {

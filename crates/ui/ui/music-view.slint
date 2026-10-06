@@ -83,13 +83,19 @@ component AlbumCell inherits VerticalLayout {
     }
 }
 
+// Albums / Artists / Playlists / Search, and the sort row below them.
+//
+// Sized for a fingertip rather than a cursor: the chip used to hug its own
+// label exactly, with no padding at all and 8px between neighbours, which put
+// two tap targets within a few millimetres of each other on a wall-mounted
+// panel. The padding is as much of the fix as the height is.
 component SectionChip inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
     callback tapped();
 
-    height: 34px;
-    border-radius: 17px;
+    height: 46px;
+    border-radius: self.height / 2;
     background: root.active ? Theme.accent : (touch.pressed ? Theme.surface-alt : transparent);
     border-width: 1px;
     border-color: root.active ? Theme.accent : Theme.border;
@@ -100,13 +106,18 @@ component SectionChip inherits Rectangle {
         clicked => { root.tapped(); }
     }
 
-    Text {
-        text: root.label;
-        font-size: 13px;
-        font-weight: 600;
-        color: root.active ? white : Theme.text-primary;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    HorizontalLayout {
+        padding-left: 22px;
+        padding-right: 22px;
+
+        Text {
+            text: root.label;
+            font-size: 16px;
+            font-weight: 600;
+            color: root.active ? white : Theme.text-primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 }
 
@@ -685,10 +696,11 @@ export component MusicPage inherits Rectangle {
             }
         }
 
-        // Section chips.
+        // Section chips. Height comes from the chips themselves; the gap is
+        // wide enough that a fingertip landing between two of them hits
+        // neither rather than both.
         HorizontalLayout {
-            spacing: 8px;
-            height: 34px;
+            spacing: 14px;
 
             for section[idx] in root.sections: SectionChip {
                 label: section;
@@ -700,8 +712,7 @@ export component MusicPage inherits Rectangle {
         }
 
         if root.sorts-visible: HorizontalLayout {
-            spacing: 8px;
-            height: 30px;
+            spacing: 14px;
 
             for sort[idx] in root.sorts: SectionChip {
                 label: sort;

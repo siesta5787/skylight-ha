@@ -1,7 +1,8 @@
 mod music;
+mod rewards;
 mod timezone;
-mod wifi;
 mod update;
+mod wifi;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -17,8 +18,8 @@ use time::{Date, Duration as TimeDuration, Month, OffsetDateTime, UtcOffset, Wee
 use ui::{
     AllDayBannerData, AppWindow, CalendarDayData, CalendarEventDot, DashboardCardData,
     DashboardRowData, EventFormMember, MemberChipData, SensorRowData, TodoColumnData,
-    MusicGridRowData, MusicRowData, TodoItemData, ToggleEntityData, WeekDayColumnData, WeekEventData,
-    WifiNetworkData,
+    MusicGridRowData, MusicRowData, RewardDayData, RewardMemberData, TodoItemData, ToggleEntityData,
+    WeekDayColumnData, WeekEventData, WifiNetworkData,
 };
 
 /// The local UTC offset in whole seconds east of UTC, re-derived once per
@@ -1319,7 +1320,7 @@ fn main() {
     // Load the library straight away when it's already set up, so the tab is
     // populated before it's first opened rather than after.
     if music_state.lock().unwrap().credentials.is_some() {
-        music_show(
+        music_show_retrying(
             &rt_handle,
             &app.as_weak(),
             &music_state,
@@ -1565,6 +1566,64 @@ fn main() {
         app.on_music_volume_released(move || {
             // Dropping the timer stops it.
             volume_repeat.borrow_mut().take();
+        });
+    }
+
+    // The Rewards tab: a snapshot when the connection comes up, then live
+    // updates off the same state_changed subscription everything else uses.
+    //
+    // Live rather than polled because this is the one screen a kid stands in
+    // front of straight after ticking a chore off their list -- the star has
+    // to appear then, not at the next refresh.
+    {
+        let live_client = live_client.clone();
+        let family_state = family_state.clone();
+        let app_weak = app.as_weak();
+        rt_handle.spawn(async move {
+            // Keyed by entity id, so an update replaces that member's state
+            // rather than appending a second copy of them.
+            let mut sensors: BTreeMap<String, EntityState> = BTreeMap::new();
+            loop {
+                let client = { live_client.lock().unwrap().clone() };
+                let Some(client) = client else {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    continue;
+                };
+
+                // Subscribe before the snapshot, so a change landing while
+                // get_states is in flight isn't missed.
+                let mut events = client.subscribe_state_changed();
+
+                // Staggered: get_states has been measured at 17s+ on this
+                // instance and several parts of the app want one at startup.
+                // Nothing here is urgent enough to join that queue first.
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                match client.get_states().await {
+                    Ok(states) => {
+                        sensors = states
+                            .into_iter()
+                            .filter(|state| {
+                                rewards::stars_sensor_slug(&state.entity_id).is_some()
+                            })
+                            .map(|state| (state.entity_id.clone(), state))
+                            .collect();
+                        publish_rewards(&app_weak, &family_state, &sensors);
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "failed to fetch entity states for the Rewards page");
+                    }
+                }
+
+                while let Ok(state) = events.recv().await {
+                    if rewards::stars_sensor_slug(&state.entity_id).is_none() {
+                        continue;
+                    }
+                    sensors.insert(state.entity_id.clone(), state);
+                    publish_rewards(&app_weak, &family_state, &sensors);
+                }
+                // The broadcast ended, which means the connection went away.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         });
     }
 
@@ -3079,12 +3138,83 @@ fn set_music_rows(app: &AppWindow, rows: &[MusicRowInfo]) {
 /// Always takes a whole stack rather than a push/pop flag, so "open this",
 /// "go back" and "switch section" are all the same operation with a different
 /// stack -- there's no second code path to keep consistent.
+/// How long to wait between attempts at the very first load.
+///
+/// The device boots unattended straight into this app, and on a cold boot
+/// Wi-Fi association plus DHCP plus DNS can take the better part of a minute
+/// (see the DHCP-timing notes in CLAUDE.md) -- comfortably longer than it
+/// takes to reach the startup album fetch, which is why that fetch failed on
+/// every first boot and the library sat empty with an error until someone
+/// tapped a section to force a reload. Nobody is standing at a wall display to
+/// do that, so keep trying for about five minutes, widening the gap.
+const FIRST_LOAD_RETRY_SECS: &[u64] = &[5, 10, 20, 30, 45, 60, 60, 60];
+
+/// Loads one level, once. The retry policy lives in `music_show_inner`.
+async fn load_music_page(
+    level: &MusicLevel,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+) -> std::result::Result<MusicPageLoad, String> {
+    // Re-read per attempt rather than captured once: a retry may be running
+    // while someone finishes setup on the Settings page.
+    let credentials = music_state.lock().unwrap().credentials.clone();
+    match level {
+        // The player list comes from Home Assistant, not the music server.
+        MusicLevel::ChoosePlayer => {
+            let ha = live_client.lock().unwrap().clone();
+            match ha {
+                Some(ha) => match ha.get_states().await {
+                    Ok(states) => {
+                        let (rows, actions) = player_rows(&states);
+                        Ok(MusicPageLoad::complete(rows, actions, Vec::new()))
+                    }
+                    Err(err) => Err(format!("Could not ask Home Assistant for speakers: {err}")),
+                },
+                None => Err("Not connected to Home Assistant yet.".to_string()),
+            }
+        }
+        level => match credentials {
+            Some(credentials) => {
+                let client = music::Client::new(credentials);
+                load_music_level(&client, level, 0).await.map_err(|err| format!("{err}"))
+            }
+            None => Err("No music server is set up yet.".to_string()),
+        },
+    }
+}
+
 fn music_show(
     rt_handle: &tokio::runtime::Handle,
     app_weak: &slint::Weak<AppWindow>,
     music_state: &Arc<Mutex<MusicUi>>,
     live_client: &Arc<Mutex<Option<Client>>>,
     stack: Vec<MusicLevel>,
+) {
+    music_show_inner(rt_handle, app_weak, music_state, live_client, stack, false);
+}
+
+/// The startup load, which keeps trying until it works.
+///
+/// Only for the load nobody asked for. A failed *tap* should report and stop
+/// -- someone is standing there and can try again -- but the one at startup
+/// races the network coming up and has to outlast it.
+fn music_show_retrying(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    stack: Vec<MusicLevel>,
+) {
+    music_show_inner(rt_handle, app_weak, music_state, live_client, stack, true);
+}
+
+fn music_show_inner(
+    rt_handle: &tokio::runtime::Handle,
+    app_weak: &slint::Weak<AppWindow>,
+    music_state: &Arc<Mutex<MusicUi>>,
+    live_client: &Arc<Mutex<Option<Client>>>,
+    stack: Vec<MusicLevel>,
+    retry_until_loaded: bool,
 ) {
     let Some(level) = stack.last().cloned() else { return };
     if let Some(app) = app_weak.upgrade() {
@@ -3097,32 +3227,26 @@ fn music_show(
     let live_client = live_client.clone();
     let rt_for_art = rt_handle.clone();
     rt_handle.spawn(async move {
-        let credentials = music_state.lock().unwrap().credentials.clone();
-
-        let loaded = match &level {
-            // The player list comes from Home Assistant, not the music server.
-            MusicLevel::ChoosePlayer => {
-                let ha = live_client.lock().unwrap().clone();
-                match ha {
-                    Some(ha) => match ha.get_states().await {
-                        Ok(states) => {
-                            let (rows, actions) = player_rows(&states);
-                            Ok(MusicPageLoad::complete(rows, actions, Vec::new()))
+        let mut delays = FIRST_LOAD_RETRY_SECS.iter();
+        let loaded = loop {
+            match load_music_page(&level, &music_state, &live_client).await {
+                Ok(page) => break Ok(page),
+                Err(message) => {
+                    let next = if retry_until_loaded { delays.next() } else { None };
+                    let Some(delay) = next else { break Err(message) };
+                    // Say what went wrong while waiting: a wall display that
+                    // shows nothing is indistinguishable from a broken one.
+                    // The next attempt clears it on success.
+                    let app_weak = app_weak.clone();
+                    let waiting = message.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(app) = app_weak.upgrade() {
+                            app.set_music_message(waiting.into());
                         }
-                        Err(err) => Err(format!("Could not ask Home Assistant for speakers: {err}")),
-                    },
-                    None => Err("Not connected to Home Assistant yet.".to_string()),
+                    });
+                    tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
                 }
             }
-            level => match credentials {
-                Some(credentials) => {
-                    let client = music::Client::new(credentials);
-                    load_music_level(&client, level, 0)
-                        .await
-                        .map_err(|err| format!("{err}"))
-                }
-                None => Err("No music server is set up yet.".to_string()),
-            },
         };
 
         let _ = slint::invoke_from_event_loop(move || {
@@ -3147,6 +3271,17 @@ fn music_show(
                 }
                 Err(message) => {
                     tracing::warn!(%message, "music browse failed");
+                    // Adopt the level we were trying to reach if nothing has
+                    // ever loaded: `on_music_tab_opened` re-fetches whatever
+                    // the stack says, and an empty stack made it return early
+                    // -- so a failed first load left the tab unable to retry
+                    // itself even when the network came back.
+                    {
+                        let mut state = music_state.lock().unwrap();
+                        if state.stack.is_empty() {
+                            state.stack = stack;
+                        }
+                    }
                     app.set_music_message(message.into());
                 }
             }
@@ -4295,6 +4430,116 @@ async fn refresh_dashboard_only(
     });
 }
 
+/// Parses the cached star sensors and shows them, on the UI thread.
+fn publish_rewards(
+    app_weak: &slint::Weak<AppWindow>,
+    family_state: &Arc<Mutex<Vec<FamilyMember>>>,
+    sensors: &BTreeMap<String, EntityState>,
+) {
+    let members = rewards::from_states(&sensors.values().cloned().collect::<Vec<_>>());
+    let family_state = family_state.clone();
+    let app_weak = app_weak.clone();
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = app_weak.upgrade() else { return };
+        let family = family_state.lock().unwrap().clone();
+        apply_rewards(&app, &members, &family);
+    });
+}
+/// Builds the Rewards page's rows.
+///
+/// Colors come from the family roster the rest of the app already uses, matched
+/// by name, so a kid is the same color on this page as their calendar events
+/// and task column. The star sensors don't carry a color of their own -- the
+/// member mapping sensor beside them does, and that is what the roster is
+/// built from.
+fn reward_member_rows(
+    members: &[rewards::Member],
+    family: &[FamilyMember],
+) -> Vec<RewardMemberData> {
+    members
+        .iter()
+        .enumerate()
+        .map(|(index, member)| {
+            let color = family
+                .iter()
+                .find(|known| known.name.eq_ignore_ascii_case(&member.name))
+                .map(|known| parse_hex_color(&known.color))
+                .unwrap_or_else(|| parse_hex_color(PALETTE[index % PALETTE.len()]));
+
+            RewardMemberData {
+                name: member.name.clone().into(),
+                color,
+                stars: member.stars.to_string().into(),
+                goal: format!("/ {}", member.goal).into(),
+                days: slint::ModelRc::new(slint::VecModel::from(
+                    member
+                        .days
+                        .iter()
+                        .map(|day| RewardDayData {
+                            label: day.label.clone().into(),
+                            earned: day.state == rewards::DayState::Earned,
+                            upcoming: day.state == rewards::DayState::Upcoming,
+                            today: day.today,
+                            note: match (day.state, day.manual) {
+                                (rewards::DayState::Upcoming, _) => "",
+                                (_, true) => "manual",
+                                (_, false) => "auto",
+                            }
+                            .into(),
+                        })
+                        .collect::<Vec<_>>(),
+                )),
+                chores: if member.chores_total > 0 {
+                    format!("Today: {} of {} chores done", member.chores_done, member.chores_total)
+                } else {
+                    "No chores assigned today".to_string()
+                }
+                .into(),
+                tablet_time: member.tablet_time,
+                prize: if member.prize_earned {
+                    "Weekly prize earned!".to_string()
+                } else if member.stars_needed == 1 {
+                    "Weekly prize: 1 more star needed".to_string()
+                } else {
+                    format!("Weekly prize: {} more stars needed", member.stars_needed)
+                }
+                .into(),
+                prize_earned: member.prize_earned,
+            }
+        })
+        .collect()
+}
+
+/// "This week: Oct 5 - Oct 11", from the ISO Monday the integration reports.
+fn reward_week_label(week_start: &str) -> String {
+    let Some(start) = parse_iso_date(week_start) else { return String::new() };
+    let end = start + TimeDuration::days(6);
+    let short = |date: Date| {
+        let month = date.month().to_string();
+        format!("{} {}", &month[..3.min(month.len())], date.day())
+    };
+    format!("This week: {} - {}", short(start), short(end))
+}
+
+/// An ISO `YYYY-MM-DD`, which is the only date shape HA ever sends.
+fn parse_iso_date(value: &str) -> Option<Date> {
+    let mut parts = value.split('-');
+    let year: i32 = parts.next()?.parse().ok()?;
+    let month: u8 = parts.next()?.parse().ok()?;
+    let day: u8 = parts.next()?.parse().ok()?;
+    Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()
+}
+
+/// Pushes a fresh set of reward rows onto the page.
+fn apply_rewards(app: &AppWindow, members: &[rewards::Member], family: &[FamilyMember]) {
+    app.set_rewards_week_label(
+        members.first().map(|m| reward_week_label(&m.week_start)).unwrap_or_default().into(),
+    );
+    app.set_rewards_members(slint::ModelRc::new(slint::VecModel::from(reward_member_rows(
+        members, family,
+    ))));
+}
+
 /// Pushes whatever weather data is actually available onto the widget's
 /// properties. Each piece is set independently and only when present --
 /// e.g. a forecast-fetch failure shouldn't blank out the current
@@ -4613,6 +4858,14 @@ async fn discover_family_from_skylight_integration(client: &Client) -> Option<Ve
     let mut members: Vec<(String, FamilyMember)> = Vec::new(); // (slug, member), sorted after
     for state in &states {
         let Some(slug) = state.entity_id.strip_prefix("sensor.skylight_family_") else { continue };
+        // The integration gained a second entity per member when reward
+        // tracking landed (`sensor.skylight_family_<name>_stars`), which
+        // shares this prefix -- without this, every tracked kid also showed up
+        // as a second family member called "Ava stars", with no todo list and
+        // no calendars. See the `rewards` module, which owns that entity.
+        if rewards::stars_sensor_slug(&state.entity_id).is_some() {
+            continue;
+        }
 
         let name = state
             .attributes
@@ -6103,6 +6356,100 @@ mod tests {
     fn volume_steps_stop_at_the_ends_of_the_dial() {
         assert_eq!(stepped_volume(0.0, -VOLUME_STEP), VOLUME_BUCKET_NUDGE);
         assert_eq!(stepped_volume(1.0, VOLUME_HELD_STEP), 1.0);
+    }
+
+    fn reward_day(label: &str, state: rewards::DayState, today: bool, manual: bool) -> rewards::Day {
+        rewards::Day { label: label.into(), state, today, manual }
+    }
+
+    fn reward_member(name: &str, stars: i32) -> rewards::Member {
+        rewards::Member {
+            name: name.into(),
+            week_start: "2026-10-05".into(),
+            stars,
+            goal: 6,
+            days: vec![
+                reward_day("MON", rewards::DayState::Earned, false, false),
+                reward_day("TUE", rewards::DayState::Missed, true, true),
+                reward_day("WED", rewards::DayState::Upcoming, false, false),
+            ],
+            chores_done: 1,
+            chores_total: 2,
+            prize_earned: false,
+            tablet_time: true,
+            stars_needed: 6 - stars,
+        }
+    }
+
+    #[test]
+    fn the_week_reads_as_dates_not_as_an_iso_string() {
+        assert_eq!(reward_week_label("2026-10-05"), "This week: Oct 5 - Oct 11");
+        // Across a month boundary, which is most weeks' second half.
+        assert_eq!(reward_week_label("2026-12-28"), "This week: Dec 28 - Jan 3");
+        assert_eq!(reward_week_label(""), "", "no week is better than a wrong one");
+    }
+
+    /// A kid is one colour everywhere: the same one their calendar events and
+    /// task column already use, not a fresh one picked per page.
+    #[test]
+    fn reward_rows_take_their_colour_from_the_family_roster() {
+        let family = vec![FamilyMember {
+            id: "ava".into(),
+            name: "Ava".into(),
+            color: "#ff00aa".into(),
+            todo_entity: None,
+            calendar_entities: Vec::new(),
+        }];
+        let rows = reward_member_rows(&[reward_member("Ava", 1)], &family);
+        assert_eq!(rows[0].color, parse_hex_color("#ff00aa"));
+
+        // Somebody the roster has never heard of still gets a column.
+        let rows = reward_member_rows(&[reward_member("Nobody", 1)], &family);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].color, parse_hex_color(PALETTE[0]));
+    }
+
+    #[test]
+    fn reward_rows_say_what_each_day_and_the_week_amount_to() {
+        let rows = reward_member_rows(&[reward_member("Ava", 1)], &[]);
+        let row = &rows[0];
+        assert_eq!(row.stars.as_str(), "1");
+        assert_eq!(row.goal.as_str(), "/ 6");
+        assert_eq!(row.chores.as_str(), "Today: 1 of 2 chores done");
+        assert_eq!(row.prize.as_str(), "Weekly prize: 5 more stars needed");
+        assert!(row.tablet_time);
+
+        let days: Vec<_> = row.days.iter().collect();
+        assert!(days[0].earned && !days[0].upcoming);
+        assert_eq!(days[0].note.as_str(), "auto");
+        assert_eq!(days[1].note.as_str(), "manual");
+        assert!(days[1].today);
+        assert!(days[2].upcoming);
+        assert_eq!(days[2].note.as_str(), "", "a day that hasn't happened was decided by nobody");
+    }
+
+    #[test]
+    fn the_last_star_and_the_prize_read_as_sentences() {
+        let mut nearly = reward_member("Ava", 5);
+        nearly.stars_needed = 1;
+        assert_eq!(
+            reward_member_rows(&[nearly], &[])[0].prize.as_str(),
+            "Weekly prize: 1 more star needed"
+        );
+
+        let mut done = reward_member("Ava", 6);
+        done.prize_earned = true;
+        let row = &reward_member_rows(&[done], &[])[0];
+        assert_eq!(row.prize.as_str(), "Weekly prize earned!");
+        assert!(row.prize_earned, "the page draws it differently, so it needs the flag too");
+
+        let mut nothing_assigned = reward_member("Ava", 0);
+        nothing_assigned.chores_total = 0;
+        nothing_assigned.chores_done = 0;
+        assert_eq!(
+            reward_member_rows(&[nothing_assigned], &[])[0].chores.as_str(),
+            "No chores assigned today"
+        );
     }
 
     #[test]

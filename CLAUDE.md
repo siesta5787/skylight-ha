@@ -406,6 +406,35 @@ entry covers "being in that area". One `PinFlow` state machine in main.rs
 disable/unlock flow, paired with a dedicated numeric `PinPad` component
 (`crates/ui/ui/pin-pad.slint`) -- not the general `VirtualKeyboard`.
 
+**Rewards tab** (`apps/skylight-ha/src/rewards.rs` +
+`crates/ui/ui/rewards-view.slint`, 2026-10-06): the star/chore tracking the
+`skylight-family` integration gained, on its own tab. One column per tracked
+kid, left to right (the HA panel stacks them vertically; a wall display is
+wide and each kid reads their own column), each showing Mon-Sun stars with
+today outlined, whether the day was decided automatically or by hand, today's
+chore progress, whether they earned tablet time, and how far off the weekly
+prize is.
+- **Read-only on purpose.** Awarding or revoking a star by hand, and browsing
+  past weeks, both stay in the integration's own HA panel -- parent jobs. This
+  screen answers what the kids stand in front of it to ask.
+- Fed from `sensor.skylight_family_<name>_stars`, **not** the integration's
+  `skylight_family/rewards` websocket command that its panel uses: the entity
+  is already in `get_states` and already arrives on the `state_changed`
+  subscription this app holds open, so a chore ticked off updates the wall
+  display immediately with no polling and no new protocol surface. The state is
+  the week's star count; the attributes carry the whole week (`days`, a
+  date-keyed map where a future day is `null`, not a record saying "no star"),
+  `goal`, `chores_done`/`chores_total`, `prize_earned`, `stars_needed` and
+  `tablet_time`. Colors come from the existing family roster, matched by name,
+  so a kid is the same color here as on the calendar.
+- **That integration change also silently broke family discovery**:
+  `discover_family_from_skylight_integration` matches every
+  `sensor.skylight_family_*` entity, so each tracked kid turned into a second
+  "Ava stars" family member with no todo list or calendars. Star sensors are
+  now skipped explicitly (`rewards::stars_sensor_slug`). Worth remembering as a
+  shape: that integration is a sibling repo on its own release cycle, and a new
+  entity sharing the prefix is a breaking change here with no compile error.
+
 **In-app self-update** (`apps/skylight-ha/src/update.rs`, 2026-09-27/29):
 checks GitHub Releases for a newer version and installs it without a
 manual reflash. Full design writeup: `~/.claude/plans/
@@ -478,6 +507,32 @@ skylight-self-update.md`. Confirmed working end-to-end on real hardware
   the live binary, a staged download, and a rollback copy need to
   coexist briefly, roughly 3x the ~20MB binary, which didn't fit in the
   original ~31MB free.
+
+**Music tab field fixes worth not relearning** (0.9.0):
+- **Volume stepped wrong in one direction only.** A tap up did nothing, a tap
+  down sometimes moved two percent, holding worked both ways. Levels arrive
+  from HA as doubles, are kept as `f32`, and come back a hair *under* the
+  percent they stand for (42% reports 0.41999998), so `level + 0.01` asked for
+  0.42999998 -- which a player that truncates reads as 42 going up and 40 going
+  down. `stepped_volume` rounds to whole percent, steps there, and aims just
+  inside the target bucket rather than at its lower edge, which is not
+  representable in binary. The held step is 5%, big enough to swamp the dust,
+  which is why only tapping looked broken.
+- **Art never showed for tracks started from the tablet**, only for ones
+  started from Music Assistant. We hand `play_media` a plain Subsonic stream
+  URL, so MA has nothing to resolve and publishes no `entity_picture` at all --
+  and the artwork refetch was keyed on the picture *changing*, so "none" to
+  "none" looked unchanged across every track. Artwork is now keyed on its
+  source: the player echoes our stream URL back as `media_content_id`, which
+  identifies the track exactly, and the cover comes from the music server. Only
+  what this app didn't start uses HA's media proxy.
+- **The library was empty on the first boot after a power cut** and stayed
+  that way until someone tapped a section. The startup fetch races Wi-Fi/DHCP
+  coming up (30-60s, see the DHCP section below) and, worse, a failed load left
+  `stack` empty -- which made `on_music_tab_opened`'s re-fetch return early, so
+  the tab couldn't even retry itself. The startup load now retries on its own
+  for about five minutes (`music_show_retrying`), and a failed first load
+  adopts the level it was aiming at.
 
 **Wi-Fi management** (`apps/skylight-ha/src/wifi.rs`, 2026-10-01, **confirmed
 working on hardware 2026-10-02**): Settings
