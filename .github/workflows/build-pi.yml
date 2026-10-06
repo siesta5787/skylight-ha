@@ -57,9 +57,11 @@ jobs:
             alpine:3.20 sh -c '
               set -eu
               # Bounded and retried like rustup below -- apk has no timeout of
-              # its own, so a dropped connection wedges it on a dead socket.
+              # its own, so a dropped connection wedges it on a dead socket,
+              # and a slow mirror can stretch a ~17s install past any tight
+              # bound (seen 2026-10-06).
               i=0
-              until timeout 420 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
+              until timeout 900 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
                 i=$((i + 1))
                 if [ "$i" -ge 5 ]; then echo "apk install failed 5 times -- giving up" >&2; exit 1; fi
                 echo "apk install attempt $i failed, retrying in 10s..." >&2

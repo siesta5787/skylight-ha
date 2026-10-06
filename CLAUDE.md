@@ -142,9 +142,10 @@ untouched by local desktop work.
     alpine:3.20 sh -c '
       set -eu
       # Bounded and retried like rustup below -- apk has no timeout of its own,
-      # so a connection dropping mid-fetch wedges it on a dead socket.
+      # so a connection dropping mid-fetch wedges it on a dead socket, and a
+      # slow mirror can stretch a ~17s install past any tight bound.
       i=0
-      until timeout 420 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
+      until timeout 900 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
         i=$((i + 1))
         if [ "$i" -ge 5 ]; then echo "apk install failed 5 times -- giving up" >&2; exit 1; fi
         echo "apk install attempt $i failed, retrying in 10s..." >&2
@@ -193,6 +194,17 @@ untouched by local desktop work.
   contending for resources with the next attempt. `docker run` attached in
   the foreground does forward SIGTERM into a real container stop request,
   so timing out `docker run` directly actually cleans up after itself.
+
+  **A failed release is not always a code problem.** On 2026-10-06 the
+  `apk add` step failed five attempts in a row, always stalling at the same
+  package, and the task reporting it claimed exit 0 (the real status was
+  masked by a trailing `tail` in the invocation -- run `scripts/release.sh`
+  as the background command itself, with nothing piped after it). Re-running
+  the identical `docker run` four hours later finished the install in 17
+  seconds, so it was a spell of Alpine CDN slowness, not the recipe, the
+  binfmt setup or the host. Worth checking in that order next time: time the
+  bare `apk add` in a throwaway container first (seconds = network was the
+  problem, minutes = look at the host), rather than editing the build.
 
   Output lands directly at `target/release/skylight-ha` — no artifact
   upload, no quota, no waiting on GitHub's queue. `target/` and the cargo

@@ -112,10 +112,16 @@ if [ "$SKIP_BUILD" = false ]; then
             set -eu
             # Bounded and retried for the same reason as rustup below: apk has
             # no timeout of its own, so a connection dropping mid-fetch leaves
-            # it blocked on a dead socket indefinitely. Seen twice -- once as a
-            # 22-minute silent hang, once as "Connection aborted"/"BAD archive".
+            # it blocked on a dead socket indefinitely. Seen three times -- a
+            # 22-minute silent hang, a "Connection aborted"/"BAD archive", and
+            # (2026-10-06) a spell of CDN slowness that took this whole install
+            # from its usual ~17s to not finishing inside half an hour, failing
+            # five attempts at the same package and costing a release. Hence
+            # the generous ceiling: it is only ever reached when something is
+            # already wrong, and riding out a slow mirror beats re-downloading
+            # everything from scratch five times.
             i=0
-            until timeout 420 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
+            until timeout 900 apk add --no-cache curl gcc libinput-dev eudev-dev libxkbcommon-dev pkgconf musl-dev linux-headers; do
                 i=$((i + 1))
                 if [ "$i" -ge 5 ]; then
                     echo "apk install failed 5 times in a row -- giving up" >&2
