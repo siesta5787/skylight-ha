@@ -41,6 +41,14 @@ export struct RewardMemberData {
     tablet-time: bool,
     prize: string,
     prize-earned: bool,
+    // Reward tracking and pocket money are switched on separately per member,
+    // so a column can have either half or both.
+    has-stars: bool,
+    has-money: bool,
+    short-term: string,
+    long-term: string,
+    // "+$0.01 accruing . 3% a year", or empty.
+    long-term-note: string,
 }
 
 component DayCell inherits VerticalLayout {
@@ -92,6 +100,47 @@ component DayCell inherits VerticalLayout {
         font-size: 10px;
         color: Theme.text-muted;
         horizontal-alignment: center;
+    }
+}
+
+// One account's balance.
+component MoneyBox inherits Rectangle {
+    in property <string> caption;
+    in property <string> amount;
+    in property <string> note;
+
+    horizontal-stretch: 1;
+    preferred-width: 0px;
+    min-width: 0px;
+    background: Theme.surface;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 6px;
+        alignment: start;
+
+        Text {
+            text: root.caption;
+            font-size: 12px;
+            font-weight: 600;
+            color: Theme.text-muted;
+        }
+        Text {
+            text: root.amount;
+            font-size: 30px;
+            font-weight: 700;
+            color: Theme.text-primary;
+            overflow: elide;
+        }
+        Text {
+            text: root.note;
+            font-size: 13px;
+            color: #6ee787;
+            overflow: elide;
+        }
     }
 }
 
@@ -155,7 +204,7 @@ component MemberCard inherits Rectangle {
             }
         }
 
-        HorizontalLayout {
+        if root.member.has-stars: HorizontalLayout {
             spacing: 6px;
 
             for day in root.member.days: DayCell {
@@ -165,7 +214,7 @@ component MemberCard inherits Rectangle {
 
         // Only ever describes right now, which is why there is no week
         // browsing on this screen -- see the note on RewardsPage.
-        VerticalLayout {
+        if root.member.has-stars: VerticalLayout {
             spacing: 4px;
 
             Text {
@@ -216,15 +265,40 @@ component MemberCard inherits Rectangle {
                 overflow: elide;
             }
         }
+
+        if root.member.has-money: VerticalLayout {
+            spacing: 8px;
+
+            Text {
+                text: "MONEY";
+                font-size: 13px;
+                font-weight: 600;
+                color: Theme.text-muted;
+            }
+            HorizontalLayout {
+                spacing: 12px;
+
+                MoneyBox {
+                    caption: "SHORT TERM";
+                    amount: root.member.short-term;
+                }
+                MoneyBox {
+                    caption: "LONG TERM";
+                    amount: root.member.long-term;
+                    note: root.member.long-term-note;
+                }
+            }
+        }
     }
 }
 
-// The Rewards tab.
+// The Rewards / Money tab.
 //
-// Read-only on purpose: awarding a star by hand is a parent's job and lives in
-// the Home Assistant panel, which is also where a past week can be browsed.
-// This screen answers the question the kids actually stand in front of it to
-// ask -- did I get today's star, and how close is the weekly prize.
+// Read-only on purpose: awarding a star by hand, or moving money, is a
+// parent's job and lives in the Home Assistant panel, which is also where a
+// past week and the ledger can be browsed. This screen answers the question
+// the kids actually stand in front of it to ask -- did I get today's star, how
+// close is the weekly prize, and how much is in the piggy bank.
 export component RewardsPage inherits Rectangle {
     in property <[RewardMemberData]> members;
     in property <string> message: "";
@@ -238,7 +312,7 @@ export component RewardsPage inherits Rectangle {
         spacing: 18px;
 
         Text {
-            text: "Rewards";
+            text: "Rewards / Money";
             font-size: 22px;
             font-weight: 700;
             color: Theme.text-primary;

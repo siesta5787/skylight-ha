@@ -1603,7 +1603,7 @@ fn main() {
                         sensors = states
                             .into_iter()
                             .filter(|state| {
-                                rewards::stars_sensor_slug(&state.entity_id).is_some()
+                                rewards::member_sensor_slug(&state.entity_id).is_some()
                             })
                             .map(|state| (state.entity_id.clone(), state))
                             .collect();
@@ -1615,7 +1615,7 @@ fn main() {
                 }
 
                 while let Ok(state) = events.recv().await {
-                    if rewards::stars_sensor_slug(&state.entity_id).is_none() {
+                    if rewards::member_sensor_slug(&state.entity_id).is_none() {
                         continue;
                     }
                     sensors.insert(state.entity_id.clone(), state);
@@ -4466,9 +4466,11 @@ fn reward_member_rows(
                 .map(|known| parse_hex_color(&known.color))
                 .unwrap_or_else(|| parse_hex_color(PALETTE[index % PALETTE.len()]));
 
+            let money = member.money.as_ref();
             RewardMemberData {
                 name: member.name.clone().into(),
                 color,
+                has_stars: member.has_stars,
                 stars: member.stars.to_string().into(),
                 goal: format!("/ {}", member.goal).into(),
                 days: slint::ModelRc::new(slint::VecModel::from(
@@ -4505,6 +4507,10 @@ fn reward_member_rows(
                 }
                 .into(),
                 prize_earned: member.prize_earned,
+                has_money: money.is_some(),
+                short_term: money.map(|m| m.short_term()).unwrap_or_default().into(),
+                long_term: money.map(|m| m.long_term()).unwrap_or_default().into(),
+                long_term_note: money.map(|m| m.long_term_note()).unwrap_or_default().into(),
             }
         })
         .collect()
@@ -4835,12 +4841,12 @@ async fn discover_family_from_skylight_integration(client: &Client) -> Option<Ve
     let mut members: Vec<(String, FamilyMember)> = Vec::new(); // (slug, member), sorted after
     for state in &states {
         let Some(slug) = state.entity_id.strip_prefix("sensor.skylight_family_") else { continue };
-        // The integration gained a second entity per member when reward
-        // tracking landed (`sensor.skylight_family_<name>_stars`), which
-        // shares this prefix -- without this, every tracked kid also showed up
-        // as a second family member called "Ava stars", with no todo list and
-        // no calendars. See the `rewards` module, which owns that entity.
-        if rewards::stars_sensor_slug(&state.entity_id).is_some() {
+        // Reward tracking and pocket money each add entities per member
+        // (`..._<name>_stars`, `_short_term`, `_long_term`) that share this
+        // prefix -- without this, every tracked kid also showed up as extra
+        // family members called "Ava stars", "Ava short term", with no todo
+        // list and no calendars. See the `rewards` module, which owns them.
+        if rewards::member_sensor_slug(&state.entity_id).is_some() {
             continue;
         }
 
@@ -6342,6 +6348,7 @@ mod tests {
     fn reward_member(name: &str, stars: i32) -> rewards::Member {
         rewards::Member {
             name: name.into(),
+            has_stars: true,
             stars,
             goal: 6,
             days: vec![
@@ -6354,6 +6361,7 @@ mod tests {
             prize_earned: false,
             tablet_time: true,
             stars_needed: 6 - stars,
+            money: None,
         }
     }
 
@@ -6375,6 +6383,25 @@ mod tests {
         let rows = reward_member_rows(&[reward_member("Nobody", 1)], &family);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].color, parse_hex_color(PALETTE[0]));
+    }
+
+    #[test]
+    fn reward_rows_carry_money_and_hide_it_when_there_is_none() {
+        let mut ava = reward_member("Ava", 1);
+        assert!(!reward_member_rows(&[ava.clone()], &[])[0].has_money);
+
+        ava.money = Some(rewards::Money {
+            short_term_cents: 0,
+            long_term_cents: 2400,
+            accruing_cents: 1,
+            interest_rate: 3.0,
+            currency: "USD".into(),
+        });
+        let rows = reward_member_rows(&[ava], &[]);
+        assert!(rows[0].has_money);
+        assert_eq!(rows[0].short_term.as_str(), "$0.00");
+        assert_eq!(rows[0].long_term.as_str(), "$24.00");
+        assert_eq!(rows[0].long_term_note.as_str(), "+$0.01 accruing \u{b7} 3% a year");
     }
 
     #[test]

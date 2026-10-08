@@ -418,7 +418,7 @@ entry covers "being in that area". One `PinFlow` state machine in main.rs
 disable/unlock flow, paired with a dedicated numeric `PinPad` component
 (`crates/ui/ui/pin-pad.slint`) -- not the general `VirtualKeyboard`.
 
-**Rewards tab** (`apps/skylight-ha/src/rewards.rs` +
+**Rewards / Money tab** (`apps/skylight-ha/src/rewards.rs` +
 `crates/ui/ui/rewards-view.slint`, 2026-10-06): the star/chore tracking the
 `skylight-family` integration gained, on its own tab. One column per tracked
 kid, left to right (the HA panel stacks them vertically; a wall display is
@@ -439,11 +439,25 @@ prize is.
   `goal`, `chores_done`/`chores_total`, `prize_earned`, `stars_needed` and
   `tablet_time`. Colors come from the existing family roster, matched by name,
   so a kid is the same color here as on the calendar.
+- **Money (2026-10-08)**: members with pocket money on also get
+  `sensor.skylight_family_<name>_short_term` / `_long_term` (state = balance in
+  currency units, `unit_of_measurement` = currency code; the long-term one
+  carries `interest_rate` (percent), `accruing`, `interest_total`). Folded into
+  the same column by slug; reward tracking and pocket money are switched on
+  separately, so a column can have stars, money, or both (`has-stars` /
+  `has-money`). Read-only: no Deposit/Expense/Transfer/Ledger buttons here --
+  moving money from a wall tablet any kid can touch would need a PIN gate and a
+  number pad first, and it is a parent's job in the HA panel.
+- **Week start is configurable in the integration** (`week_start`, default
+  Monday). The star sensor's `days` are the seven dates from that day, so day
+  labels are derived from each date's own weekday, never from position -- a
+  positional "MON..SUN" was right only for Monday weeks.
 - **That integration change also silently broke family discovery**:
   `discover_family_from_skylight_integration` matches every
   `sensor.skylight_family_*` entity, so each tracked kid turned into a second
   "Ava stars" family member with no todo list or calendars. Star sensors are
-  now skipped explicitly (`rewards::stars_sensor_slug`). Worth remembering as a
+  now skipped explicitly (`rewards::member_sensor_slug`, which covers the
+  `_stars`, `_short_term` and `_long_term` suffixes). Worth remembering as a
   shape: that integration is a sibling repo on its own release cycle, and a new
   entity sharing the prefix is a breaking change here with no compile error.
 
